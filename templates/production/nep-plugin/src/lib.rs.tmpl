@@ -1,0 +1,136 @@
+use thenodes::plugin_host::{Plugin, PluginContext, PluginRegistrarApi};
+use thenodes::config::ConfigDefaults;
+use thenodes::network::message::Message;
+
+/// {{APP_NAME}} Plugin
+/// 
+/// This plugin demonstrates the NEP (Node-Embedded Plugin) pattern.
+/// It's designed to be compiled as a .so file and loaded by the TheNodes binary.
+pub struct {{APP_NAME_PASCAL}}Plugin;
+
+impl {{APP_NAME_PASCAL}}Plugin {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait::async_trait]
+impl Plugin for {{APP_NAME_PASCAL}}Plugin {
+    /// Handle incoming network messages
+    fn on_message(&self, message: &Message, ctx: &PluginContext) {
+        println!("{{APP_NAME}} received message: {:?}", message);
+        // TODO: Implement your message handling logic here
+    }
+
+    /// Handle user prompt input for this plugin
+    async fn on_prompt(&self, input: &str, _ctx: &PluginContext) -> Option<String> {
+        // Simple echo response - customize for your plugin's functionality
+        Some(format!("{{APP_NAME}} plugin received: {}", input))
+    }
+
+    /// Set the prompt prefix for this plugin's commands
+    fn prompt_prefix(&self) -> Option<&str> {
+        Some("{{APP_NAME}}")
+    }
+
+    /// Provide configuration defaults for this plugin
+    fn early_config_defaults(&self) -> Option<ConfigDefaults> {
+        Some(ConfigDefaults {
+            realm: Some("{{APP_REALM}}".to_string()),
+            app_name: Some("{{APP_NAME}} Network".to_string()),
+            ..Default::default()
+        })
+    }
+
+    /// Handle initialization after the node starts
+    async fn on_init(&mut self, ctx: &PluginContext) -> Result<(), Box<dyn std::error::Error>> {
+        log::info!("{} plugin initialized", self.name);
+        
+        // Emit a system event
+        ctx.events().emit_system_event("plugin_started", Some(&format!("plugin={}", self.name)));
+        
+        Ok(())
+    }
+
+    /// Handle incoming messages
+    async fn on_message(
+        &mut self,
+        msg: &thenodes::network::Message,
+        _ctx: &PluginContext,
+    ) -> Option<String> {
+        log::debug!("Received message: {:?}", msg);
+        
+        // Handle your custom message types here
+        match &msg.message_type {
+            thenodes::network::MessageType::Extension(data) => {
+                if let Some(plugin_type) = data.get("plugin") {
+                    if plugin_type == &Value::String(self.name.clone()) {
+                        // Handle plugin-specific messages
+                        return Some(format!("Processed by {}", self.name));
+                    }
+                }
+            }
+            _ => {
+                // Ignore other message types or handle them as needed
+            }
+        }
+        
+        None
+    }
+
+    /// Handle prompt commands (if using --prompt mode)
+    fn prompt_prefix(&self) -> Option<&str> {
+        Some("{{APP_NAME_SHORT}}")
+    }
+
+    async fn on_prompt(&mut self, input: &str, ctx: &PluginContext) -> Option<String> {
+        match input.trim() {
+            "status" => {
+                Some(format!("{} plugin is running", self.name))
+            }
+            "info" => {
+                Some(format!("Plugin: {}\nRealm: {{REALM_NAME}}", self.name))
+            }
+            "ping" => {
+                // Example: send a message to all peers
+                let msg = thenodes::network::Message::new(
+                    "{{APP_NAME}}",
+                    "*",
+                    thenodes::network::MessageType::Extension({
+                        let mut map = HashMap::new();
+                        map.insert("plugin".to_string(), Value::String(self.name.clone()));
+                        map.insert("action".to_string(), Value::String("ping".to_string()));
+                        map
+                    }),
+                    None,
+                    Some(thenodes::realms::RealmInfo::new("{{REALM_NAME}}", "1")),
+                );
+                
+                // Note: In a real implementation, you'd use ctx to send this message
+                Some(format!("Ping message prepared: {}", msg.as_json()))
+            }
+            _ => {
+                Some(format!("Unknown command: {}\nTry: status, info, ping", input))
+            }
+        }
+    }
+}
+
+impl Default for {{APP_NAME_PASCAL}}Plugin {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Plugin registration function (required for NEP mode)
+/// This function is called by the TheNodes binary to register the plugin
+#[no_mangle]
+pub unsafe extern "C" fn register_plugin(api: *const PluginRegistrarApi) {
+    let Ok(api) = PluginRegistrarApi::from_raw(api) else {
+        eprintln!("[{{APP_NAME}}] registrar API pointer was null");
+        return;
+    };
+    if let Err(err) = api.register_plugin(Box::new({{APP_NAME_PASCAL}}Plugin::new())) {
+        eprintln!("[{{APP_NAME}}] failed to register plugin: {err}");
+    }
+}

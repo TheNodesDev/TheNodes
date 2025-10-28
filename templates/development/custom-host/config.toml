@@ -1,0 +1,52 @@
+# Configuration for {{APP_NAME}}
+
+# Network settings
+port = 50001
+bootstrap_nodes = ["127.0.0.1:50002", "127.0.0.1:50003"]
+
+# Application settings
+app_name = "{{APP_NAME}}"
+
+# Realm information (network segmentation)
+[realm]
+name = "{{APP_REALM}}"
+version = "1.0"
+
+# Node identity and state
+[node]
+state_dir = "data/{{APP_NAME}}"
+id_file = "node_id"
+allow_ephemeral = true
+
+# Encryption settings (optional)
+[encryption]
+enabled = false  # Set to true to enable TLS encryption
+
+# When encryption is enabled, uncomment and configure these paths:
+# [encryption.paths]
+# own_certificate = "pki/own/{{APP_NAME}}.crt"
+# own_private_key = "pki/own/{{APP_NAME}}.key"
+# trusted_cert_dir = "pki/trusted/certs"
+# trusted_crl_dir = "pki/trusted/crl"
+# rejected_dir = "pki/rejected"
+# issuer_cert_dir = "pki/issuers/certs"
+# issuer_crl_dir = "pki/issuers/crl"
+
+# Trust policy (when encryption is enabled)
+# [encryption.trust_policy]
+# mode = "allowlist"  # or "blacklist"
+# accept_self_signed = true
+# store_new_certs = "observed"
+# reject_expired = true
+# reject_before_valid = true
+# enforce_ca_chain = false
+
+# [encryption.trust_policy.paths]
+# observed_dir = "pki/observed/certs"
+
+# Logging configuration
+[logging]
+json_path = "logs/{{APP_NAME}}_audit.jsonl"
+json_max_bytes = 5242880  # 5MB
+json_rotate = 5
+disable_console = false

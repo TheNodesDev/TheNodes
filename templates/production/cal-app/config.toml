@@ -1,0 +1,46 @@
+# Configuration for {{APP_NAME}}
+
+# Network settings
+port = 50001
+bootstrap_nodes = ["127.0.0.1:50002", "127.0.0.1:50003"]
+
+# NOTE: realm and app_name are hardcoded in src/app_identity.rs
+
+# Node identity and state
+[node]
+state_dir = "data/{{APP_NAME}}"
+id_file = "node_id"
+allow_ephemeral = true
+
+# Encryption settings (secure by default)
+[encryption]
+enabled = true            # TLS on by default (production posture)
+mtls = true               # Recommend mutual TLS in production
+
+[encryption.paths]
+own_certificate  = "pki/own/{{APP_NAME}}.crt"
+own_private_key  = "pki/own/{{APP_NAME}}.key"
+trusted_cert_dir = "pki/trusted/certs"
+trusted_crl_dir  = "pki/trusted/crl"
+rejected_dir     = "pki/rejected"
+issuer_cert_dir  = "pki/issuers/certs"
+issuer_crl_dir   = "pki/issuers/crl"
+
+# Restrictive trust policy scaffold (tighten/adjust as needed)
+[encryption.trust_policy]
+mode = "allowlist"           # allow only explicitly trusted peers
+accept_self_signed = true     # permit self-signed peer certs present in trusted store
+store_new_certs = "observed" # records first-seen certs (helpful during rollout)
+reject_expired = true
+reject_before_valid = true
+enforce_ca_chain = false      # set true when operating a private CA
+
+[encryption.trust_policy.paths]
+observed_dir = "pki/observed/certs"
+
+# Logging configuration
+[logging]
+json_path = "logs/{{APP_NAME}}_audit.jsonl"
+json_max_bytes = 5242880  # 5MB
+json_rotate = 5
+disable_console = false

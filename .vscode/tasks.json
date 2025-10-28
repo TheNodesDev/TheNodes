@@ -1,0 +1,44 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "cargo: build (workspace)",
+      "type": "shell",
+      "command": "cargo",
+      "args": ["build", "--workspace"],
+      "group": "build",
+      "problemMatcher": ["$rustc"]
+    },
+    {
+      "label": "cargo: test (workspace)",
+      "type": "shell",
+      "command": "cargo",
+      "args": ["test", "--workspace", "--all-features", "--", "--nocapture"],
+      "group": "test",
+      "problemMatcher": ["$rustc"]
+    },
+    {
+      "label": "cargo: fmt check",
+      "type": "shell",
+      "command": "cargo",
+      "args": ["fmt", "--all", "--", "--check"]
+    },
+    {
+      "label": "cargo: clippy (relaxed)",
+      "type": "shell",
+      "command": "cargo",
+      "args": [
+        "clippy",
+        "--workspace",
+        "--all-targets",
+        "--all-features",
+        "--",
+        "-D", "clippy::correctness",
+        "-D", "clippy::perf",
+        "-W", "clippy::style",
+        "-W", "clippy::complexity"
+      ],
+      "problemMatcher": ["$rustc"]
+    }
+  ]
+}

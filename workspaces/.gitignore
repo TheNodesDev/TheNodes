@@ -1,0 +1,8 @@
+# Ignore all generated user workspaces
+*
+!.gitignore
+!README.md
+
+# But allow tracking the directory structure itself
+# This ensures the workspaces/ directory exists in git
+# while ignoring all user-generated content

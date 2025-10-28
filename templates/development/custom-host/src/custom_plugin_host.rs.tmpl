@@ -1,0 +1,272 @@
+use std::sync::Arc;
+use tokio::sync::RwLock;
+use thenodes::prelude::*;
+use uuid::Uuid;
+
+/// Custom plugin host that provides application-specific functionality
+pub struct CustomPluginHost {
+    config: Config,
+    state: Arc<RwLock<HostState>>,
+    custom_plugins: Arc<RwLock<Vec<Box<dyn CustomPlugin>>>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct HostState {
+    pub id: Uuid,
+    pub active_sessions: std::collections::HashMap<String, SessionInfo>,
+    pub message_count: usize,
+    pub custom_data: std::collections::HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionInfo {
+    pub id: String,
+    pub peer_id: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub last_activity: chrono::DateTime<chrono::Utc>,
+    pub metadata: std::collections::HashMap<String, String>,
+}
+
+/// Trait for application-specific plugins
+#[async_trait::async_trait]
+pub trait CustomPlugin: Send + Sync {
+    /// Plugin identifier
+    fn name(&self) -> &str;
+    
+    /// Plugin version
+    fn version(&self) -> &str;
+    
+    /// Initialize the plugin
+    async fn initialize(&mut self) -> Result<(), Box<dyn std::error::Error>>;
+    
+    /// Handle custom messages
+    async fn handle_message(&self, message: &Message) -> Result<Option<Message>, Box<dyn std::error::Error>>;
+    
+    /// Handle custom commands from prompt
+    async fn handle_command(&self, command: &str, args: Vec<&str>) -> Result<String, Box<dyn std::error::Error>>;
+    
+    /// Get plugin status
+    async fn status(&self) -> Result<serde_json::Value, Box<dyn std::error::Error>>;
+}
+
+impl CustomPluginHost {
+    pub fn new(config: Config) -> Self {
+        Self {
+            config,
+            state: Arc::new(RwLock::new(HostState {
+                id: Uuid::new_v4(),
+                active_sessions: std::collections::HashMap::new(),
+                message_count: 0,
+                custom_data: std::collections::HashMap::new(),
+            })),
+            custom_plugins: Arc::new(RwLock::new(Vec::new())),
+        }
+    }
+
+    /// Register a custom plugin
+    pub async fn register_plugin(&self, plugin: Box<dyn CustomPlugin>) -> Result<(), Box<dyn std::error::Error>> {
+        let mut plugins = self.custom_plugins.write().await;
+        log::info!("🔌 Registering custom plugin: {} v{}", plugin.name(), plugin.version());
+        plugins.push(plugin);
+        Ok(())
+    }
+
+    /// Handle messages from the network
+    pub async fn handle_network_message(&self, message: Message) -> Result<(), Box<dyn std::error::Error>> {
+        // Update message count
+        {
+            let mut state = self.state.write().await;
+            state.message_count += 1;
+        }
+
+        log::debug!("📨 CustomPluginHost received message: {:?}", message);
+
+        // Route to custom plugins
+        let plugins = self.custom_plugins.read().await;
+        for plugin in plugins.iter() {
+            if let Ok(Some(response)) = plugin.handle_message(&message).await {
+                log::info!("🔄 Plugin {} generated response: {:?}", plugin.name(), response);
+                // In a real implementation, you'd send this response through the network
+            }
+        }
+
+        // Handle host-specific message types
+        match message.msg_type {
+            MessageType::Custom(ref msg_type) if msg_type == "session_create" => {
+                self.handle_session_create(&message).await?;
+            }
+            MessageType::Custom(ref msg_type) if msg_type == "session_destroy" => {
+                self.handle_session_destroy(&message).await?;
+            }
+            MessageType::Custom(ref msg_type) if msg_type == "host_status" => {
+                self.handle_status_request(&message).await?;
+            }
+            _ => {
+                log::debug!("🔄 No specific handler for message type: {:?}", message.msg_type);
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn handle_session_create(&self, message: &Message) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(Payload::Json(data)) = &message.payload {
+            if let Some(session_id) = data.get("session_id").and_then(|s| s.as_str()) {
+                let session = SessionInfo {
+                    id: session_id.to_string(),
+                    peer_id: Some(message.from.clone()),
+                    created_at: chrono::Utc::now(),
+                    last_activity: chrono::Utc::now(),
+                    metadata: std::collections::HashMap::new(),
+                };
+
+                let mut state = self.state.write().await;
+                state.active_sessions.insert(session_id.to_string(), session);
+                log::info!("🎯 Created session: {}", session_id);
+            }
+        }
+        Ok(())
+    }
+
+    async fn handle_session_destroy(&self, message: &Message) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(Payload::Json(data)) = &message.payload {
+            if let Some(session_id) = data.get("session_id").and_then(|s| s.as_str()) {
+                let mut state = self.state.write().await;
+                if state.active_sessions.remove(session_id).is_some() {
+                    log::info!("🗑️  Destroyed session: {}", session_id);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn handle_status_request(&self, _message: &Message) -> Result<(), Box<dyn std::error::Error>> {
+        let state = self.state.read().await;
+        let plugins = self.custom_plugins.read().await;
+        
+        let status = serde_json::json!({
+            "host_id": state.id,
+            "active_sessions": state.active_sessions.len(),
+            "message_count": state.message_count,
+            "custom_plugins": plugins.len(),
+            "uptime": "TODO: implement uptime tracking"
+        });
+
+        log::info!("📊 Host status: {}", status);
+        // In a real implementation, you'd send this as a response message
+        Ok(())
+    }
+
+    /// Handle custom commands from the prompt interface
+    pub async fn handle_custom_command(&self, command: &str, args: Vec<&str>) -> Result<String, Box<dyn std::error::Error>> {
+        match command {
+            "status" => self.get_status().await,
+            "sessions" => self.list_sessions().await,
+            "plugins" => self.list_plugins().await,
+            "data" => self.handle_data_command(args).await,
+            _ => {
+                // Try custom plugins
+                let plugins = self.custom_plugins.read().await;
+                for plugin in plugins.iter() {
+                    if let Ok(result) = plugin.handle_command(command, args.clone()).await {
+                        return Ok(result);
+                    }
+                }
+                Err(format!("Unknown command: {}", command).into())
+            }
+        }
+    }
+
+    async fn get_status(&self) -> Result<String, Box<dyn std::error::Error>> {
+        let state = self.state.read().await;
+        let plugins = self.custom_plugins.read().await;
+        
+        Ok(format!(
+            "📊 Host Status:\n  ID: {}\n  Active Sessions: {}\n  Messages Processed: {}\n  Custom Plugins: {}",
+            state.id, 
+            state.active_sessions.len(), 
+            state.message_count,
+            plugins.len()
+        ))
+    }
+
+    async fn list_sessions(&self) -> Result<String, Box<dyn std::error::Error>> {
+        let state = self.state.read().await;
+        
+        if state.active_sessions.is_empty() {
+            return Ok("🎯 No active sessions".to_string());
+        }
+
+        let mut result = String::from("🎯 Active Sessions:\n");
+        for (id, session) in &state.active_sessions {
+            result.push_str(&format!(
+                "  {} (peer: {}, created: {})\n",
+                id,
+                session.peer_id.as_deref().unwrap_or("unknown"),
+                session.created_at.format("%Y-%m-%d %H:%M:%S UTC")
+            ));
+        }
+        Ok(result)
+    }
+
+    async fn list_plugins(&self) -> Result<String, Box<dyn std::error::Error>> {
+        let plugins = self.custom_plugins.read().await;
+        
+        if plugins.is_empty() {
+            return Ok("🔌 No custom plugins loaded".to_string());
+        }
+
+        let mut result = String::from("🔌 Custom Plugins:\n");
+        for plugin in plugins.iter() {
+            result.push_str(&format!("  {} v{}\n", plugin.name(), plugin.version()));
+        }
+        Ok(result)
+    }
+
+    async fn handle_data_command(&self, args: Vec<&str>) -> Result<String, Box<dyn std::error::Error>> {
+        let mut state = self.state.write().await;
+        
+        match args.first() {
+            Some(&"set") if args.len() >= 3 => {
+                let key = args[1].to_string();
+                let value = serde_json::Value::String(args[2].to_string());
+                state.custom_data.insert(key.clone(), value);
+                Ok(format!("📝 Set data: {} = {}", key, args[2]))
+            }
+            Some(&"get") if args.len() >= 2 => {
+                let key = args[1];
+                match state.custom_data.get(key) {
+                    Some(value) => Ok(format!("📖 {}: {}", key, value)),
+                    None => Ok(format!("❓ Key '{}' not found", key)),
+                }
+            }
+            Some(&"list") => {
+                if state.custom_data.is_empty() {
+                    Ok("📂 No custom data stored".to_string())
+                } else {
+                    let mut result = String::from("📂 Custom Data:\n");
+                    for (key, value) in &state.custom_data {
+                        result.push_str(&format!("  {}: {}\n", key, value));
+                    }
+                    Ok(result)
+                }
+            }
+            _ => Ok("Usage: data [set <key> <value> | get <key> | list]".to_string()),
+        }
+    }
+
+    /// Send a custom message through the network
+    pub async fn send_custom_message(&self, msg_type: &str, payload: serde_json::Value, target: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let message = Message {
+            from: format!("host:{}", self.config.app_name.as_ref().unwrap_or(&"custom_host".to_string())),
+            to: target.to_string(),
+            msg_type: MessageType::Custom(msg_type.to_string()),
+            payload: Some(Payload::Json(payload)),
+            realm: self.config.realm.clone(),
+        };
+
+        log::info!("📤 Sending custom message: {:?}", message);
+        // In a real implementation, you'd send this through TheNodes network
+        Ok(())
+    }
+}

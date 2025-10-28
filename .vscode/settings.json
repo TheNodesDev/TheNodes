@@ -1,0 +1,22 @@
+{
+  // Prevent rust-analyzer from parsing placeholder template files
+  "rust-analyzer.files.excludeDirs": [
+    "templates"
+  ],
+  "rust-analyzer.files.watcherExclude": [
+    "templates/**"
+  ],
+  
+  // Limit analysis to known, valid Cargo projects to avoid picking up templates
+  "rust-analyzer.linkedProjects": [
+    "Cargo.toml",
+    "minimal-crate/Cargo.toml",
+    "test_build/Cargo.toml",
+    "examples/kvstore_plugin/Cargo.toml"
+  ],
+  
+  // Treat template Rust files as plaintext if manually opened (prevents ad-hoc diagnostics)
+  "files.associations": {
+    "**/templates/**/*.rs": "plaintext"
+  }
+}

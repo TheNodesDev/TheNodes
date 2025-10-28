@@ -1,0 +1,169 @@
+use std::sync::Arc;
+use crate::custom_plugin_host::CustomPluginHost;
+
+/// Application-specific command handler for the prompt interface
+pub struct AppCommands {
+    host: Arc<CustomPluginHost>,
+}
+
+impl AppCommands {
+    pub fn new(host: Arc<CustomPluginHost>) -> Self {
+        Self { host }
+    }
+
+    /// Handle application commands
+    pub async fn handle_command(&self, input: &str) -> Result<Option<String>, Box<dyn std::error::Error>> {
+        let parts: Vec<&str> = input.trim().split_whitespace().collect();
+        if parts.is_empty() {
+            return Ok(None);
+        }
+
+        let command = parts[0];
+        let args = if parts.len() > 1 { parts[1..].to_vec() } else { vec![] };
+
+        match command {
+            // Application-specific commands
+            "help" | "?" => Ok(Some(self.show_help())),
+            "status" | "info" => {
+                let result = self.host.handle_custom_command("status", args).await?;
+                Ok(Some(result))
+            }
+            "sessions" => {
+                let result = self.host.handle_custom_command("sessions", args).await?;
+                Ok(Some(result))
+            }
+            "plugins" => {
+                let result = self.host.handle_custom_command("plugins", args).await?;
+                Ok(Some(result))
+            }
+            "data" => {
+                let result = self.host.handle_custom_command("data", args).await?;
+                Ok(Some(result))
+            }
+            "send" => self.handle_send_command(args).await,
+            "session" => self.handle_session_command(args).await,
+            
+            // Let custom plugins handle unknown commands
+            _ => {
+                match self.host.handle_custom_command(command, args).await {
+                    Ok(result) => Ok(Some(result)),
+                    Err(_) => Ok(Some(format!("❓ Unknown command: '{}'. Type 'help' for available commands.", command))),
+                }
+            }
+        }
+    }
+
+    fn show_help(&self) -> String {
+        r#"
+🎮 {{APP_NAME}} Commands:
+
+📊 Information:
+  help, ?          - Show this help message  
+  status, info     - Show host status
+  sessions         - List active sessions
+  plugins          - List loaded custom plugins
+
+📂 Data Management:
+  data set <key> <value>  - Store custom data
+  data get <key>          - Retrieve custom data  
+  data list              - List all custom data
+
+📤 Messaging:
+  send <type> <target> <payload>  - Send custom message
+  
+🎯 Session Management:
+  session create <id>     - Create new session
+  session destroy <id>    - Destroy session
+  session list           - List sessions (same as 'sessions')
+
+🔌 Plugin Commands:
+  (Custom plugin commands will appear here when plugins are loaded)
+
+💡 Tips:
+  - Use Tab completion for commands
+  - Commands are case-sensitive
+  - Use Ctrl+C to exit
+        "#.trim().to_string()
+    }
+
+    async fn handle_send_command(&self, args: Vec<&str>) -> Result<Option<String>, Box<dyn std::error::Error>> {
+        if args.len() < 3 {
+            return Ok(Some("Usage: send <message_type> <target> <payload_json>".to_string()));
+        }
+
+        let msg_type = args[0];
+        let target = args[1];
+        let payload_str = args[2..].join(" ");
+
+        // Try to parse payload as JSON
+        let payload: serde_json::Value = match serde_json::from_str(&payload_str) {
+            Ok(json) => json,
+            Err(_) => {
+                // If not valid JSON, treat as simple string
+                serde_json::Value::String(payload_str)
+            }
+        };
+
+        self.host.send_custom_message(msg_type, payload, target).await?;
+        Ok(Some(format!("📤 Sent {} message to {}", msg_type, target)))
+    }
+
+    async fn handle_session_command(&self, args: Vec<&str>) -> Result<Option<String>, Box<dyn std::error::Error>> {
+        if args.is_empty() {
+            return Ok(Some("Usage: session [create <id> | destroy <id> | list]".to_string()));
+        }
+
+        match args[0] {
+            "create" if args.len() >= 2 => {
+                let session_id = args[1];
+                let payload = serde_json::json!({
+                    "session_id": session_id,
+                    "timestamp": chrono::Utc::now().timestamp()
+                });
+                
+                self.host.send_custom_message("session_create", payload, "*").await?;
+                Ok(Some(format!("🎯 Creating session: {}", session_id)))
+            }
+            "destroy" if args.len() >= 2 => {
+                let session_id = args[1];
+                let payload = serde_json::json!({
+                    "session_id": session_id,
+                    "timestamp": chrono::Utc::now().timestamp()
+                });
+                
+                self.host.send_custom_message("session_destroy", payload, "*").await?;
+                Ok(Some(format!("🗑️ Destroying session: {}", session_id)))
+            }
+            "list" => {
+                let result = self.host.handle_custom_command("sessions", vec![]).await?;
+                Ok(Some(result))
+            }
+            _ => Ok(Some("Usage: session [create <id> | destroy <id> | list]".to_string())),
+        }
+    }
+}
+
+// Integration with TheNodes prompt system
+impl AppCommands {
+    /// Handle prompt input - this integrates with TheNodes' prompt system
+    pub async fn handle_prompt_input(&self, input: &str) -> Result<String, Box<dyn std::error::Error>> {
+        match self.handle_command(input).await? {
+            Some(response) => Ok(response),
+            None => Ok("".to_string()),
+        }
+    }
+
+    /// Get command completions for tab completion
+    pub fn get_completions(&self, partial: &str) -> Vec<String> {
+        let commands = vec![
+            "help", "?", "status", "info", "sessions", "plugins",
+            "data", "send", "session",
+        ];
+
+        commands
+            .into_iter()
+            .filter(|cmd| cmd.starts_with(partial))
+            .map(|cmd| cmd.to_string())
+            .collect()
+    }
+}

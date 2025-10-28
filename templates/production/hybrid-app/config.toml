@@ -1,0 +1,44 @@
+# {{APP_NAME}} configuration (Hybrid: CAL app + NEP plugins)
+# NOTE: realm and app_name are hardcoded in src/app_identity.rs and intentionally
+# not present here to avoid accidental overrides.
+port = 50001
+
+[node]
+state_dir = "data"
+id_file = "node_id"
+node_type = "daemon"
+
+[encryption]
+enabled = true
+mtls = true
+
+[encryption.paths]
+own_certificate  = "pki/own/cert.pem"
+own_private_key  = "pki/own/key.pem"
+trusted_cert_dir = "pki/trusted/certs"
+trusted_crl_dir  = "pki/trusted/crl"
+rejected_dir     = "pki/rejected"
+issuer_cert_dir  = "pki/issuers/certs"
+issuer_crl_dir   = "pki/issuers/crl"
+
+[encryption.trust_policy]
+mode = "allowlist"
+accept_self_signed = true
+store_new_certs = "observed"
+reject_expired = true
+reject_before_valid = true
+enforce_ca_chain = false
+pin_subjects = []
+pin_fp_algo = "sha256"
+
+[encryption.trust_policy.paths]
+observed_dir = "pki/observed/certs"
+
+[logging]
+json_path = "logs/audit.jsonl"
+json_max_bytes = 5242880
+json_rotate = 5
+disable_console = false
+
+[realm_access]
+allowed_node_types = ["daemon", "admin"]

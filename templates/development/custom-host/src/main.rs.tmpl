@@ -1,0 +1,150 @@
+use clap::Parser;
+use std::fs;
+use std::sync::Arc;
+use tokio::signal;
+
+// Import TheNodes framework
+use thenodes::prelude::*;
+use thenodes::network::{start_listener, connect_to_bootstrap_nodes, PeerStore, peer_manager::PeerManager};
+use thenodes::plugin_host::{PluginManager, PluginLoader};
+use thenodes::prompt::run_prompt_mode;
+
+mod custom_plugin_host;
+mod app_commands;
+
+use custom_plugin_host::CustomPluginHost;
+use app_commands::AppCommands;
+
+#[derive(Parser, Debug)]
+#[command(author, version, about = "{{APP_DESCRIPTION}}")]
+struct Args {
+    /// Path to configuration file (TOML)
+    #[arg(short, long, default_value = "config.toml")]
+    config: String,
+
+    /// Enable interactive prompt mode
+    #[arg(long)]
+    prompt: bool,
+
+    /// Enable verbose logging
+    #[arg(short, long)]
+    verbose: bool,
+
+    /// Plugin directory override
+    #[arg(long, default_value = "plugins")]
+    plugin_dir: String,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args = Args::parse();
+
+    // Initialize logging
+    if args.verbose {
+        std::env::set_var("RUST_LOG", "debug");
+    }
+    env_logger::init();
+
+    // Load configuration
+    let config = load_config(&args.config)?;
+    log::info!("Starting {{APP_NAME}} with config: {:?}", config.app_name);
+
+    // Initialize TheNodes components
+    let peer_store = Arc::new(PeerStore::new());
+    let peer_manager = Arc::new(PeerManager::new(peer_store.clone()));
+    let mut plugin_manager = PluginManager::new();
+
+    // Initialize custom plugin host
+    let custom_host = Arc::new(CustomPluginHost::new(config.clone()));
+
+    // Load TheNodes plugins from the standard plugin directory
+    if std::path::Path::new(&args.plugin_dir).exists() {
+        log::info!("🔌 Loading plugins from: {}", args.plugin_dir);
+        let plugin_loader = PluginLoader::new();
+        
+        // Load each .so/.dll file in the plugin directory
+        for entry in fs::read_dir(&args.plugin_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            
+            if path.extension().and_then(|s| s.to_str()) == Some("so") ||
+               path.extension().and_then(|s| s.to_str()) == Some("dll") {
+                
+                log::info!("📦 Loading plugin: {:?}", path);
+                match plugin_loader.load_plugin(path) {
+                    Ok(_) => log::info!("✅ Plugin loaded successfully"),
+                    Err(e) => log::error!("❌ Failed to load plugin: {}", e),
+                }
+            }
+        }
+    } else {
+        log::warn!("⚠️  Plugin directory '{}' does not exist", args.plugin_dir);
+    }
+
+    // Start TheNodes networking
+    let listener_handle = tokio::spawn({
+        let peer_manager = peer_manager.clone();
+        let plugin_manager = Arc::new(plugin_manager);
+        let custom_host = custom_host.clone();
+        async move {
+            if let Err(e) = start_listener(
+                config.port,
+                peer_manager,
+                plugin_manager,
+                Some(custom_host)
+            ).await {
+                log::error!("Listener failed: {}", e);
+            }
+        }
+    });
+
+    // Connect to bootstrap nodes
+    if let Some(bootstrap_nodes) = &config.bootstrap_nodes {
+        let bootstrap_handle = tokio::spawn({
+            let peer_manager = peer_manager.clone();
+            let bootstrap_nodes = bootstrap_nodes.clone();
+            async move {
+                if let Err(e) = connect_to_bootstrap_nodes(&bootstrap_nodes, peer_manager).await {
+                    log::error!("Bootstrap connection failed: {}", e);
+                }
+            }
+        });
+
+        // Wait a bit for bootstrap connections
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+    }
+
+    log::info!("🚀 {{APP_NAME}} is running. Press Ctrl+C to shutdown...");
+
+    // Handle prompt mode or wait for shutdown
+    if args.prompt {
+        log::info!("🎮 Starting interactive prompt mode");
+        let app_commands = AppCommands::new(custom_host.clone());
+        
+        // Run prompt mode with custom commands
+        if let Err(e) = run_prompt_mode(Some(Box::new(app_commands))).await {
+            log::error!("Prompt mode failed: {}", e);
+        }
+    } else {
+        // Wait for shutdown signal
+        signal::ctrl_c().await?;
+    }
+
+    log::info!("🛑 Shutting down {{APP_NAME}}...");
+
+    // Cleanup
+    listener_handle.abort();
+
+    log::info!("✅ {{APP_NAME}} shutdown complete");
+    Ok(())
+}
+
+fn load_config(path: &str) -> Result<Config, Box<dyn std::error::Error>> {
+    let content = fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read config file '{}': {}", path, e))?;
+    
+    let config: Config = toml::from_str(&content)
+        .map_err(|e| format!("Failed to parse config file '{}': {}", path, e))?;
+    
+    Ok(config)
+}

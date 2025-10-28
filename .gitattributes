@@ -1,0 +1,18 @@
+# Normalize line endings to LF for Rust sources and text files
+*.rs text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.sh text eol=lf
+
+# Mark binary artifacts
+*.so binary
+*.dylib binary
+*.dll binary
+*.pem text eol=lf
+*.crt text eol=lf
+
+# GitHub linguist hints
+*.rs linguist-language=Rust

@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    name: build (stable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Clippy (relaxed)
+        run: |
+          cargo clippy --workspace --all-targets --all-features -- \
+            -D clippy::correctness \
+            -D clippy::perf \
+            -W clippy::style \
+            -W clippy::complexity
+      - name: Build
+        run: cargo build --workspace --all-targets --locked
+      - name: Tests
+        run: cargo test --workspace --all-features -- --nocapture
+
+  msrv:
+    name: build (MSRV)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.74.0
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Build (locked)
+        run: cargo build --workspace --all-targets --locked

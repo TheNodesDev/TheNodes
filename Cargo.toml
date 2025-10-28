@@ -5,6 +5,11 @@ edition = "2021"
 license = "Apache-2.0 OR MIT"
 repository = "https://github.com/TheNodesDev/TheNodes"
 homepage = "https://thenodes.dev"
+description = "TheNodes is a modular, plugin-driven P2P node framework for Rust, supporting node-embedded plugins (NEP) and core-as-a-library (CAL) modes with async-first APIs."
+readme = "README.md"
+documentation = "https://docs.rs/thenodes"
+keywords = ["p2p", "networking", "async", "plugins", "security"]
+categories = ["network-programming", "asynchronous", "cryptography"]
 
 [lib]
 name = "thenodes"

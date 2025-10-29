@@ -5,7 +5,12 @@ All notable changes to this project will be documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project adheres to [Semantic Versioning](https://semver.org/) once the first public release is cut.
 
 ## [Unreleased]
-Nothing yet.
+
+### Fixed
+- Templates (production/hybrid-app): align to current public APIs so newly scaffolded apps build cleanly.
+	- listener: add the new `emit_console_errors: bool` argument to `start_listener(…)`.
+	- bootstrap: pass `allow_console` based on prompt mode (`!args.prompt`).
+	- prompt: update to `run_prompt_mode(plugin_manager, config)` two-argument signature.
 
 ## [0.1.0] - 2025-10-28
 

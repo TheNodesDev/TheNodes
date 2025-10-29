@@ -54,6 +54,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Start listener
     let peer_store = thenodes::network::peer_store::PeerStore::new();
+    let emit_listener_errors = !args.prompt;
     let _listen_task = tokio::spawn({
         let pm = peer_manager.clone();
         let pmgr = plugin_manager_arc.clone();
@@ -61,8 +62,18 @@ async fn main() -> anyhow::Result<()> {
         let cfg_clone = cfg.clone();
         let node_id = node_id.clone();
         let peer_store = peer_store.clone();
+        let emit_console_errors = emit_listener_errors;
         async move {
-            if let Err(e) = thenodes::network::listener::start_listener(port, realm, pm, pmgr, &cfg_clone, node_id, peer_store).await {
+            if let Err(e) = thenodes::network::listener::start_listener(
+                port,
+                realm,
+                pm,
+                pmgr,
+                &cfg_clone,
+                node_id,
+                peer_store,
+                emit_console_errors,
+            ).await {
                 eprintln!("listener error: {}", e);
             }
         }
@@ -78,7 +89,7 @@ async fn main() -> anyhow::Result<()> {
             peer_manager.clone(),
             plugin_manager_arc.clone(),
             error_buffer,
-            true,
+            !args.prompt,
             node_id.clone(),
             peer_store.clone(),
         ).await;
@@ -86,7 +97,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Optional interactive prompt
     if args.prompt {
-        thenodes::prompt::run_prompt_mode(plugin_manager_arc.clone(), cfg.clone(), None).await;
+        thenodes::prompt::run_prompt_mode(plugin_manager_arc.clone(), cfg.clone()).await;
     }
 
     // Park main; services run on tasks

@@ -285,18 +285,14 @@ generate_project() {
     process_directory "$TEMPLATE_DIR/$RESOLVED_TEMPLATE_PATH" "$output_path" "$app_name" "$REALM_NAME" "$DESCRIPTION"
 
     # After processing, rename manifest templates to real Cargo manifests
-    if compgen -G "$output_path/**/Cargo.toml.template" > /dev/null; then
-        while IFS= read -r -d '' tmpl; do
-            mv "$tmpl" "${tmpl%.template}"
-        done < <(find "$output_path" -type f -name 'Cargo.toml.template' -print0)
-    fi
-    
+    while IFS= read -r -d '' tmpl; do
+        mv "$tmpl" "${tmpl%.template}"
+    done < <(find "$output_path" -type f -name 'Cargo.toml.template' -print0)
+
     # Rename any Rust source templates (*.rs.tmpl) back to *.rs
-    if compgen -G "$output_path/**/*.rs.tmpl" > /dev/null; then
-        while IFS= read -r -d '' tmpl; do
-            mv "$tmpl" "${tmpl%.tmpl}"
-        done < <(find "$output_path" -type f -name '*.rs.tmpl' -print0)
-    fi
+    while IFS= read -r -d '' tmpl; do
+        mv "$tmpl" "${tmpl%.tmpl}"
+    done < <(find "$output_path" -type f -name '*.rs.tmpl' -print0)
     
     # Create additional directory structure
     log $BLUE "🏗️  Creating directory structure..."

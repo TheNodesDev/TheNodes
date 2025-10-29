@@ -11,6 +11,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 	- listener: add the new `emit_console_errors: bool` argument to `start_listener(…)`.
 	- bootstrap: pass `allow_console` based on prompt mode (`!args.prompt`).
 	- prompt: update to `run_prompt_mode(plugin_manager, config)` two-argument signature.
+- Generator: ensure template files are fully materialized in new apps.
+	- Always rename `Cargo.toml.template` → `Cargo.toml` and `*.rs.tmpl` → `*.rs` (removed fragile glob checks).
 
 ## [0.1.0] - 2025-10-28
 

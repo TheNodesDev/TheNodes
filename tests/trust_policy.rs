@@ -46,13 +46,8 @@ fn fingerprint_pin_enforced() {
     tp.pin_fingerprints = Some(vec![fp.clone()]);
     enc.trust_policy = Some(tp);
     let policy = EffectiveTrustPolicy::from_config(&enc);
-    let decision = evaluate_peer_cert_chain(
-        &policy,
-        None,
-        None,
-        std::slice::from_ref(&dummy),
-        None,
-    );
+    let decision =
+        evaluate_peer_cert_chain(&policy, None, None, std::slice::from_ref(&dummy), None);
     assert_eq!(
         decision.outcome,
         TrustDecisionOutcome::Accept,

@@ -7,7 +7,7 @@ use tokio::sync::mpsc::Sender;
 use tokio::sync::Mutex;
 
 use crate::config::Config;
-use crate::network::{connect_to_peer, Peer, PeerStore};
+use crate::network::{Peer, PeerStore};
 use crate::plugin_host::manager::PluginManager;
 use crate::realms::RealmInfo;
 
@@ -18,6 +18,12 @@ pub struct PeerManager {
     // Mapping of a peer's advertised listening address (host:port) -> node_id.
     // Lets us suppress redundant outbound dials when an inbound connection already exists.
     listen_addrs: Arc<Mutex<HashMap<String, String>>>,
+}
+
+impl Default for PeerManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PeerManager {
@@ -174,15 +180,17 @@ impl PeerManager {
             attempted += 1;
             let addr_str = addr.to_string();
             let peer = Peer::new(&format!("retry-{}", addr_str), &addr_str);
-            match connect_to_peer(
-                &peer,
-                realm.clone(),
-                config.port,
-                peer_manager.clone(),
-                plugin_manager.clone(),
-                true,
-                config,
-                local_node_id.clone(),
+            match crate::network::transport::connect_to_peer(
+                crate::network::transport::ConnectToPeerParams {
+                    peer: &peer,
+                    our_realm: realm.clone(),
+                    our_port: config.port,
+                    peer_manager: peer_manager.clone(),
+                    plugin_manager: plugin_manager.clone(),
+                    allow_console: true,
+                    config: config.clone(),
+                    local_node_id: local_node_id.clone(),
+                },
             )
             .await
             {

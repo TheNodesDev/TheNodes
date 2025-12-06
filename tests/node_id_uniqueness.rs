@@ -73,14 +73,16 @@ async fn node_id_self_and_duplicate_rejections() {
         address: format!("127.0.0.1:{}", cfg.port),
     };
     let res_self = thenodes::network::transport::connect_to_peer(
-        &peer,
-        realm.clone(),
-        cfg.port,
-        peer_manager.clone(),
-        plugin_manager.clone(),
-        false,
-        &cfg,
-        "node-A".into(),
+        thenodes::network::transport::ConnectToPeerParams {
+            peer: &peer,
+            our_realm: realm.clone(),
+            our_port: cfg.port,
+            peer_manager: peer_manager.clone(),
+            plugin_manager: plugin_manager.clone(),
+            allow_console: false,
+            config: cfg.clone(),
+            local_node_id: "node-A".into(),
+        },
     )
     .await;
     assert!(res_self.is_err(), "expected self-id rejection");
@@ -99,14 +101,16 @@ async fn node_id_self_and_duplicate_rejections() {
     let peer_for_ok = peer.clone();
     let handle_ok = tokio::spawn(async move {
         let _ = thenodes::network::transport::connect_to_peer(
-            &peer_for_ok,
-            realm2,
-            cfg.port,
-            pm_for_wait.clone(),
-            plugin2,
-            false,
-            &cfg2,
-            "node-B".into(),
+            thenodes::network::transport::ConnectToPeerParams {
+                peer: &peer_for_ok,
+                our_realm: realm2,
+                our_port: cfg.port,
+                peer_manager: pm_for_wait.clone(),
+                plugin_manager: plugin2,
+                allow_console: false,
+                config: cfg2,
+                local_node_id: "node-B".into(),
+            },
         )
         .await;
     });
@@ -128,14 +132,16 @@ async fn node_id_self_and_duplicate_rejections() {
     let res_dup = tokio::time::timeout(
         Duration::from_secs(5),
         thenodes::network::transport::connect_to_peer(
-            &peer.clone(),
-            realm.clone(),
-            cfg.port,
-            peer_manager.clone(),
-            plugin_manager.clone(),
-            false,
-            &cfg,
-            "node-C".into(),
+            thenodes::network::transport::ConnectToPeerParams {
+                peer: &peer,
+                our_realm: realm.clone(),
+                our_port: cfg.port,
+                peer_manager: peer_manager.clone(),
+                plugin_manager: plugin_manager.clone(),
+                allow_console: false,
+                config: cfg.clone(),
+                local_node_id: "node-C".into(),
+            },
         ),
     )
     .await

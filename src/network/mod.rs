@@ -19,6 +19,12 @@ pub struct Network {
     pub peers: Vec<String>, // Placeholder
 }
 
+impl Default for Network {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Network {
     pub fn new() -> Self {
         Self { peers: vec![] }

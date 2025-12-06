@@ -29,6 +29,12 @@ pub struct PeerStore {
     inner: Arc<RwLock<HashMap<SocketAddr, PeerRecord>>>,
 }
 
+impl Default for PeerStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PeerStore {
     pub fn new() -> Self {
         Self {

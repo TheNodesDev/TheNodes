@@ -6,22 +6,19 @@ use tokio_rustls::rustls::pki_types::CertificateDer;
 // Simple dummy cert (non-compliant) to exercise pin logic — fingerprint fallback path.
 const DUMMY_CERT: &[u8] = b"\x30\x03\x02\x01\x01";
 
-fn base_policy() -> thenodes::config::EncryptionConfig {
-    let mut enc = thenodes::config::EncryptionConfig::default();
-    let mut tp = thenodes::config::TrustPolicyConfig::default();
-    tp.mode = Some("open".to_string());
-    enc.trust_policy = Some(tp);
-    enc
-}
+// removed: base_policy was unused after struct-literal refactors
 
 #[test]
 fn fingerprint_pin_match_accepts() {
-    let mut enc = base_policy();
-    // Compute fp
     let fp = spki_fingerprint(&CertificateDer::from(DUMMY_CERT.to_vec())).unwrap();
-    if let Some(tp) = &mut enc.trust_policy {
-        tp.pin_fingerprints = Some(vec![fp.clone()]);
-    }
+    let enc = thenodes::config::EncryptionConfig {
+        trust_policy: Some(thenodes::config::TrustPolicyConfig {
+            mode: Some("open".into()),
+            pin_fingerprints: Some(vec![fp.clone()]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
     let policy = EffectiveTrustPolicy::from_config(&enc);
     let decision = evaluate_peer_cert_chain(
         &policy,
@@ -39,10 +36,14 @@ fn fingerprint_pin_match_accepts() {
 
 #[test]
 fn fingerprint_pin_mismatch_rejects() {
-    let mut enc = base_policy();
-    if let Some(tp) = &mut enc.trust_policy {
-        tp.pin_fingerprints = Some(vec!["deadbeef".into()]);
-    }
+    let enc = thenodes::config::EncryptionConfig {
+        trust_policy: Some(thenodes::config::TrustPolicyConfig {
+            mode: Some("open".into()),
+            pin_fingerprints: Some(vec!["deadbeef".into()]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
     let policy = EffectiveTrustPolicy::from_config(&enc);
     let decision = evaluate_peer_cert_chain(
         &policy,
@@ -60,10 +61,14 @@ fn fingerprint_pin_mismatch_rejects() {
 
 #[test]
 fn subject_pin_mismatch_rejects() {
-    let mut enc = base_policy();
-    if let Some(tp) = &mut enc.trust_policy {
-        tp.pin_subjects = Some(vec!['X'.to_string()]);
-    }
+    let enc = thenodes::config::EncryptionConfig {
+        trust_policy: Some(thenodes::config::TrustPolicyConfig {
+            mode: Some("open".into()),
+            pin_subjects: Some(vec![String::from('X')]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
     let policy = EffectiveTrustPolicy::from_config(&enc);
     let decision = evaluate_peer_cert_chain(
         &policy,

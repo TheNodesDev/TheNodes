@@ -7,14 +7,13 @@ use tokio_rustls::rustls::pki_types::CertificateDer;
 const DUMMY_CERT: &[u8] = b"\x30\x03\x02\x01\x01"; // ASN.1 SEQUENCE of INTEGER 1
 
 fn make_policy(open: bool) -> EffectiveTrustPolicy {
-    let mut enc = thenodes::config::EncryptionConfig::default();
-    let mut tp = thenodes::config::TrustPolicyConfig::default();
-    tp.mode = Some(if open {
-        "open".into()
-    } else {
-        "allowlist".into()
-    });
-    enc.trust_policy = Some(tp);
+    let enc = thenodes::config::EncryptionConfig {
+        trust_policy: Some(thenodes::config::TrustPolicyConfig {
+            mode: Some(if open { "open".into() } else { "allowlist".into() }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
     EffectiveTrustPolicy::from_config(&enc)
 }
 
@@ -40,11 +39,14 @@ fn open_mode_accepts_dummy_cert() {
 fn fingerprint_pin_enforced() {
     let dummy = CertificateDer::from(DUMMY_CERT.to_vec());
     let fp = spki_fingerprint(&dummy).unwrap();
-    let mut enc = thenodes::config::EncryptionConfig::default();
-    let mut tp = thenodes::config::TrustPolicyConfig::default();
-    tp.mode = Some("open".into());
-    tp.pin_fingerprints = Some(vec![fp.clone()]);
-    enc.trust_policy = Some(tp);
+    let enc = thenodes::config::EncryptionConfig {
+        trust_policy: Some(thenodes::config::TrustPolicyConfig {
+            mode: Some("open".into()),
+            pin_fingerprints: Some(vec![fp.clone()]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
     let policy = EffectiveTrustPolicy::from_config(&enc);
     let decision =
         evaluate_peer_cert_chain(&policy, None, None, std::slice::from_ref(&dummy), None);
@@ -55,10 +57,14 @@ fn fingerprint_pin_enforced() {
     );
 
     // Now mismatch
-    let mut tp2 = thenodes::config::TrustPolicyConfig::default();
-    tp2.mode = Some("open".into());
-    tp2.pin_fingerprints = Some(vec!["deadbeef".into()]);
-    enc.trust_policy = Some(tp2);
+    let enc = thenodes::config::EncryptionConfig {
+        trust_policy: Some(thenodes::config::TrustPolicyConfig {
+            mode: Some("open".into()),
+            pin_fingerprints: Some(vec!["deadbeef".into()]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
     let policy2 = EffectiveTrustPolicy::from_config(&enc);
     let decision2 = evaluate_peer_cert_chain(&policy2, None, None, &[dummy], None);
     assert_eq!(
@@ -72,11 +78,14 @@ fn fingerprint_pin_enforced() {
 fn subject_pin_unparsed_rejects() {
     // Our dummy cert cannot be parsed -> expect subject-unparsed when pins set
     let dummy = CertificateDer::from(DUMMY_CERT.to_vec());
-    let mut enc = thenodes::config::EncryptionConfig::default();
-    let mut tp = thenodes::config::TrustPolicyConfig::default();
-    tp.mode = Some("open".into());
-    tp.pin_subjects = Some(vec!["CN=Test".into()]);
-    enc.trust_policy = Some(tp);
+    let enc = thenodes::config::EncryptionConfig {
+        trust_policy: Some(thenodes::config::TrustPolicyConfig {
+            mode: Some("open".into()),
+            pin_subjects: Some(vec!["CN=Test".into()]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
     let policy = EffectiveTrustPolicy::from_config(&enc);
     let decision = evaluate_peer_cert_chain(&policy, None, None, &[dummy], None);
     assert_eq!(

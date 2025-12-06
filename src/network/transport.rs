@@ -68,16 +68,19 @@ use crate::plugin_host::manager::PluginManager;
 use crate::security::trust::{evaluate_peer_cert_chain, EffectiveTrustPolicy};
 // ...existing code...
 
-pub async fn connect_to_peer(
-    peer: &Peer,
-    our_realm: RealmInfo,
-    our_port: u16,
-    peer_manager: PeerManager,
-    plugin_manager: Arc<PluginManager>,
-    allow_console: bool,
-    config: &Config,
-    local_node_id: String,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
+pub struct ConnectToPeerParams<'a> {
+    pub peer: &'a Peer,
+    pub our_realm: RealmInfo,
+    pub our_port: u16,
+    pub peer_manager: PeerManager,
+    pub plugin_manager: Arc<PluginManager>,
+    pub allow_console: bool,
+    pub config: Config,
+    pub local_node_id: String,
+}
+
+pub async fn connect_to_peer<'a>(params: ConnectToPeerParams<'a>) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let ConnectToPeerParams { peer, our_realm, our_port, peer_manager, plugin_manager, allow_console, config, local_node_id } = params;
     emit_network_event(
         "transport",
         LogLevel::Info,
@@ -193,9 +196,22 @@ pub async fn connect_to_peer(
                         Some(format!("chain_len={}", cert_chain.len())),
                         allow_console,
                     );
-                    client_builder
-                        .with_client_auth_cert(cert_chain, key_opt.unwrap())
-                        .expect("invalid client cert/key")
+                    match key_opt {
+                        Some(key) => client_builder
+                            .with_client_auth_cert(cert_chain, key)
+                            .expect("invalid client cert/key"),
+                        None => {
+                            emit_network_event(
+                                "transport",
+                                LogLevel::Warn,
+                                "mtls_client_key_missing",
+                                Some(addr.to_string()),
+                                Some("falling_back=no_client_auth".to_string()),
+                                allow_console,
+                            );
+                            client_builder.with_no_client_auth()
+                        }
+                    }
                 }
             } else {
                 client_builder.with_no_client_auth()
@@ -256,7 +272,7 @@ pub async fn connect_to_peer(
                 .peer_certificates()
                 .unwrap_or(&[])
                 .iter()
-                .map(|c| CertificateDer::from(c.clone().into_owned()))
+                .map(|c| c.clone().into_owned())
                 .collect();
             let trusted_dir = enc
                 .paths
@@ -405,12 +421,11 @@ pub async fn connect_to_peer(
         let mut meta = dispatcher::meta("network", LogLevel::Info);
         meta.corr_id = Some(dispatcher::correlation_id());
         // Determine flavor: same addr vs different addr
-        let action;
-        if peer_manager.has_addr(&addr).await {
-            action = "peer_already_connected";
+        let action = if peer_manager.has_addr(&addr).await {
+            "peer_already_connected"
         } else {
-            action = "peer_cross_connect_suppressed"; // opposite side likely also dialing us
-        }
+            "peer_cross_connect_suppressed" // opposite side likely also dialing us
+        };
         dispatcher::emit(LogEvent::System(SystemEvent {
             meta,
             action: action.into(),
@@ -451,7 +466,7 @@ pub async fn connect_to_peer(
     // Create mpsc channel for outgoing messages
     let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(32);
     let mut write_half_for_task = writer;
-    let addr_clone = addr.clone();
+    let addr_clone = addr;
     let allow_console_for_writer = allow_console;
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
@@ -494,13 +509,8 @@ pub async fn connect_to_peer(
         return Err(e.into());
     }
     // If remote provided a listen_addr in its HELLO, record it for suppression logic
-    if let MessageType::Hello {
-        ref listen_addr, ..
-    } = hello.msg_type
-    {
-        if let Some(listen) = listen_addr {
-            peer_manager.add_listen_addr(listen, &remote_node_id).await;
-        }
+    if let MessageType::Hello { listen_addr: Some(listen), .. } = hello.msg_type {
+        peer_manager.add_listen_addr(&listen, &remote_node_id).await;
     }
 
     // Spawn periodic PeerRequest gossip if discovery enabled
@@ -508,7 +518,7 @@ pub async fn connect_to_peer(
         if disc.enabled {
             let interval = disc.request_interval_secs.unwrap_or(90);
             let want = disc.request_want.unwrap_or(16);
-            let target_addr = addr.clone();
+            let target_addr = addr;
             let allow_console_for_gossip = allow_console;
             tokio::spawn(async move {
                 loop {
@@ -665,9 +675,22 @@ pub async fn connect_to_peer_handshake_only(
                         Some(format!("chain_len={}", cert_chain.len())),
                         allow_console,
                     );
-                    client_builder
-                        .with_client_auth_cert(cert_chain, key_opt.unwrap())
-                        .expect("invalid client cert/key")
+                    match key_opt {
+                        Some(key) => client_builder
+                            .with_client_auth_cert(cert_chain, key)
+                            .expect("invalid client cert/key"),
+                        None => {
+                            emit_network_event(
+                                "transport",
+                                LogLevel::Warn,
+                                "mtls_client_key_missing_handshake_only",
+                                Some(addr.to_string()),
+                                Some("falling_back=no_client_auth".to_string()),
+                                allow_console,
+                            );
+                            client_builder.with_no_client_auth()
+                        }
+                    }
                 }
             } else {
                 client_builder.with_no_client_auth()
@@ -713,7 +736,7 @@ pub async fn connect_to_peer_handshake_only(
                 .peer_certificates()
                 .unwrap_or(&[])
                 .iter()
-                .map(|c| CertificateDer::from(c.clone().into_owned()))
+                .map(|c| c.clone().into_owned())
                 .collect();
             let trusted_dir = enc
                 .paths

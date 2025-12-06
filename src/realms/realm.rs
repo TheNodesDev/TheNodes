@@ -12,6 +12,7 @@ pub struct RealmInfo {
 }
 
 impl RealmInfo {
+    #[allow(clippy::should_implement_trait)]
     pub fn default() -> Self {
         Self {
             name: "default".to_string(),
@@ -59,7 +60,11 @@ impl RealmInfo {
 // Provide std::default::Default so templates that call unwrap_or_default() compile.
 impl Default for RealmInfo {
     fn default() -> Self {
-        Self::default()
+        Self {
+            name: "default".to_string(),
+            code: Some("default".to_string()),
+            version: "1.0".to_string(),
+        }
     }
 }
 

@@ -12,6 +12,7 @@ use std::io::Cursor;
 use std::path::Path;
 use std::path::PathBuf;
 use tokio_rustls::rustls::pki_types::CertificateDer;
+use std::str::FromStr;
 
 /// Runtime trust policy mode (Phase 1)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,24 +31,28 @@ pub enum StoreNew {
     Observed,
 }
 
-impl TrustMode {
-    pub fn from_str(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
+impl FromStr for TrustMode {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let m = match s.to_lowercase().as_str() {
             "allowlist" => TrustMode::Allowlist,
             "tofu" => TrustMode::Tofu,
             "observe" | "record" | "quarantine" => TrustMode::Observe,
             "hybrid" => TrustMode::HybridPlaceholder,
             _ => TrustMode::Open,
-        }
+        };
+        Ok(m)
     }
 }
 
-impl StoreNew {
-    pub fn from_str(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
+impl FromStr for StoreNew {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let v = match s.to_lowercase().as_str() {
             "observed" => StoreNew::Observed,
             _ => StoreNew::None,
-        }
+        };
+        Ok(v)
     }
 }
 
@@ -74,13 +79,13 @@ impl EffectiveTrustPolicy {
             let mode = tp
                 .mode
                 .as_deref()
-                .map(TrustMode::from_str)
+                .and_then(|s| TrustMode::from_str(s).ok())
                 .unwrap_or(TrustMode::Open);
             let accept_self_signed = tp.accept_self_signed.unwrap_or(false);
             let store_new = tp
                 .store_new_certs
                 .as_deref()
-                .map(StoreNew::from_str)
+                .and_then(|s| StoreNew::from_str(s).ok())
                 .unwrap_or(StoreNew::None);
             let observed_dir = tp.paths.as_ref().and_then(|p| p.observed_dir.clone());
             let reject_expired = tp.reject_expired.unwrap_or(false);
@@ -312,9 +317,8 @@ pub fn evaluate_peer_cert_chain(
             Some(subj) => {
                 let mut matched = false;
                 for pin in &policy.pin_subjects {
-                    if pin.starts_with('~') {
+                    if let Some(needle) = pin.strip_prefix('~') {
                         // substring pin
-                        let needle = &pin[1..];
                         if subj.contains(needle) {
                             matched = true;
                             break;
@@ -381,7 +385,7 @@ pub fn evaluate_peer_cert_chain(
                     }
                 }
             }
-            return TrustDecision::accept(
+            TrustDecision::accept(
                 "open-policy",
                 fp_ref,
                 stored,
@@ -389,14 +393,14 @@ pub fn evaluate_peer_cert_chain(
                 time_valid,
                 chain_reason,
                 time_reason,
-            );
+            )
         }
         TrustMode::Allowlist => {
             if let Some(dir) = trusted_cert_dir {
                 if let Some(fp) = leaf_fp.as_ref() {
                     if let Ok(set) = load_trusted_fingerprints(dir) {
                         if set.contains(fp) {
-                            return TrustDecision::accept(
+                            TrustDecision::accept(
                                 "present-in-trusted",
                                 fp_ref,
                                 false,
@@ -404,7 +408,7 @@ pub fn evaluate_peer_cert_chain(
                                 time_valid,
                                 chain_reason,
                                 time_reason,
-                            );
+                            )
                         } else {
                             if policy.store_new == StoreNew::Observed {
                                 if let (Some(obs_dir), Some(first)) =
@@ -419,14 +423,14 @@ pub fn evaluate_peer_cert_chain(
                                     let _ = store_observed_cert(obs_dir, fp, pem.as_bytes());
                                 }
                             }
-                            return TrustDecision::reject(
+                            TrustDecision::reject(
                                 "not-in-trusted",
                                 fp_ref,
                                 chain_valid,
                                 time_valid,
                                 chain_reason,
                                 time_reason,
-                            );
+                            )
                         }
                     } else {
                         if policy.store_new == StoreNew::Observed {
@@ -443,34 +447,34 @@ pub fn evaluate_peer_cert_chain(
                                 }
                             }
                         }
-                        return TrustDecision::reject(
+                        TrustDecision::reject(
                             "trusted-dir-unreadable",
                             fp_ref,
                             chain_valid,
                             time_valid,
                             chain_reason,
                             time_reason,
-                        );
+                        )
                     }
                 } else {
-                    return TrustDecision::reject(
+                    TrustDecision::reject(
                         "no-leaf-cert",
                         None,
                         chain_valid,
                         time_valid,
                         chain_reason,
                         time_reason,
-                    );
+                    )
                 }
             } else {
-                return TrustDecision::reject(
+                TrustDecision::reject(
                     "no-trusted-dir",
                     fp_ref,
                     chain_valid,
                     time_valid,
                     chain_reason,
                     time_reason,
-                );
+                )
             }
         }
         TrustMode::Tofu => {
@@ -548,7 +552,7 @@ pub fn evaluate_peer_cert_chain(
                     }
                 }
             }
-            return TrustDecision::accept(
+            TrustDecision::accept(
                 "hybrid-placeholder-open",
                 leaf_fp,
                 stored,
@@ -556,7 +560,7 @@ pub fn evaluate_peer_cert_chain(
                 time_valid,
                 chain_reason,
                 time_reason,
-            );
+            )
         }
         TrustMode::Observe => {
             let mut stored = false;
@@ -572,7 +576,7 @@ pub fn evaluate_peer_cert_chain(
                     stored = true;
                 }
             }
-            return TrustDecision {
+            TrustDecision {
                 outcome: TrustDecisionOutcome::Reject,
                 reason: "observe-only",
                 fingerprint: leaf_fp,
@@ -581,7 +585,7 @@ pub fn evaluate_peer_cert_chain(
                 time_valid,
                 chain_reason,
                 time_reason,
-            };
+            }
         }
     }
 }

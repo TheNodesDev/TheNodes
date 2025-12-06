@@ -616,7 +616,7 @@ impl rustyline::completion::Completer for PromptCompleter {
 
         // Parse tokens to specialize completion sets
         let parts: Vec<&str> = before.split_whitespace().collect();
-        if !self.in_plugin && parts.get(0).copied() == Some("trust") {
+        if !self.in_plugin && parts.first().copied() == Some("trust") {
             match parts.get(1).copied().unwrap_or("") {
                 sub if sub.is_empty() || "observed".starts_with(sub) || sub.starts_with("o") => {
                     let opts = ["observed list"];

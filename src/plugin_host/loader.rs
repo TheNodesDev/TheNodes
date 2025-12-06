@@ -75,6 +75,9 @@ impl PluginRegistrarApi {
         Ok(())
     }
 
+    /// # Safety
+    /// The caller must ensure that `ptr` points to a valid `PluginRegistrarApi` instance
+    /// with the expected ABI layout. Passing an invalid or dangling pointer is undefined behavior.
     pub unsafe fn from_raw<'a>(
         ptr: *const PluginRegistrarApi,
     ) -> Result<&'a PluginRegistrarApi, PluginApiError> {
@@ -155,6 +158,12 @@ unsafe extern "C" fn register_handler_thunk(ctx: *mut c_void, handle: PluginHand
 
 pub struct PluginLoader {
     loaded: Vec<Library>,
+}
+
+impl Default for PluginLoader {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PluginLoader {

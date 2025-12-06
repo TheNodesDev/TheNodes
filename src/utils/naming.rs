@@ -30,11 +30,9 @@ pub fn to_kebab_ascii_strict(s: &str) -> String {
             if lc.is_ascii_alphanumeric() {
                 out.push(lc);
                 last_dash = false;
-            } else {
-                if !last_dash {
-                    out.push('-');
-                    last_dash = true;
-                }
+            } else if !last_dash {
+                out.push('-');
+                last_dash = true;
             }
             continue;
         }
@@ -59,11 +57,9 @@ pub fn to_kebab_ascii_strict(s: &str) -> String {
                     pushed_any = true;
                 }
             }
-            if !pushed_any {
-                if !last_dash {
-                    out.push('-');
-                    last_dash = true;
-                }
+            if !pushed_any && !last_dash {
+                out.push('-');
+                last_dash = true;
             }
         } else {
             // Non-Latin scripts: do not transliterate; treat as separator

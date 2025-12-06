@@ -123,5 +123,5 @@ async fn mtls_open_mode_basic_handshake() {
 
     // Cleanup
     // We don't have a shutdown signal for listener yet; detach handle.
-    let _ = listener_handle.abort();
+    listener_handle.abort();
 }

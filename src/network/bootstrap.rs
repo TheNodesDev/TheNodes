@@ -1,15 +1,17 @@
 // src/network/bootstrap.rs
 
-use super::{connect_to_peer, Peer, PeerSource, PeerStore};
+use super::{Peer, PeerSource, PeerStore};
 use crate::config::Config;
 use crate::events::model::LogLevel;
 use crate::network::events::emit_network_event;
 use crate::network::peer_manager::PeerManager;
+use crate::network::transport::connect_to_peer;
 use crate::plugin_host::manager::PluginManager;
 use crate::realms::RealmInfo;
 use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
 
+#[allow(clippy::too_many_arguments)]
 pub async fn connect_to_bootstrap_nodes(
     config: &Config,
     realm: RealmInfo,
@@ -45,16 +47,16 @@ pub async fn connect_to_bootstrap_nodes(
                         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                         continue;
                     }
-                    match connect_to_peer(
-                        &peer,
-                        realm_clone.clone(),
-                        port,
-                        peer_manager_clone.clone(),
-                        plugin_manager_clone.clone(),
+                    match connect_to_peer(crate::network::transport::ConnectToPeerParams {
+                        peer: &peer,
+                        our_realm: realm_clone.clone(),
+                        our_port: port,
+                        peer_manager: peer_manager_clone.clone(),
+                        plugin_manager: plugin_manager_clone.clone(),
                         allow_console,
-                        &config_clone,
-                        (*node_id_for_task).clone(),
-                    )
+                        config: config_clone.clone(),
+                        local_node_id: (*node_id_for_task).clone(),
+                    })
                     .await
                     {
                         Ok(_) => {

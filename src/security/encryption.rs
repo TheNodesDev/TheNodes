@@ -18,7 +18,7 @@ pub fn extract_validity_windows(der: &[u8]) -> Option<(i64, i64)> {
 /// - presence of at least one cert (leaf)
 /// - if more than one cert provided OR issuer root present on disk matching leaf issuer => treat as valid
 /// - self-signed leaf accepted only if accept_self_signed allowed (caller decides)
-/// Returns (chain_valid, chain_reason, self_signed_leaf)
+///   Returns (chain_valid, chain_reason, self_signed_leaf)
 pub fn validate_chain_simple(
     peer_chain: &[tokio_rustls::rustls::pki_types::CertificateDer<'_>],
     issuer_cert_dir: Option<&str>,

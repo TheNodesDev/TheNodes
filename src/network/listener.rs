@@ -28,6 +28,7 @@ fn log_network_event(
     emit_network_event("listener", level, action, addr, detail, allow_console);
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn start_listener(
     port: u16,
     our_realm: RealmInfo,
@@ -91,6 +92,9 @@ pub async fn start_listener(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::unnecessary_unwrap)]
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     stream: TcpStream,
     peer_addr: SocketAddr,
@@ -322,13 +326,8 @@ async fn handle_connection(
                             .get_ref()
                             .1
                             .peer_certificates()
-                            .map(|certs| {
-                                certs
-                                    .iter()
-                                    .map(|c| CertificateDer::from(c.clone().into_owned()))
-                                    .collect()
-                            })
-                            .unwrap_or_else(|| Vec::new());
+                            .map(|certs| certs.iter().map(|c| c.clone().into_owned()).collect())
+                            .unwrap_or_else(Vec::new);
                         let (r, w) = tokio::io::split(tls_stream);
                         reader = Box::new(tokio::io::BufReader::new(r));
                         write_half = Box::new(w);
@@ -474,7 +473,7 @@ async fn handle_connection(
 
     // Spawn a task to forward messages from rx to the socket
     let mut write_half_for_task = write_half;
-    let peer_addr_clone = peer_addr.clone();
+    let peer_addr_clone = peer_addr;
     let emit_console_errors_clone = emit_console_errors;
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {

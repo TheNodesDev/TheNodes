@@ -11,8 +11,8 @@ use std::io::BufReader as StdBufReader;
 use std::io::Cursor;
 use std::path::Path;
 use std::path::PathBuf;
-use tokio_rustls::rustls::pki_types::CertificateDer;
 use std::str::FromStr;
+use tokio_rustls::rustls::pki_types::CertificateDer;
 
 /// Runtime trust policy mode (Phase 1)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

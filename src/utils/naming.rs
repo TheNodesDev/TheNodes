@@ -57,11 +57,10 @@ pub fn to_kebab_ascii_strict(s: &str) -> String {
                     pushed_any = true;
                 }
             }
-            if !pushed_any
-                && !last_dash {
-                    out.push('-');
-                    last_dash = true;
-                }
+            if !pushed_any && !last_dash {
+                out.push('-');
+                last_dash = true;
+            }
         } else {
             // Non-Latin scripts: do not transliterate; treat as separator
             if !last_dash {

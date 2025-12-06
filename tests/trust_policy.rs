@@ -9,7 +9,11 @@ const DUMMY_CERT: &[u8] = b"\x30\x03\x02\x01\x01"; // ASN.1 SEQUENCE of INTEGER 
 fn make_policy(open: bool) -> EffectiveTrustPolicy {
     let enc = thenodes::config::EncryptionConfig {
         trust_policy: Some(thenodes::config::TrustPolicyConfig {
-            mode: Some(if open { "open".into() } else { "allowlist".into() }),
+            mode: Some(if open {
+                "open".into()
+            } else {
+                "allowlist".into()
+            }),
             ..Default::default()
         }),
         ..Default::default()

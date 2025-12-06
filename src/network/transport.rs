@@ -79,8 +79,19 @@ pub struct ConnectToPeerParams<'a> {
     pub local_node_id: String,
 }
 
-pub async fn connect_to_peer<'a>(params: ConnectToPeerParams<'a>) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let ConnectToPeerParams { peer, our_realm, our_port, peer_manager, plugin_manager, allow_console, config, local_node_id } = params;
+pub async fn connect_to_peer<'a>(
+    params: ConnectToPeerParams<'a>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let ConnectToPeerParams {
+        peer,
+        our_realm,
+        our_port,
+        peer_manager,
+        plugin_manager,
+        allow_console,
+        config,
+        local_node_id,
+    } = params;
     emit_network_event(
         "transport",
         LogLevel::Info,
@@ -509,7 +520,11 @@ pub async fn connect_to_peer<'a>(params: ConnectToPeerParams<'a>) -> Result<(), 
         return Err(e.into());
     }
     // If remote provided a listen_addr in its HELLO, record it for suppression logic
-    if let MessageType::Hello { listen_addr: Some(listen), .. } = hello.msg_type {
+    if let MessageType::Hello {
+        listen_addr: Some(listen),
+        ..
+    } = hello.msg_type
+    {
         peer_manager.add_listen_addr(&listen, &remote_node_id).await;
     }
 

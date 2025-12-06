@@ -326,12 +326,7 @@ async fn handle_connection(
                             .get_ref()
                             .1
                             .peer_certificates()
-                            .map(|certs| {
-                                certs
-                                    .iter()
-                                    .map(|c| c.clone().into_owned())
-                                    .collect()
-                            })
+                            .map(|certs| certs.iter().map(|c| c.clone().into_owned()).collect())
                             .unwrap_or_else(Vec::new);
                         let (r, w) = tokio::io::split(tls_stream);
                         reader = Box::new(tokio::io::BufReader::new(r));

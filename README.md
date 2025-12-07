@@ -6,7 +6,7 @@
 
 Repository: https://github.com/TheNodesDev/TheNodes
 
-## Install (pre-release)
+## Install
 
 Add to your Cargo.toml:
 
@@ -19,7 +19,7 @@ This guide targets version 0.1.0.
 
 ## What Is TheNodes?
 
-TheNodes is a modular, async-first peer-to-peer (P2P) node framework. It supplies the plumbing—network transport, peer discovery, identity, trust / optional TLS, realms (isolation domains), event instrumentation, and a dynamic plugin system—so you can focus on application logic packaged as plugins.
+TheNodes is a modular, async-first peer-to-peer (P2P) node framework. It supplies the plumbing—network transport, peer discovery, identity, trust / encryption (TLS or Noise, enabled by default in production templates), realms (isolation domains), event instrumentation, and a dynamic plugin system—so you can focus on application logic packaged as plugins.
 
 ### Core Value Proposition
 - Reuse a battle-tested networking + trust substrate instead of re‑inventing sockets, identity, and message routing.
@@ -128,6 +128,7 @@ TheNodes/
 │   │   ├── peer_store.rs
 │   │   ├── message.rs
 │   │   ├── protocol.rs
+│   │   ├── relay.rs               # Relay node handlers (bind, forward, unbind)
 │   │   └── transport.rs
 │   ├── plugin_host/               # Dynamic plugin loading & orchestration
 │   │   ├── mod.rs
@@ -160,7 +161,11 @@ TheNodes/
 ├── docs/                          # Design / security plans
 │   ├── SECURITY.md
 │   ├── SECURITY_TRUST_POLICY_PLAN.md
-│   └── EVENTS_RELIABILITY_AND_CONSENSUS_PLAN.md
+│   ├── EVENTS_RELIABILITY_AND_CONSENSUS_PLAN.md
+│   └── adr/                       # Architecture Decision Records
+│       ├── 0001-secure-channel-abstraction.md
+│       ├── 0002-persistent-peer-store.md
+│       └── 0003-relay-nodes.md
 └── README.md
 ```
 
@@ -257,6 +262,40 @@ Security by design and secure by default.
 - Production templates and examples enable TLS by default and recommend mTLS with a restrictive trust policy (allowlist/pins) for production.
 - Development remains configurable; you may explicitly set `encryption.enabled = false` for local testing.
 - Read the full guidance and PKI layout in `docs/SECURITY.md`.
+
+### Encryption Backends
+
+TheNodes supports pluggable encryption backends via the `encryption.backend` config key:
+
+| Backend | Description | Feature |
+|---------|-------------|---------|
+| `tls` | Rustls-based TLS with certificates (default when enabled) | always available |
+| `noise` | Noise Protocol (XX handshake, 25519, ChaChaPoly, BLAKE2s) | requires `noise` feature |
+| `none` | Plaintext (explicit disable) | always available |
+
+To enable Noise protocol support, build with the feature flag:
+
+```sh
+cargo build --release --features noise
+```
+
+Configuration example:
+
+```toml
+[encryption]
+enabled = true
+backend = "noise"    # or "tls" (default) or "none"
+
+# Noise-specific settings (optional)
+[encryption.noise]
+pattern = "XX"           # Handshake pattern
+curve = "25519"          # Key exchange curve
+cipher = "ChaChaPoly"    # Symmetric cipher
+hash = "BLAKE2s"         # Hash function
+# static_key_path = "pki/own/noise_static.key"  # Optional static key for identity
+```
+
+When `backend = "noise"` but the `noise` feature is not compiled in, TheNodes falls back to plaintext with a warning.
 
 ### TLS & Trust Policy (Overview)
 TheNodes supports optional TLS. When disabled, traffic is plaintext (development / controlled environments). When TLS is enabled, the `[encryption.trust_policy]` `mode` controls how peer certificates are evaluated. The currently implemented modes behave as follows:
@@ -447,6 +486,127 @@ ctx.events().emit(LogEvent::System(SystemEvent { meta, action: "started".into(),
 ```
 
 Roadmap additions: policy checksum embedding, metrics sink example crate, CLI-driven promotion with explicit operator tagging, richer trust audit tooling.
+
+## Relay Nodes
+
+TheNodes supports relay functionality for routing messages between peers that cannot directly connect. A node can act as a relay when peers bind to it, enabling store-and-forward messaging for offline peers.
+
+### Wire Protocol
+
+The relay protocol uses the following message types (all use screaming snake case on the wire):
+
+| Message | Purpose |
+|---------|---------|
+| `RELAY_BIND` | Request to bind a route through the relay to a target peer |
+| `RELAY_BIND_ACK` | Acknowledgement with binding status, binding_id, and peer presence |
+| `RELAY_FWD` | Opaque forwarding frame with to, from, and sequence fields |
+| `RELAY_UNBIND` | Explicit teardown of a binding |
+| `RELAY_NOTIFY` | Lifecycle notifications (overload, timeout, peer_left) |
+| `ACK` | Hop-level delivery acknowledgement for reliable QoS |
+
+### Quality of Service (QoS)
+
+Four QoS modes control forwarding behavior:
+
+- **`low_latency`**: Bypass store-and-forward entirely; drop if target is offline.
+- **`high_throughput`**: Priority enqueue at front for faster draining.
+- **`bulk`**: Enqueue at back; soft-drop when per-target cap is reached.
+- **`reliable`**: ACK-based delivery with delayed retry (~500ms) cancelled by ACK.
+
+### Store-and-Forward
+
+When peers are offline, messages can be queued for later delivery:
+- Per-target queue cap: 1024 messages
+- Global queue cap: 8192 messages across all targets
+- TTL-based expiry with origin notification on timeout
+- Overload notifications sent to origin when caps are reached
+
+### Relay Selection
+
+Deterministic relay selection via Rendezvous (HRW) hashing ensures consistent routing. Peers must advertise the `relay` capability (and optionally `relay_store_forward`) to be selected.
+
+### Configuration
+
+```toml
+[network.relay]
+enabled = true
+store_forward_enabled = true
+selection_enabled = true          # Enable deterministic relay selection
+```
+
+### Example: Binding to a Relay
+
+```rust
+use thenodes::network::relay::RelayBindBuilder;
+
+RelayBindBuilder::new("my-node", "target-peer")
+    .store_forward(true)
+    .qos("reliable")
+    .ttl(3600)  // 1 hour binding TTL
+    .send(&peer_manager, &relay_addr, Some(realm.clone()))
+    .await;
+```
+
+See `docs/adr/0003-relay-nodes.md` for the full design rationale.
+
+## Persistent Peer Store
+
+TheNodes maintains an in-memory peer store that can optionally persist to disk, enabling faster reconnection after restarts.
+
+### Features
+
+- **Peer records**: Each entry tracks `addr`, `source` (Bootstrap/Handshake/Gossip/Manual), `failures`, `last_success_epoch`, `node_id`, and `capabilities`.
+- **TTL expiry**: Old entries are filtered on load based on `ttl_secs`.
+- **Entry cap**: Maximum entries enforced via `max_entries`; oldest are dropped first (LRU).
+- **Periodic flush**: Background task saves store at configurable intervals.
+- **Metadata capture**: On successful handshake, `node_id` and `capabilities` are extracted from HELLO and stored.
+
+### Configuration
+
+```toml
+[network.persistence]
+enabled = true
+path = "data/peers.json"          # Override default path
+max_entries = 1024                # Maximum stored peers
+ttl_secs = 604800                 # 7 days (default)
+save_interval_secs = 60           # Flush interval
+```
+
+### File Format
+
+Peers are stored as JSON, sorted by most recent success:
+
+```json
+[
+  {
+    "addr": "203.0.113.10:7447",
+    "source": "Handshake",
+    "failures": 0,
+    "last_success_epoch": 1733430000,
+    "node_id": "node-abc",
+    "capabilities": ["relay", "kv"]
+  }
+]
+```
+
+### Programmatic Access
+
+```rust
+use thenodes::network::{PeerStore, PeerSource};
+
+// Load from config
+let store = PeerStore::from_config(&config).await;
+
+// Manual operations
+store.insert(addr, PeerSource::Manual).await;
+store.mark_success(&addr).await;
+store.mark_success_with_meta(&addr, Some(node_id), Some(capabilities)).await;
+
+// Sample random peers for discovery
+let candidates = store.sample(10, &exclude_set).await;
+```
+
+See `docs/adr/0002-persistent-peer-store.md` for the full design rationale.
 
 ## Realms
 Realms create *overlay boundaries* so multiple independent networks can coexist using the same binary and plugin set.

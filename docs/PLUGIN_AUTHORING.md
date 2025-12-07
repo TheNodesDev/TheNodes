@@ -148,7 +148,113 @@ If you must support multiple host versions simultaneously, consider building sep
 - Respect TheNodes logging conventions so that audit trails remain consistent.
 - If you build plugins in other languages, ensure the generated function table exactly matches the `PluginRegistrarApi` layout (C layout, little endian). Provide thorough testing before deployment.
 
-## 10. Next Steps and Resources
+## 10. Core Infrastructure APIs
+
+Plugins can interact with core TheNodes infrastructure through `PluginContext`. This section covers key subsystems.
+
+### Peer Store Access
+
+The `PeerStore` maintains known peers with metadata. Plugins can query it for discovery or connection decisions:
+
+```rust
+use thenodes::network::{PeerStore, PeerSource};
+
+fn example(ctx: &PluginContext) {
+    let store = ctx.peer_store();
+    
+    // Sample random peers (excluding already-connected)
+    let exclude = std::collections::HashSet::new();
+    let candidates = store.sample(10, &exclude).await;
+    
+    // Insert a manually discovered peer
+    store.insert("192.168.1.50:7447".parse().unwrap(), PeerSource::Manual).await;
+    
+    // Query all known peers
+    let all = store.all().await;
+}
+```
+
+`PeerRecord` fields available: `addr`, `source`, `failures`, `last_success_epoch`, `node_id`, `capabilities`.
+
+### Relay Message Builders
+
+Plugins can construct and send relay protocol messages using the builder APIs:
+
+```rust
+use thenodes::network::relay::{RelayBindBuilder, RelayForwardBuilder};
+
+async fn bind_via_relay(ctx: &PluginContext, relay_addr: &SocketAddr, target: &str) {
+    let pm = ctx.peer_manager();
+    
+    // Request a relay binding to a target peer
+    RelayBindBuilder::new("my-node", target)
+        .store_forward(true)      // Enable store-and-forward if target offline
+        .qos("reliable")          // QoS: low_latency | high_throughput | bulk | reliable
+        .ttl(3600)                // Binding TTL in seconds
+        .send(&pm, relay_addr, ctx.realm().cloned())
+        .await;
+}
+
+async fn send_via_relay(ctx: &PluginContext, relay_addr: &SocketAddr, to: &str) {
+    let pm = ctx.peer_manager();
+    
+    // Send an opaque forwarding frame through the relay
+    RelayForwardBuilder::new("my-node", to)
+        .sequence(42)                          // Optional sequence number for ordering
+        .payload_text("hello via relay")       // Or .payload_json() / .payload_binary()
+        .send(&pm, relay_addr, ctx.realm().cloned())
+        .await;
+}
+```
+
+### Advertising Capabilities
+
+Plugins can influence the capabilities advertised in HELLO by providing configuration defaults. Capabilities like `relay` or `relay_store_forward` are used for deterministic relay selection:
+
+```rust
+use thenodes::config::ConfigDefaults;
+
+impl Plugin for MyPlugin {
+    fn early_config_defaults(&self) -> Option<ConfigDefaults> {
+        Some(ConfigDefaults {
+            // Advertise that this node can act as a relay
+            capabilities: Some(vec!["relay".into(), "my-plugin-feature".into()]),
+            ..Default::default()
+        })
+    }
+}
+```
+
+Peers advertising `relay` are eligible for Rendezvous (HRW) selection. Add `relay_store_forward` if your node supports store-and-forward buffering.
+
+### Handling Relay Notifications
+
+Plugins receive relay lifecycle events through `on_message`. Handle `RelayNotify` to react to overload, timeout, or peer departure:
+
+```rust
+use thenodes::network::message::{Message, MessageType, Reason};
+
+impl Plugin for MyPlugin {
+    fn on_message(&self, message: &Message, ctx: &PluginContext) {
+        if let MessageType::RelayNotify { notif_type, binding_id, detail } = &message.msg_type {
+            match notif_type {
+                Reason::Overload => {
+                    // Relay queue is full; consider backing off
+                }
+                Reason::Timeout => {
+                    // Message TTL expired before delivery
+                }
+                Reason::PeerLeft => {
+                    // Target peer disconnected from relay
+                }
+                _ => {}
+            }
+        }
+    }
+}
+```
+
+## 11. Next Steps and Resources
 
 - Browse `examples/kvstore_plugin` for a working reference implementation.
 - The template at `templates/production/nep-plugin` demonstrates a production-ready scaffold with configuration defaults and prompt commands.

@@ -22,6 +22,10 @@ pub struct PeerRecord {
     pub source: PeerSource,
     pub failures: u32,
     pub last_success_epoch: Option<u64>,
+    /// Optional node identifier (populated on successful handshake)
+    pub node_id: Option<String>,
+    /// Optional capability flags advertised by peer
+    pub capabilities: Option<Vec<String>>,
 }
 
 #[derive(Clone)]
@@ -49,6 +53,8 @@ impl PeerStore {
             source,
             failures: 0,
             last_success_epoch: None,
+            node_id: None,
+            capabilities: None,
         });
     }
 
@@ -60,6 +66,8 @@ impl PeerStore {
                 source,
                 failures: 0,
                 last_success_epoch: None,
+                node_id: None,
+                capabilities: None,
             });
         }
     }

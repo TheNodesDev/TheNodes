@@ -71,6 +71,7 @@ async fn node_id_self_and_duplicate_rejections() {
     let peer = Peer {
         id: "srv".into(),
         address: format!("127.0.0.1:{}", cfg.port),
+        capabilities: None,
     };
     let res_self = thenodes::network::transport::connect_to_peer(
         thenodes::network::transport::ConnectToPeerParams {
@@ -82,6 +83,7 @@ async fn node_id_self_and_duplicate_rejections() {
             allow_console: false,
             config: cfg.clone(),
             local_node_id: "node-A".into(),
+            peer_store: None,
         },
     )
     .await;
@@ -110,6 +112,7 @@ async fn node_id_self_and_duplicate_rejections() {
                 allow_console: false,
                 config: cfg2,
                 local_node_id: "node-B".into(),
+                peer_store: None,
             },
         )
         .await;
@@ -141,6 +144,7 @@ async fn node_id_self_and_duplicate_rejections() {
                 allow_console: false,
                 config: cfg.clone(),
                 local_node_id: "node-C".into(),
+                peer_store: None,
             },
         ),
     )

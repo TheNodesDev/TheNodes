@@ -89,6 +89,8 @@ pub struct Config {
     pub discovery: Option<DiscoveryConfig>,
     /// Optional realm access policy to constrain allowed remote node types
     pub realm_access: Option<RealmAccessConfig>,
+    /// Network-scoped configuration (tables under [network.*])
+    pub network: Option<NetworkConfig>,
 }
 
 /// Minimal set of default values that a plugin can supply for core runtime
@@ -176,6 +178,10 @@ impl Default for Config {
             node: Some(NodeConfig::default()),
             discovery: Some(DiscoveryConfig::default()),
             realm_access: None,
+            network: Some(NetworkConfig {
+                persistence: Some(NetworkPersistenceConfig::default()),
+                relay: Some(RelayConfig::default()),
+            }),
         }
     }
 }
@@ -291,6 +297,62 @@ impl Default for DiscoveryConfig {
 pub struct RealmAccessConfig {
     /// Allowed peer node types for the active realm. If None, all types are allowed.
     pub allowed_node_types: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct NetworkPersistenceConfig {
+    pub enabled: Option<bool>,
+    pub path: Option<String>,
+    pub max_entries: Option<usize>,
+    pub ttl_secs: Option<u64>,
+    pub save_interval_secs: Option<u64>,
+}
+
+impl Default for NetworkPersistenceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: Some(false),
+            // Use node.state_dir at runtime if path is None
+            path: None,
+            max_entries: Some(1024),
+            ttl_secs: Some(7 * 24 * 3600),
+            save_interval_secs: Some(60),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct NetworkConfig {
+    /// Persistent known peer store configuration (optional)
+    pub persistence: Option<NetworkPersistenceConfig>,
+    /// Relay configuration (optional; opt-in)
+    pub relay: Option<RelayConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RelayConfig {
+    /// Enable relay role on this node
+    pub enabled: Option<bool>,
+    /// Allow store-and-forward buffering when relaying
+    pub store_forward: Option<bool>,
+    /// Optional per-target queue cap (fallback to internal defaults if None)
+    pub queue_max_per_target: Option<usize>,
+    /// Optional global queue cap (fallback to internal defaults if None)
+    pub queue_max_global: Option<usize>,
+    /// Selection strategy to pick a relay when target is absent (none|rendezvous)
+    pub selection: Option<String>,
+}
+
+impl Default for RelayConfig {
+    fn default() -> Self {
+        Self {
+            enabled: Some(false),
+            store_forward: Some(false),
+            queue_max_per_target: Some(1024),
+            queue_max_global: Some(8192),
+            selection: Some("none".to_string()),
+        }
+    }
 }
 
 /// Policy for how to handle conflicts when a locked value differs from a

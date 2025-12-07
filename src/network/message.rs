@@ -6,6 +6,7 @@ use serde_json::Value;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MessageType {
+    #[serde(rename = "HELLO")]
     Hello {
         node_id: String,
         listen_addr: Option<String>,
@@ -14,21 +15,79 @@ pub enum MessageType {
         version: Option<String>,
         // Optional realm-defined node type label (e.g., "daemon", "admin")
         node_type: Option<String>,
+        // Optional capability flags advertised during handshake
+        capabilities: Option<Vec<String>>,
     },
+    #[serde(rename = "TEXT")]
     Text(String),
-    PeerRequest {
-        want: u16,
+    #[serde(rename = "PEER_REQUEST")]
+    PeerRequest { want: u16 },
+    #[serde(rename = "PEER_LIST")]
+    PeerList { peers: Vec<String> },
+    /// Relay bind control opcode (wire token: "RELAY_BIND")
+    #[serde(rename = "RELAY_BIND")]
+    RelayBind {
+        target: String,
+        want_store_forward: Option<bool>,
+        qos: Option<String>,
+        nonce: Option<u64>,
+        expires_at: Option<u64>,
     },
-    PeerList {
-        peers: Vec<String>,
+    /// Relay bind acknowledgement (wire token: "RELAY_BIND_ACK")
+    #[serde(rename = "RELAY_BIND_ACK")]
+    RelayBindAck {
+        ok: bool,
+        reason: Option<Reason>,
+        binding_id: Option<String>,
+        peer_present: Option<bool>,
+        nonce: Option<u64>,
     },
+    /// Opaque forwarding frame routed via relay (wire token: "RELAY_FWD")
+    #[serde(rename = "RELAY_FWD")]
+    RelayForward {
+        to: String,
+        from: String,
+        sequence: Option<u64>,
+    },
+    /// Explicit unbind to close relay binding (wire token: "RELAY_UNBIND")
+    #[serde(rename = "RELAY_UNBIND")]
+    RelayUnbind { binding_id: String },
+    /// Lifecycle notification from relay (wire token: "RELAY_NOTIFY")
+    #[serde(rename = "RELAY_NOTIFY")]
+    RelayNotify {
+        notif_type: Reason,
+        binding_id: Option<String>,
+        detail: Option<String>,
+    },
+    /// Delivery acknowledgement for reliable QoS (wire token: "ACK")
+    #[serde(rename = "ACK")]
+    Ack {
+        to: String,
+        from: String,
+        sequence: u64,
+        status: Option<String>, // "ok" | "dup" | "error"
+    },
+    #[serde(rename = "DATA_REQUEST")]
     DataRequest,
+    #[serde(rename = "DATA_RESPONSE")]
     DataResponse,
+    #[serde(rename = "HEARTBEAT")]
     Heartbeat,
+    #[serde(rename = "DISCONNECT")]
     Disconnect,
-    Extension {
-        kind: String,
-    },
+    #[serde(rename = "EXTENSION")]
+    Extension { kind: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Reason {
+    PolicyDenied,
+    Timeout,
+    AlreadyBound,
+    UnknownTarget,
+    Overload,
+    PeerLeft,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

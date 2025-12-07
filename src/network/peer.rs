@@ -4,13 +4,26 @@
 pub struct Peer {
     pub id: String,
     pub address: String,
+    pub capabilities: Option<Vec<String>>, // from HELLO; used to gate features
 }
 
 impl Peer {
-    pub fn new(id: &str, address: &str) -> Self {
+    pub fn new(id: String, address: String) -> Self {
         Self {
-            id: id.to_string(),
-            address: address.to_string(),
+            id,
+            address,
+            capabilities: None,
+        }
+    }
+
+    pub fn set_capabilities(&mut self, caps: Option<Vec<String>>) {
+        self.capabilities = caps;
+    }
+
+    pub fn has_capability(&self, cap: &str) -> bool {
+        match &self.capabilities {
+            Some(v) => v.iter().any(|c| c == cap),
+            None => false,
         }
     }
 

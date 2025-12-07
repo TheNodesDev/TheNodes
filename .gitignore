@@ -2,7 +2,6 @@ build/
 # Track the workspace lockfile for reproducible builds
 # (library crates published to crates.io ignore their lockfiles)
 #Cargo.lock
-config/
 data/
 logs/
 # Ignore PKI material directories (any variants used during testing)

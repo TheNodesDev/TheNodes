@@ -6,7 +6,7 @@
 
 Repository: https://github.com/TheNodesDev/TheNodes
 
-## Install (pre-release)
+## Install
 
 Add to your Cargo.toml:
 
@@ -19,7 +19,7 @@ This guide targets version 0.1.0.
 
 ## What Is TheNodes?
 
-TheNodes is a modular, async-first peer-to-peer (P2P) node framework. It supplies the plumbing—network transport, peer discovery, identity, trust / optional TLS, realms (isolation domains), event instrumentation, and a dynamic plugin system—so you can focus on application logic packaged as plugins.
+TheNodes is a modular, async-first peer-to-peer (P2P) node framework. It supplies the plumbing—network transport, peer discovery, identity, trust / encryption (TLS or Noise, enabled by default in production templates), realms (isolation domains), event instrumentation, and a dynamic plugin system—so you can focus on application logic packaged as plugins.
 
 ### Core Value Proposition
 - Reuse a battle-tested networking + trust substrate instead of re‑inventing sockets, identity, and message routing.
@@ -262,6 +262,40 @@ Security by design and secure by default.
 - Production templates and examples enable TLS by default and recommend mTLS with a restrictive trust policy (allowlist/pins) for production.
 - Development remains configurable; you may explicitly set `encryption.enabled = false` for local testing.
 - Read the full guidance and PKI layout in `docs/SECURITY.md`.
+
+### Encryption Backends
+
+TheNodes supports pluggable encryption backends via the `encryption.backend` config key:
+
+| Backend | Description | Feature |
+|---------|-------------|---------|
+| `tls` | Rustls-based TLS with certificates (default when enabled) | always available |
+| `noise` | Noise Protocol (XX handshake, 25519, ChaChaPoly, BLAKE2s) | requires `noise` feature |
+| `none` | Plaintext (explicit disable) | always available |
+
+To enable Noise protocol support, build with the feature flag:
+
+```sh
+cargo build --release --features noise
+```
+
+Configuration example:
+
+```toml
+[encryption]
+enabled = true
+backend = "noise"    # or "tls" (default) or "none"
+
+# Noise-specific settings (optional)
+[encryption.noise]
+pattern = "XX"           # Handshake pattern
+curve = "25519"          # Key exchange curve
+cipher = "ChaChaPoly"    # Symmetric cipher
+hash = "BLAKE2s"         # Hash function
+# static_key_path = "pki/own/noise_static.key"  # Optional static key for identity
+```
+
+When `backend = "noise"` but the `noise` feature is not compiled in, TheNodes falls back to plaintext with a warning.
 
 ### TLS & Trust Policy (Overview)
 TheNodes supports optional TLS. When disabled, traffic is plaintext (development / controlled environments). When TLS is enabled, the `[encryption.trust_policy]` `mode` controls how peer certificates are evaluated. The currently implemented modes behave as follows:

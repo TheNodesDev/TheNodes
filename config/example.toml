@@ -1,0 +1,112 @@
+# Example configuration for TheNodes
+
+# Network settings
+port = 50001  # Listening port for incoming connections
+bootstrap_nodes = ["127.0.0.1:50002", "127.0.0.1:50003"]  # Initial peers to dial
+
+# Application settings
+app_name = "example-app"  # Optional application name used in HELLO
+
+# Realm information (network segmentation)
+[realm]
+name = "example-realm"     # Realm name
+version = "1.0"           # Realm protocol version
+
+# Node identity and state
+[node]
+state_dir = "data/example-app"  # Directory for node state (node_id, peer store etc.)
+id_file = "node_id"              # Filename within state_dir to persist node id
+allow_ephemeral = true            # Allow ephemeral UUID when persistence fails
+node_type = "daemon"             # Optional node type label advertised in HELLO
+
+# Encryption settings (TLS) — optional
+[encryption]
+enabled = false                   # Set to true to enable encryption on network transport
+mtls = false                      # TLS-only: enable mutual TLS (client auth)
+
+# Select encryption backend:
+# - "tls"   : Rustls/TLS with certificates (see [encryption.paths])
+# - "noise" : Noise protocol (feature-gated; experimental)
+# - "none"  : Explicitly disable (same effect as enabled=false)
+# If omitted, defaults to "none" when enabled=false, or "tls" when enabled=true.
+backend = "tls"
+
+# When encryption is enabled, configure certificate/key and trust paths
+[encryption.paths]
+own_certificate = "pki/own/example-app.crt"   # Client cert for mTLS (optional)
+own_private_key = "pki/own/example-app.key"   # Client key for mTLS (optional)
+trusted_cert_dir = "pki/trusted/certs"        # Directory of trusted peer certs (PEM)
+trusted_crl_dir = "pki/trusted/crl"           # Directory of CRLs for trusted peers (optional)
+rejected_dir = "pki/rejected"                 # Directory to store rejected certs (optional)
+issuer_cert_dir = "pki/issuers/certs"         # Directory of issuer/CA certs (optional)
+issuer_crl_dir = "pki/issuers/crl"            # Directory of issuer CRLs (optional)
+
+# Noise backend configuration (experimental; requires the `noise` feature)
+# Only used when `backend = "noise"` and `enabled = true`.
+[encryption.noise]
+# Handshake pattern: e.g., "XX", "IK", or full spec like
+# "Noise_XX_25519_ChaChaPoly_BLAKE2s".
+pattern = "XX"
+
+# Curve: "25519" (or "448" if supported)
+curve = "25519"
+
+# Cipher: "ChaChaPoly" or "AESGCM" (subject to feature support)
+cipher = "ChaChaPoly"
+
+# Hash: "BLAKE2s" or "SHA256"
+hash = "BLAKE2s"
+
+# Optional: path to static private key for identity/pinning
+# static_key_path = "pki/own/noise_static.key"
+
+# Trust policy when TLS is enabled
+[encryption.trust_policy]
+mode = "open"                    # open | allowlist | tofu | observe | hybrid (future)
+accept_self_signed = false        # Permit self-signed peers in non-CA modes
+store_new_certs = "none"         # none | observed (write new leaf certs to observed dir)
+reject_expired = false            # Phase 2: reject chain if expired
+reject_before_valid = false       # Phase 2: reject chain if not yet valid
+enforce_ca_chain = false          # Phase 2: require valid issuer chain
+pin_subjects = []                 # Phase 3: exact subject DNs or substring if prefixed with '~'
+pin_fingerprints = []             # Phase 3: allowed SPKI fingerprints (hex lowercase)
+pin_fp_algo = "sha256"           # Fingerprint algorithm (sha256)
+realm_subject_binding = false     # Require subject to contain realm name
+
+[encryption.trust_policy.paths]
+observed_dir = "pki/observed/certs"  # Directory to write newly observed leaf certs
+
+# Logging / events configuration
+[logging]
+json_path = "logs/example_app_audit.jsonl"  # Path for structured audit logs (JSONL)
+json_max_bytes = 5242880                     # Rotate after 5MB
+json_rotate = 5                              # Keep up to 5 rotated files
+disable_console = false                      # Suppress console output when true
+
+# Peer discovery (gossip) configuration
+[discovery]
+enabled = true               # Enable PeerRequest/PeerList gossip
+request_interval_secs = 90   # Interval between automatic PeerRequest messages
+request_want = 16            # Peers requested per interval
+
+# Optional realm access policy to constrain allowed remote node types
+[realm_access]
+allowed_node_types = ["daemon", "admin"]  # Only allow peers that advertise one of these types
+
+# Persistent known peer store (ADR-0002)
+[network.persistence]
+enabled = true                    # Enable persistence across runs
+# If path is omitted, it defaults to `${node.state_dir}/peers.json`
+# path = "data/example-app/peers.json"
+max_entries = 1024                # Hard cap on stored peers
+ttl_secs = 604800                 # Expire entries older than 7 days (in seconds)
+save_interval_secs = 60           # Periodic flush interval in seconds
+
+# Relay configuration (ADR-0003)
+# Advertise relay role in HELLO and, if enabled, accept RELAY_BIND requests.
+# Store-and-forward is optional and bounded by internal limits unless overridden.
+[network.relay]
+enabled = false                   # Enable this node to act as a relay
+store_forward = false             # Allow bounded buffering for temporarily absent peers
+# queue_max_per_target = 1024     # Optional override per-target cap
+# queue_max_global = 8192         # Optional override global cap across targets

@@ -25,7 +25,7 @@ pub async fn connect_to_bootstrap_nodes(
     if let Some(peers) = &config.bootstrap_nodes {
         let node_id_arc = Arc::new(local_node_id);
         for addr in peers {
-            let peer = Peer::new("bootstrap", addr);
+            let peer = Peer::new("bootstrap".to_string(), addr.clone());
             let realm_clone = realm.clone();
             let addr_clone = addr.clone();
             let peer_manager_clone = peer_manager.clone();
@@ -56,6 +56,7 @@ pub async fn connect_to_bootstrap_nodes(
                         allow_console,
                         config: config_clone.clone(),
                         local_node_id: (*node_id_for_task).clone(),
+                        peer_store: Some(peer_store_clone.clone()),
                     })
                     .await
                     {
@@ -85,6 +86,8 @@ pub async fn connect_to_bootstrap_nodes(
                             }
                         }
                     }
+                    // On any outcome, persist latest store periodically if enabled
+                    peer_store_clone.save_if_enabled(&config_clone).await;
                     // Wait before retrying
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                     // Optionally buffer retry message as well

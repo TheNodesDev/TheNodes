@@ -398,6 +398,7 @@ async fn handle_connection(
                             );
                             return;
                         }
+                        // Note: capability advertisement is included in our outbound Hello below.
                     }
                     Err(e) => {
                         log_network_event(
@@ -433,6 +434,22 @@ async fn handle_connection(
     let mut line = String::new();
 
     // Embed our realm; its canonical_code() will be used for matching and by consumers.
+    // Capabilities advertised by this node based on config
+    let caps: Vec<String> = {
+        let mut v = Vec::new();
+        if let Some(net) = &config.network {
+            if let Some(relay) = &net.relay {
+                if relay.enabled.unwrap_or(false) {
+                    v.push("relay".to_string());
+                    if relay.store_forward.unwrap_or(false) {
+                        v.push("relay_store_forward".to_string());
+                    }
+                }
+            }
+        }
+        v
+    };
+
     let hello = Message::new(
         "TheNodes",
         &peer_addr.to_string(),
@@ -442,6 +459,7 @@ async fn handle_connection(
             protocol: Some(PROTOCOL_NAME.to_string()),
             version: Some(PROTOCOL_VERSION.to_string()),
             node_type: config.node.as_ref().and_then(|n| n.node_type.clone()),
+            capabilities: if caps.is_empty() { None } else { Some(caps) },
         },
         None,
         Some(our_realm.clone()),
@@ -544,6 +562,7 @@ async fn handle_connection(
                         ref protocol,
                         ref version,
                         ref node_type,
+                        ref capabilities,
                     } => {
                         if remote_node_id == &node_id {
                             log_network_event(
@@ -629,8 +648,8 @@ async fn handle_connection(
                             "hello_received",
                             Some(peer_addr.to_string()),
                             Some(format!(
-                                "node_id={} listen={:?} protocol={:?} version={:?}",
-                                remote_node_id, listen_addr, protocol, version
+                                "node_id={} listen={:?} protocol={:?} version={:?} caps={:?}",
+                                remote_node_id, listen_addr, protocol, version, capabilities
                             )),
                             emit_console_errors,
                         );
@@ -651,6 +670,7 @@ async fn handle_connection(
                             // Track advertised listen address for suppression logic
                             peer_manager.add_listen_addr(listen, remote_node_id).await;
                         }
+                        // Drain store-and-forward queue (handled inside add_peer), nothing else needed here
                     }
                     _ => {
                         log_network_event(
@@ -681,6 +701,25 @@ async fn handle_connection(
 
     // Use shared receive-and-dispatch loop
     let discovery_enabled = config.discovery.as_ref().map(|d| d.enabled).unwrap_or(true);
+    let relay_enabled = config
+        .network
+        .as_ref()
+        .and_then(|n| n.relay.as_ref())
+        .and_then(|r| r.enabled)
+        .unwrap_or(false);
+    let relay_store_forward_enabled = config
+        .network
+        .as_ref()
+        .and_then(|n| n.relay.as_ref())
+        .and_then(|r| r.store_forward)
+        .unwrap_or(false);
+    let relay_selection_enabled = config
+        .network
+        .as_ref()
+        .and_then(|n| n.relay.as_ref())
+        .and_then(|r| r.selection.clone())
+        .map(|s| s == "rendezvous")
+        .unwrap_or(false);
     crate::network::transport::receive_and_dispatch(
         &mut reader,
         peer_addr,
@@ -688,6 +727,9 @@ async fn handle_connection(
         peer_manager,
         Some(peer_store),
         discovery_enabled,
+        relay_enabled,
+        relay_store_forward_enabled,
+        relay_selection_enabled,
         emit_console_errors,
     )
     .await;

@@ -98,6 +98,7 @@ async fn mtls_open_mode_basic_handshake() {
     let peer = Peer {
         id: "peer-test".into(),
         address: "127.0.0.1:38123".into(),
+        capabilities: None,
     };
     // Use handshake-only variant to avoid entering infinite receive loop during the test
     let connect_res = tokio::time::timeout(

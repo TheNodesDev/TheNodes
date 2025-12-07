@@ -2,13 +2,17 @@
 // Simple in-memory peer candidate store for discovery.
 // Future: persistence, scoring, backoff.
 
+use crate::config::Config;
 use rand::seq::IteratorRandom;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tokio::fs;
+use tokio::io::AsyncWriteExt as _;
 use tokio::sync::RwLock;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PeerSource {
     Bootstrap,
     Handshake,
@@ -16,15 +20,17 @@ pub enum PeerSource {
     Manual,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerRecord {
     pub addr: SocketAddr,
     pub source: PeerSource,
     pub failures: u32,
     pub last_success_epoch: Option<u64>,
     /// Optional node identifier (populated on successful handshake)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_id: Option<String>,
     /// Optional capability flags advertised by peer
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<Vec<String>>,
 }
 
@@ -131,6 +137,101 @@ impl PeerStore {
 
     pub async fn all(&self) -> Vec<SocketAddr> {
         self.inner.read().await.keys().cloned().collect()
+    }
+
+    // Persistence API
+    const DEFAULT_FILENAME: &str = "peers.json";
+
+    pub async fn load_from_file(path: &str, ttl_secs: u64, max_entries: usize) -> Self {
+        let store = Self::new();
+        if let Ok(bytes) = fs::read(path).await {
+            let entries: Vec<PeerRecord> = serde_json::from_slice(&bytes).unwrap_or_default();
+            let now = Self::epoch();
+            let mut count = 0usize;
+            for rec in entries.into_iter() {
+                let age_ok = rec
+                    .last_success_epoch
+                    .map(|t| now.saturating_sub(t) <= ttl_secs)
+                    .unwrap_or(true);
+                if age_ok {
+                    store.insert(rec.addr, rec.source).await;
+                    count += 1;
+                    if count >= max_entries {
+                        break;
+                    }
+                }
+            }
+        }
+        store
+    }
+
+    pub async fn save_to_file(&self, path: &str) -> Result<(), std::io::Error> {
+        let map = self.inner.read().await;
+        let mut entries: Vec<PeerRecord> = map.values().cloned().collect();
+        // Prefer recent successes first
+        entries.sort_by_key(|r| std::cmp::Reverse(r.last_success_epoch.unwrap_or(0)));
+        let json = serde_json::to_vec_pretty(&entries).map_err(std::io::Error::other)?;
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            fs::create_dir_all(parent).await.ok();
+        }
+        let mut f = fs::File::create(path).await?;
+        f.write_all(&json).await?;
+        Ok(())
+    }
+
+    pub async fn spawn_periodic_save(self, path: String, interval_secs: u64) {
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+            loop {
+                ticker.tick().await;
+                let _ = self.save_to_file(&path).await;
+            }
+        });
+    }
+
+    /// Construct and optionally start periodic saves based on runtime config.
+    /// Uses `node.state_dir` to derive path when not explicitly provided.
+    pub async fn from_config(cfg: &Config) -> Self {
+        if let Some(p) = cfg.network.as_ref().and_then(|n| n.persistence.as_ref()) {
+            let enabled = p.enabled.unwrap_or(false);
+            let max_entries = p.max_entries.unwrap_or(1024);
+            let ttl_secs = p.ttl_secs.unwrap_or(7 * 24 * 3600);
+            let base_dir = cfg
+                .node
+                .as_ref()
+                .and_then(|n| n.state_dir.clone())
+                .unwrap_or_else(|| "data".to_string());
+            let path = p
+                .path
+                .clone()
+                .unwrap_or_else(|| format!("{}/{}", base_dir, Self::DEFAULT_FILENAME));
+            let store = Self::load_from_file(&path, ttl_secs, max_entries).await;
+            if enabled {
+                let interval = p.save_interval_secs.unwrap_or(60);
+                store.clone().spawn_periodic_save(path, interval).await;
+            }
+            store
+        } else {
+            Self::new()
+        }
+    }
+
+    /// Save to derived path if persistence enabled in config.
+    pub async fn save_if_enabled(&self, cfg: &Config) {
+        if let Some(p) = cfg.network.as_ref().and_then(|n| n.persistence.as_ref()) {
+            if p.enabled.unwrap_or(false) {
+                let base_dir = cfg
+                    .node
+                    .as_ref()
+                    .and_then(|n| n.state_dir.clone())
+                    .unwrap_or_else(|| "data".to_string());
+                let path = p
+                    .path
+                    .clone()
+                    .unwrap_or_else(|| format!("{}/{}", base_dir, Self::DEFAULT_FILENAME));
+                let _ = self.save_to_file(&path).await;
+            }
+        }
     }
 
     fn epoch() -> u64 {

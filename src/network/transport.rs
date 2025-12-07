@@ -77,6 +77,7 @@ pub struct ConnectToPeerParams<'a> {
     pub allow_console: bool,
     pub config: Config,
     pub local_node_id: String,
+    pub peer_store: Option<crate::network::peer_store::PeerStore>,
 }
 
 pub async fn connect_to_peer<'a>(
@@ -91,6 +92,7 @@ pub async fn connect_to_peer<'a>(
         allow_console,
         config,
         local_node_id,
+        peer_store,
     } = params;
     emit_network_event(
         "transport",
@@ -381,12 +383,13 @@ pub async fn connect_to_peer<'a>(
     let hello = Message::from_json(&line).ok_or("Failed to parse HELLO")?;
 
     // Validate remote HELLO (duplicate/self check) before replying
-    let (remote_node_id, remote_node_type) = match hello.msg_type {
+    let (remote_node_id, remote_node_type, remote_capabilities) = match hello.msg_type {
         MessageType::Hello {
             ref node_id,
             ref node_type,
+            ref capabilities,
             ..
-        } => (node_id.clone(), node_type.clone()),
+        } => (node_id.clone(), node_type.clone(), capabilities.clone()),
         _ => return Err("Expected HELLO from server".into()),
     };
     // Optional realm access policy check on outbound for server's node_type
@@ -458,6 +461,7 @@ pub async fn connect_to_peer<'a>(
             protocol: Some(PROTOCOL_NAME.to_string()),
             version: Some(PROTOCOL_VERSION.to_string()),
             node_type: config.node.as_ref().and_then(|n| n.node_type.clone()),
+            capabilities: Some(vec!["relay".to_string(), "relay_store_forward".to_string()]),
         },
         None,
         Some(our_realm.clone()),
@@ -519,6 +523,12 @@ pub async fn connect_to_peer<'a>(
         );
         return Err(e.into());
     }
+    // Update peer store with successful handshake metadata
+    if let Some(store) = &peer_store {
+        store
+            .mark_success_with_meta(&addr, Some(remote_node_id.clone()), remote_capabilities)
+            .await;
+    }
     // If remote provided a listen_addr in its HELLO, record it for suppression logic
     if let MessageType::Hello {
         listen_addr: Some(listen),
@@ -555,6 +565,25 @@ pub async fn connect_to_peer<'a>(
 
     // Use shared receive-and-dispatch loop
     let discovery_enabled = config.discovery.as_ref().map(|d| d.enabled).unwrap_or(true);
+    let relay_enabled = config
+        .network
+        .as_ref()
+        .and_then(|n| n.relay.as_ref())
+        .and_then(|r| r.enabled)
+        .unwrap_or(false);
+    let relay_store_forward_enabled = config
+        .network
+        .as_ref()
+        .and_then(|n| n.relay.as_ref())
+        .and_then(|r| r.store_forward)
+        .unwrap_or(false);
+    let relay_selection_enabled = config
+        .network
+        .as_ref()
+        .and_then(|n| n.relay.as_ref())
+        .and_then(|r| r.selection.clone())
+        .map(|s| s == "rendezvous")
+        .unwrap_or(false);
     receive_and_dispatch(
         &mut reader,
         addr,
@@ -562,6 +591,9 @@ pub async fn connect_to_peer<'a>(
         peer_manager.clone(),
         None,
         discovery_enabled,
+        relay_enabled,
+        relay_store_forward_enabled,
+        relay_selection_enabled,
         allow_console,
     )
     .await;
@@ -821,6 +853,22 @@ pub async fn connect_to_peer_handshake_only(
     if remote_node_id == local_node_id {
         return Err("remote node id matches our own".into());
     }
+    // Capabilities advertised by this node based on config
+    let caps: Vec<String> = {
+        let mut v = Vec::new();
+        if let Some(net) = &config.network {
+            if let Some(relay) = &net.relay {
+                if relay.enabled.unwrap_or(false) {
+                    v.push("relay".to_string());
+                    if relay.store_forward.unwrap_or(false) {
+                        v.push("relay_store_forward".to_string());
+                    }
+                }
+            }
+        }
+        v
+    };
+
     let reply = Message::new(
         DEFAULT_APP_NAME,
         &hello.from,
@@ -830,6 +878,7 @@ pub async fn connect_to_peer_handshake_only(
             protocol: Some(PROTOCOL_NAME.to_string()),
             version: Some(PROTOCOL_VERSION.to_string()),
             node_type: config.node.as_ref().and_then(|n| n.node_type.clone()),
+            capabilities: if caps.is_empty() { None } else { Some(caps) },
         },
         None,
         Some(our_realm.clone()),
@@ -848,6 +897,7 @@ pub async fn connect_to_peer_handshake_only(
 }
 
 /// Shared receive-and-dispatch loop for peer connections
+#[allow(clippy::too_many_arguments)]
 pub async fn receive_and_dispatch<R: AsyncBufReadExt + Unpin>(
     reader: &mut R,
     addr: SocketAddr,
@@ -856,6 +906,9 @@ pub async fn receive_and_dispatch<R: AsyncBufReadExt + Unpin>(
     // Optional: peer discovery store
     peer_store: Option<crate::network::peer_store::PeerStore>,
     discovery_enabled: bool,
+    relay_enabled: bool,
+    relay_store_forward_enabled: bool,
+    relay_selection_enabled: bool,
     allow_console: bool,
 ) {
     let mut line = String::new();
@@ -871,7 +924,8 @@ pub async fn receive_and_dispatch<R: AsyncBufReadExt + Unpin>(
                     None,
                     allow_console,
                 );
-                peer_manager.remove_peer(&addr).await;
+                // Remove peer and capture node_id for lifecycle notifications
+                let removed_node_id = peer_manager.remove_peer(&addr).await;
                 use crate::events::{
                     dispatcher,
                     model::{LogEvent, LogLevel, SystemEvent},
@@ -883,6 +937,24 @@ pub async fn receive_and_dispatch<R: AsyncBufReadExt + Unpin>(
                     action: "peer_disconnected".into(),
                     detail: Some(format!("addr={}", addr)),
                 }));
+                // Emit RelayNotify peer_left for all bindings originating from this peer
+                if let Some(from_id) = removed_node_id {
+                    let pairs = peer_manager.list_bindings_for_from(&from_id).await;
+                    for (to_id, binding_id) in pairs {
+                        let notify = Message::new(
+                            &addr.to_string(),
+                            &addr.to_string(),
+                            MessageType::RelayNotify {
+                                notif_type: crate::network::message::Reason::PeerLeft,
+                                binding_id,
+                                detail: Some(format!("from={} to={}", from_id, to_id)),
+                            },
+                            None,
+                            None,
+                        );
+                        let _ = peer_manager.send_to_addr(&addr, notify.as_json()).await;
+                    }
+                }
                 break;
             }
             Ok(_) => {
@@ -971,6 +1043,7 @@ pub async fn receive_and_dispatch<R: AsyncBufReadExt + Unpin>(
                                                 crate::network::peer_store::PeerSource::Gossip,
                                             )
                                             .await;
+                                        store.mark_success(&sock).await;
                                     }
                                     added += 1;
                                 }
@@ -995,6 +1068,60 @@ pub async fn receive_and_dispatch<R: AsyncBufReadExt + Unpin>(
                                 action: "peer_list_received".into(),
                                 detail: Some(format!("from={} added={}", addr, added)),
                             }));
+                        }
+                        MessageType::RelayBind { .. } => {
+                            crate::network::relay::handle_bind(
+                                &msg,
+                                &addr,
+                                &peer_manager,
+                                relay_enabled,
+                                relay_store_forward_enabled,
+                                allow_console,
+                            )
+                            .await;
+                        }
+                        MessageType::RelayBindAck {
+                            ok,
+                            reason,
+                            binding_id,
+                            peer_present,
+                            nonce,
+                        } => {
+                            emit_network_event(
+                                "transport",
+                                LogLevel::Info,
+                                "relay_bind_ack",
+                                Some(addr.to_string()),
+                                Some(format!(
+                                    "ok={} reason={:?} binding_id={:?} peer_present={:?} nonce={:?}",
+                                    ok, reason, binding_id, peer_present, nonce
+                                )),
+                                allow_console,
+                            );
+                        }
+                        MessageType::RelayForward { .. } => {
+                            crate::network::relay::handle_forward(
+                                &msg,
+                                &addr,
+                                &peer_manager,
+                                relay_enabled,
+                                relay_store_forward_enabled,
+                                relay_selection_enabled,
+                                allow_console,
+                            )
+                            .await;
+                        }
+                        MessageType::RelayUnbind { .. } => {
+                            crate::network::relay::handle_unbind(
+                                &msg,
+                                &addr,
+                                &peer_manager,
+                                allow_console,
+                            )
+                            .await;
+                        }
+                        MessageType::Ack { .. } => {
+                            crate::network::relay::handle_ack(&msg, &addr, &peer_manager).await;
                         }
                         _ => {
                             emit_network_event(

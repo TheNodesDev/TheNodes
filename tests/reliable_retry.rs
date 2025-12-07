@@ -18,8 +18,8 @@ async fn delayed_retry_cancelled_by_ack() {
     // Craft forward with sequence
     let seq = 7u64;
     let fwd = Message::new(
-        &"fromA".to_string(),
-        &"toB".to_string(),
+        "fromA",
+        "toB",
         MessageType::RelayForward {
             to: "toB".into(),
             from: "fromA".into(),
@@ -59,7 +59,7 @@ async fn delayed_retry_cancelled_by_ack() {
     // Wait past retry delay; no second message should arrive
     let second = tokio::time::timeout(std::time::Duration::from_millis(600), rx.recv()).await;
     assert!(
-        matches!(second, Err(_)) || matches!(second, Ok(None)),
+        second.is_err() || matches!(second, Ok(None)),
         "unexpected retry delivery after ACK"
     );
 }

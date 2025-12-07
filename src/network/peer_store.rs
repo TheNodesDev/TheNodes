@@ -72,6 +72,39 @@ impl PeerStore {
         }
     }
 
+    /// Mark peer as successfully connected and update metadata from HELLO
+    pub async fn mark_success_with_meta(
+        &self,
+        addr: &SocketAddr,
+        node_id: Option<String>,
+        capabilities: Option<Vec<String>>,
+    ) {
+        let mut map = self.inner.write().await;
+        if let Some(rec) = map.get_mut(addr) {
+            rec.last_success_epoch = Some(Self::epoch());
+            rec.failures = 0;
+            if node_id.is_some() {
+                rec.node_id = node_id;
+            }
+            if capabilities.is_some() {
+                rec.capabilities = capabilities;
+            }
+        } else {
+            // Insert new record if not present
+            map.insert(
+                *addr,
+                PeerRecord {
+                    addr: *addr,
+                    source: PeerSource::Handshake,
+                    failures: 0,
+                    last_success_epoch: Some(Self::epoch()),
+                    node_id,
+                    capabilities,
+                },
+            );
+        }
+    }
+
     pub async fn mark_failure(&self, addr: &SocketAddr) {
         let mut map = self.inner.write().await;
         if let Some(rec) = map.get_mut(addr) {

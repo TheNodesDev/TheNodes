@@ -513,7 +513,10 @@ impl SecureChannel for PlaintextChannel {
 pub fn make_secure_channel(cfg: &crate::config::Config) -> Box<dyn SecureChannel> {
     let enc = cfg.encryption.as_ref();
     // Derive backend: default to tls if enabled, plaintext if disabled
-    let backend = enc.and_then(|e| e.backend.clone()).or_else(|| {
+    let backend = enc
+        .and_then(|e| e.backend.as_deref())
+        .map(|b| b.trim().to_ascii_lowercase())
+        .or_else(|| {
         enc.map(|e| {
             if e.enabled {
                 "tls".to_string()
@@ -524,7 +527,7 @@ pub fn make_secure_channel(cfg: &crate::config::Config) -> Box<dyn SecureChannel
     });
     match backend.as_deref() {
         Some("tls") => Box::new(TlsSecureChannel::new()),
-        Some("plaintext") => Box::new(PlaintextChannel::new()),
+        Some("none") | Some("plaintext") => Box::new(PlaintextChannel::new()),
         Some("noise") => {
             #[cfg(feature = "noise")]
             {

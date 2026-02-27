@@ -29,6 +29,8 @@ async fn mtls_open_mode_basic_handshake() {
     let cfg = Config {
         encryption: Some(EncryptionConfig {
             enabled: true,
+            backend: Some("tls".to_string()),
+            noise: None,
             mtls: Some(true),
             accept_self_signed: Some(true), // legacy still honored; permissive for test
             paths: Some(EncryptionPaths {

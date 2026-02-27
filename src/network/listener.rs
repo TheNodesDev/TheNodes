@@ -148,21 +148,6 @@ async fn handle_connection(
     let mut line = String::new();
 
     // Embed our realm; its canonical_code() will be used for matching and by consumers.
-    // Capabilities advertised by this node based on config
-    let caps: Vec<String> = {
-        let mut v = Vec::new();
-        if let Some(net) = &config.network {
-            if let Some(relay) = &net.relay {
-                if relay.enabled.unwrap_or(false) {
-                    v.push("relay".to_string());
-                    if relay.store_forward.unwrap_or(false) {
-                        v.push("relay_store_forward".to_string());
-                    }
-                }
-            }
-        }
-        v
-    };
 
     let hello = Message::new(
         "TheNodes",
@@ -173,7 +158,7 @@ async fn handle_connection(
             protocol: Some(PROTOCOL_NAME.to_string()),
             version: Some(PROTOCOL_VERSION.to_string()),
             node_type: config.node.as_ref().and_then(|n| n.node_type.clone()),
-            capabilities: if caps.is_empty() { None } else { Some(caps) },
+            capabilities: crate::network::advertised_capabilities(&config),
         },
         None,
         Some(our_realm.clone()),

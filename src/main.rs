@@ -89,12 +89,12 @@ async fn main() {
 
     // Instantiate basic managers prior to plugin load (needed for context)
     let peer_manager = Arc::new(PeerManager::new());
-    let peer_store = PeerStore::new();
+    let peer_store_for_plugins = PeerStore::new();
 
     // Dynamically load plugins from `plugins/`
     let plugin_context = thenodes::plugin_host::PluginContext {
         peer_manager: peer_manager.clone(),
-        peer_store: peer_store.clone(),
+        peer_store: peer_store_for_plugins.clone(),
         events: thenodes::events::dispatcher::handle(),
     };
     let mut raw_manager = PluginManager::with_context(plugin_context);
@@ -204,6 +204,21 @@ async fn main() {
             action: "plugin_config_defaults_applied".into(),
             detail: Some(format!("fields={:?}", applied)),
         }));
+    }
+
+    // Initialize runtime peer store from final config (ADR-0002 persistence integration)
+    let peer_store = PeerStore::from_config(&config).await;
+    if let Some(ctx) = raw_manager.context.as_mut() {
+        ctx.peer_store = peer_store.clone();
+    }
+
+    if let Some(relay) = config.network.as_ref().and_then(|n| n.relay.as_ref()) {
+        let (per_target, global) = peer_manager
+            .set_relay_queue_caps(relay.queue_max_per_target, relay.queue_max_global);
+        println!(
+            "{}Relay queue caps: per_target={}, global={}",
+            ICON_PLACEHOLDER, per_target, global
+        );
     }
 
     let plugin_manager = Arc::new(raw_manager);

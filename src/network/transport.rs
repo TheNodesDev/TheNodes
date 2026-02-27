@@ -168,7 +168,7 @@ pub async fn connect_to_peer<'a>(
             protocol: Some(PROTOCOL_NAME.to_string()),
             version: Some(PROTOCOL_VERSION.to_string()),
             node_type: config.node.as_ref().and_then(|n| n.node_type.clone()),
-            capabilities: Some(vec!["relay".to_string(), "relay_store_forward".to_string()]),
+            capabilities: crate::network::advertised_capabilities(&config),
         },
         None,
         Some(our_realm.clone()),
@@ -251,20 +251,46 @@ pub async fn connect_to_peer<'a>(
             let interval = disc.request_interval_secs.unwrap_or(90);
             let want = disc.request_want.unwrap_or(16);
             let target_addr = addr;
+            let peer_manager_for_gossip = peer_manager.clone();
+            let local_node_id_for_gossip = local_node_id.clone();
+            let gossip_realm = our_realm.clone();
             let allow_console_for_gossip = allow_console;
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
-                    // TODO: send actual PeerRequest message to target_addr via its channel
-                    // For now just log placeholder
-                    emit_network_event(
-                        "transport",
-                        LogLevel::Debug,
-                        "gossip_peer_request_placeholder",
-                        Some(target_addr.to_string()),
-                        Some(format!("want={}", want)),
-                        allow_console_for_gossip,
+                    let req = Message::new(
+                        &local_node_id_for_gossip,
+                        &target_addr.to_string(),
+                        MessageType::PeerRequest { want },
+                        None,
+                        Some(gossip_realm.clone()),
                     );
+                    match peer_manager_for_gossip
+                        .send_to_addr(&target_addr, req.as_json())
+                        .await
+                    {
+                        Ok(()) => {
+                            emit_network_event(
+                                "transport",
+                                LogLevel::Debug,
+                                "gossip_peer_request_sent",
+                                Some(target_addr.to_string()),
+                                Some(format!("want={}", want)),
+                                allow_console_for_gossip,
+                            );
+                        }
+                        Err(err) => {
+                            emit_network_event(
+                                "transport",
+                                LogLevel::Debug,
+                                "gossip_peer_request_stopped",
+                                Some(target_addr.to_string()),
+                                Some(err),
+                                allow_console_for_gossip,
+                            );
+                            break;
+                        }
+                    }
                 }
             });
         }
@@ -381,22 +407,6 @@ pub async fn connect_to_peer_handshake_only(
     if remote_node_id == local_node_id {
         return Err("remote node id matches our own".into());
     }
-    // Capabilities advertised by this node based on config
-    let caps: Vec<String> = {
-        let mut v = Vec::new();
-        if let Some(net) = &config.network {
-            if let Some(relay) = &net.relay {
-                if relay.enabled.unwrap_or(false) {
-                    v.push("relay".to_string());
-                    if relay.store_forward.unwrap_or(false) {
-                        v.push("relay_store_forward".to_string());
-                    }
-                }
-            }
-        }
-        v
-    };
-
     let reply = Message::new(
         DEFAULT_APP_NAME,
         &hello.from,
@@ -406,7 +416,7 @@ pub async fn connect_to_peer_handshake_only(
             protocol: Some(PROTOCOL_NAME.to_string()),
             version: Some(PROTOCOL_VERSION.to_string()),
             node_type: config.node.as_ref().and_then(|n| n.node_type.clone()),
-            capabilities: if caps.is_empty() { None } else { Some(caps) },
+            capabilities: crate::network::advertised_capabilities(&config),
         },
         None,
         Some(our_realm.clone()),
@@ -527,13 +537,23 @@ pub async fn receive_and_dispatch<R: AsyncBufReadExt + Unpin>(
                                             None,
                                             msg.realm.clone(),
                                         );
-                                        let _ = list_msg.as_json();
+                                        let send_result =
+                                            peer_manager.send_to_addr(&addr, list_msg.as_json()).await;
                                         emit_network_event(
                                             "transport",
-                                            LogLevel::Debug,
-                                            "peer_list_placeholder",
+                                            if send_result.is_ok() {
+                                                LogLevel::Debug
+                                            } else {
+                                                LogLevel::Warn
+                                            },
+                                            "peer_list_sent",
                                             Some(addr.to_string()),
-                                            Some(format!("count={}", sample.len())),
+                                            Some(format!(
+                                                "count={} ok={} err={:?}",
+                                                sample.len(),
+                                                send_result.is_ok(),
+                                                send_result.err()
+                                            )),
                                             allow_console,
                                         );
                                         use crate::events::{

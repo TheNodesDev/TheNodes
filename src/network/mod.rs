@@ -26,7 +26,11 @@ pub(crate) fn advertised_capabilities(config: &crate::config::Config) -> Option<
             }
         }
     }
-    if caps.is_empty() { None } else { Some(caps) }
+    if caps.is_empty() {
+        None
+    } else {
+        Some(caps)
+    }
 }
 
 // Quality-of-Service preferences for relay bindings and forwards

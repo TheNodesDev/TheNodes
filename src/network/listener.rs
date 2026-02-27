@@ -137,11 +137,7 @@ async fn handle_connection(
         Some(peer_addr.to_string()),
         Some(format!(
             "backend={:?} decision={} reason={} local={} remote={}",
-            channel.auth.backend,
-            channel.auth.decision,
-            channel.auth.reason,
-            local_addr,
-            peer_addr
+            channel.auth.backend, channel.auth.decision, channel.auth.reason, local_addr, peer_addr
         )),
         emit_console_errors,
     );

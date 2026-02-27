@@ -213,8 +213,8 @@ async fn main() {
     }
 
     if let Some(relay) = config.network.as_ref().and_then(|n| n.relay.as_ref()) {
-        let (per_target, global) = peer_manager
-            .set_relay_queue_caps(relay.queue_max_per_target, relay.queue_max_global);
+        let (per_target, global) =
+            peer_manager.set_relay_queue_caps(relay.queue_max_per_target, relay.queue_max_global);
         println!(
             "{}Relay queue caps: per_target={}, global={}",
             ICON_PLACEHOLDER, per_target, global

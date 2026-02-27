@@ -537,8 +537,9 @@ pub async fn receive_and_dispatch<R: AsyncBufReadExt + Unpin>(
                                             None,
                                             msg.realm.clone(),
                                         );
-                                        let send_result =
-                                            peer_manager.send_to_addr(&addr, list_msg.as_json()).await;
+                                        let send_result = peer_manager
+                                            .send_to_addr(&addr, list_msg.as_json())
+                                            .await;
                                         emit_network_event(
                                             "transport",
                                             if send_result.is_ok() {

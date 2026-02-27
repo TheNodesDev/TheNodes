@@ -66,6 +66,8 @@ impl Default for TrustPolicyConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct EncryptionConfig {
     pub enabled: bool,
+    /// Optional secure channel backend selector: tls | noise | plaintext
+    pub backend: Option<String>,
     /// Enable mutual TLS (client auth). Both sides must present certs.
     pub mtls: Option<bool>,
     /// DEPRECATED: use encryption.trust_policy.accept_self_signed
@@ -158,6 +160,7 @@ impl Default for EncryptionConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            backend: None,
             mtls: Some(false),
             accept_self_signed: Some(false),
             paths: Some(EncryptionPaths::default()),

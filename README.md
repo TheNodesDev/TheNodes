@@ -12,14 +12,14 @@ Add to your Cargo.toml:
 
 ```toml
 [dependencies]
-thenodes = "0.1.0"
+thenodes = "0.2.0"
 ```
 
-This guide targets version 0.1.0.
+This guide targets version 0.2.0.
 
 ## What Is TheNodes?
 
-TheNodes is a modular, async-first peer-to-peer (P2P) node framework. It supplies the plumbing—network transport, peer discovery, identity, trust / encryption (TLS or Noise, enabled by default in production templates), realms (isolation domains), event instrumentation, and a dynamic plugin system—so you can focus on application logic packaged as plugins.
+TheNodes is a modular, async-first peer-to-peer (P2P) node framework. It supplies the plumbing — network transport, peer discovery, identity, trust / encryption (TLS or Noise), realms (isolation domains), event instrumentation, and a dynamic plugin system — so you can focus on application logic.
 
 ### Core Value Proposition
 - Reuse a battle-tested networking + trust substrate instead of re‑inventing sockets, identity, and message routing.
@@ -142,6 +142,7 @@ TheNodes/
 │   ├── security/                  # Encryption / trust policy
 │   │   ├── mod.rs
 │   │   ├── encryption.rs
+│   │   ├── secure_channel.rs
 │   │   └── trust.rs
 │   └── utils/                     # Misc helpers (kept minimal intentionally)
 │       └── mod.rs
@@ -188,14 +189,14 @@ my-app/
 ├── config/
 │   └── app.toml
 └── my-plugin-src/        # Separate plugin development project
-    ├── Cargo.toml        # Depends on thenodes = "0.1.0" for Plugin trait
+    ├── Cargo.toml        # Depends on thenodes = "0.2.0" for Plugin trait
     └── src/lib.rs        # Your plugin code
 ```
 
 **CAL Mode:**
 ```
 my-app/
-├── Cargo.toml            # Lists thenodes = "0.1.0" as dependency
+├── Cargo.toml            # Lists thenodes = "0.2.0" as dependency
 ├── src/
 │   └── main.rs           # Your app using TheNodes APIs  
 └── config/
@@ -260,7 +261,7 @@ CAL Mode Note: When embedding as a library, you *may* still internally structure
 Security by design and secure by default.
 
 - Production templates and examples enable TLS by default and recommend mTLS with a restrictive trust policy (allowlist/pins) for production.
-- Development remains configurable; you may explicitly set `encryption.enabled = false` for local testing.
+- The runtime default remains configurable; if `encryption.enabled = false`, transport is plaintext (suitable for local/development only).
 - Read the full guidance and PKI layout in `docs/SECURITY.md`.
 
 ### Encryption Backends
@@ -530,8 +531,10 @@ Deterministic relay selection via Rendezvous (HRW) hashing ensures consistent ro
 ```toml
 [network.relay]
 enabled = true
-store_forward_enabled = true
-selection_enabled = true          # Enable deterministic relay selection
+store_forward = true
+queue_max_per_target = 1024
+queue_max_global = 8192
+selection = "rendezvous"          # or "none"
 ```
 
 ### Example: Binding to a Relay

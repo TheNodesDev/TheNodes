@@ -6,6 +6,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+
+## [0.2.0] - 2026-02-28
+
 ### Breaking
 - **Wire protocol**: All message type tokens now use SCREAMING_SNAKE_CASE (e.g., `PEER_REQUEST`, `RELAY_BIND`). Nodes running pre-0.2 wire format cannot interoperate with 0.2+.
 - **Wire protocol**: `Reason` enum values serialize as snake_case (`policy_denied`, `timeout`, etc.).
@@ -70,6 +73,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - HELLO capability advertisement is now centralized and consistently config-driven across listener, outbound transport, and handshake-only transport paths.
 
 ### Fixed
+- Trust decision logging now redacts certificate-derived fields (`reason`, `fingerprint`, `chain_reason`, `time_reason`) in emitted events to avoid cleartext sensitive metadata in console/JSON logs while preserving trust enforcement behavior.
 - Resolved async hang in `enqueue_store_forward`: removed `.await` calls while holding `relay_queue` mutex; notifications now sent after releasing lock.
 - Discovery periodic task now sends real `PEER_REQUEST` messages (replacing placeholder behavior).
 - `PEER_REQUEST` handling now sends actual `PEER_LIST` responses instead of constructing placeholders only.

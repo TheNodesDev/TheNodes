@@ -10,10 +10,8 @@ use thenodes::plugin_host::{PluginManager, PluginLoader};
 use thenodes::prompt::run_prompt_mode;
 
 mod custom_plugin_host;
-mod app_commands;
 
 use custom_plugin_host::CustomPluginHost;
-use app_commands::AppCommands;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "{{APP_DESCRIPTION}}")]
@@ -82,9 +80,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Start TheNodes networking
+    let plugin_manager_arc = Arc::new(plugin_manager);
+
     let listener_handle = tokio::spawn({
         let peer_manager = peer_manager.clone();
-        let plugin_manager = Arc::new(plugin_manager);
+        let plugin_manager = plugin_manager_arc.clone();
         let custom_host = custom_host.clone();
         async move {
             if let Err(e) = start_listener(
@@ -119,12 +119,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Handle prompt mode or wait for shutdown
     if args.prompt {
         log::info!("🎮 Starting interactive prompt mode");
-        let app_commands = AppCommands::new(custom_host.clone());
-        
-        // Run prompt mode with custom commands
-        if let Err(e) = run_prompt_mode(Some(Box::new(app_commands))).await {
-            log::error!("Prompt mode failed: {}", e);
-        }
+        run_prompt_mode(plugin_manager_arc.clone(), config.clone()).await;
     } else {
         // Wait for shutdown signal
         signal::ctrl_c().await?;

@@ -6,6 +6,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+
+## [0.2.0] - 2026-02-28
+
 ### Breaking
 - **Wire protocol**: All message type tokens now use SCREAMING_SNAKE_CASE (e.g., `PEER_REQUEST`, `RELAY_BIND`). Nodes running pre-0.2 wire format cannot interoperate with 0.2+.
 - **Wire protocol**: `Reason` enum values serialize as snake_case (`policy_denied`, `timeout`, etc.).

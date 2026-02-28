@@ -1,6 +1,6 @@
 # Stability & Public API (Pre-1.0)
 
-TheNodes is currently in an unreleased (pre-0.1.0) state. Until the first public release, **APIs may change**; we are converging on stability but will prioritize progress and correctness over strict compatibility. This document declares *intent* so early adopters know what they can reasonably build against.
+TheNodes is currently in a pre-1.0 state. **APIs may still change**; we are converging on stability but will prioritize progress and correctness over strict compatibility. This document declares *intent* so early adopters know what they can reasonably build against.
 
 Semantic Versioning expectation before 1.0.0: minor versions (`0.x`) MAY introduce breaking changes. After 1.0.0, only major versions will.
 

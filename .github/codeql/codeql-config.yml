@@ -1,7 +1,0 @@
-name: thenodes-codeql-config
-
-query-filters:
-  - exclude:
-      id: rust/cleartext-logging
-      paths:
-        - src/security/secure_channel.rs

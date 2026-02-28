@@ -18,6 +18,15 @@ pub struct TrustPolicyPathsConfig {
     pub observed_dir: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct EncryptionNoiseConfig {
+    pub pattern: Option<String>,
+    pub curve: Option<String>,
+    pub cipher: Option<String>,
+    pub hash: Option<String>,
+    pub static_key_path: Option<String>,
+}
+
 // Default derived above
 
 #[derive(Debug, Clone, Deserialize)]
@@ -66,6 +75,10 @@ impl Default for TrustPolicyConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct EncryptionConfig {
     pub enabled: bool,
+    /// Optional secure channel backend selector: tls | noise | plaintext
+    pub backend: Option<String>,
+    /// Optional Noise backend settings (used when backend = "noise")
+    pub noise: Option<EncryptionNoiseConfig>,
     /// Enable mutual TLS (client auth). Both sides must present certs.
     pub mtls: Option<bool>,
     /// DEPRECATED: use encryption.trust_policy.accept_self_signed
@@ -158,6 +171,8 @@ impl Default for EncryptionConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            backend: None,
+            noise: None,
             mtls: Some(false),
             accept_self_signed: Some(false),
             paths: Some(EncryptionPaths::default()),

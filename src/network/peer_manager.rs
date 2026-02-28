@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::Mutex;
@@ -27,6 +27,9 @@ pub struct PeerManager {
     relay_bindings: Arc<Mutex<HashMap<(String, String), BindingPrefs>>>,
     // Store-and-forward queue: to_node_id -> Vec<(serialized_message_json, Option<u64>, Option<String /*origin*/>)>
     relay_queue: Arc<Mutex<HashMap<String, Vec<(String, Option<u64>, Option<String>)>>>>,
+    // Store-and-forward queue caps (configurable via network.relay)
+    relay_queue_max_per_target: Arc<AtomicUsize>,
+    relay_queue_max_global: Arc<AtomicUsize>,
     // Track last seen sequence per (from,to) for ordering/dedup
     relay_last_sequence: Arc<Mutex<HashMap<(String, String), u64>>>,
     capabilities_by_node: Arc<Mutex<HashMap<String, Vec<String>>>>,
@@ -43,6 +46,9 @@ impl Default for PeerManager {
 }
 
 impl PeerManager {
+    const DEFAULT_QUEUE_MAX_PER_TARGET: usize = 1024;
+    const DEFAULT_QUEUE_MAX_GLOBAL: usize = 8192;
+
     pub fn new() -> Self {
         Self {
             peers: Arc::new(Mutex::new(HashMap::new())),
@@ -53,10 +59,37 @@ impl PeerManager {
             relay_dropped: Arc::new(AtomicU64::new(0)),
             relay_bindings: Arc::new(Mutex::new(HashMap::new())),
             relay_queue: Arc::new(Mutex::new(HashMap::new())),
+            relay_queue_max_per_target: Arc::new(AtomicUsize::new(
+                Self::DEFAULT_QUEUE_MAX_PER_TARGET,
+            )),
+            relay_queue_max_global: Arc::new(AtomicUsize::new(Self::DEFAULT_QUEUE_MAX_GLOBAL)),
             relay_binding_ids: Arc::new(Mutex::new(HashMap::new())),
             relay_last_sequence: Arc::new(Mutex::new(HashMap::new())),
             reliable_inflight: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+
+    pub fn set_relay_queue_caps(
+        &self,
+        per_target: Option<usize>,
+        global: Option<usize>,
+    ) -> (usize, usize) {
+        let per_target_cap = per_target
+            .unwrap_or(Self::DEFAULT_QUEUE_MAX_PER_TARGET)
+            .max(1);
+        let global_cap = global.unwrap_or(Self::DEFAULT_QUEUE_MAX_GLOBAL).max(1);
+        self.relay_queue_max_per_target
+            .store(per_target_cap, Ordering::Relaxed);
+        self.relay_queue_max_global
+            .store(global_cap, Ordering::Relaxed);
+        (per_target_cap, global_cap)
+    }
+
+    pub fn relay_queue_caps(&self) -> (usize, usize) {
+        (
+            self.relay_queue_max_per_target.load(Ordering::Relaxed),
+            self.relay_queue_max_global.load(Ordering::Relaxed),
+        )
     }
 
     /// Returns a list of currently connected peer addresses
@@ -493,8 +526,7 @@ impl PeerManager {
         soft_drop_bulk: bool,
         origin_from: Option<String>,
     ) -> bool {
-        const MAX_QUEUE_PER_TARGET: usize = 1024;
-        const MAX_QUEUE_GLOBAL: usize = 8192;
+        let (max_queue_per_target, max_queue_global) = self.relay_queue_caps();
         // Accumulate notifications to send after releasing queue lock to avoid await while locked
         let mut to_notify: Vec<(String, crate::network::message::Reason)> = Vec::new();
         // If the incoming frame is already expired, notify origin immediately and drop.
@@ -539,8 +571,8 @@ impl PeerManager {
             // Note: exact count not required; boolean is sufficient for notify decisions upstream.
             // We cannot easily read previous length without cloning; use can_enqueue check separately.
             // Enforce cap by dropping oldest if exceeding limit
-            if v.len() >= MAX_QUEUE_PER_TARGET {
-                let drop_count = v.len() + 1 - MAX_QUEUE_PER_TARGET;
+            if v.len() >= max_queue_per_target {
+                let drop_count = v.len() + 1 - max_queue_per_target;
                 for _ in 0..drop_count {
                     let removed = v.remove(0);
                     if let Some(o) = removed.2.as_ref() {
@@ -550,7 +582,7 @@ impl PeerManager {
             }
         }
         let entry = q.entry(to_node_id.to_string()).or_insert_with(Vec::new);
-        if entry.len() >= MAX_QUEUE_PER_TARGET {
+        if entry.len() >= max_queue_per_target {
             // If soft_drop_bulk, drop the incoming frame silently
             if soft_drop_bulk {
                 return false;
@@ -569,11 +601,11 @@ impl PeerManager {
 
         // Enforce global cap by dropping oldest across targets (simple round-robin)
         let mut total_len: usize = q.values().map(|v| v.len()).sum();
-        if total_len > MAX_QUEUE_GLOBAL {
+        if total_len > max_queue_global {
             let mut keys: Vec<String> = q.keys().cloned().collect();
             keys.sort();
             let mut idx = 0usize;
-            while total_len > MAX_QUEUE_GLOBAL && !keys.is_empty() {
+            while total_len > max_queue_global && !keys.is_empty() {
                 let k = &keys[idx % keys.len()];
                 if let Some(vec) = q.get_mut(k) {
                     if !vec.is_empty() {
@@ -614,15 +646,14 @@ impl PeerManager {
     }
 
     pub async fn can_enqueue_store_forward(&self, to_node_id: &str) -> bool {
-        const MAX_QUEUE_PER_TARGET: usize = 1024;
-        const MAX_QUEUE_GLOBAL: usize = 8192;
+        let (max_queue_per_target, max_queue_global) = self.relay_queue_caps();
         let q = self.relay_queue.lock().await;
         let per_target_ok = q
             .get(to_node_id)
-            .map(|v| v.len() < MAX_QUEUE_PER_TARGET)
+            .map(|v| v.len() < max_queue_per_target)
             .unwrap_or(true);
         let total_len: usize = q.values().map(|v| v.len()).sum();
-        let global_ok = total_len < MAX_QUEUE_GLOBAL;
+        let global_ok = total_len < max_queue_global;
         per_target_ok && global_ok
     }
 

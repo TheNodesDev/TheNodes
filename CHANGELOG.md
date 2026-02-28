@@ -54,6 +54,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   - Config key `encryption.backend` to select backend: `tls` (default), `noise`, or `none`.
   - Optional `[encryption.noise]` section for pattern, curve, cipher, hash, and static key path.
   - Fallback behavior: if `backend = "noise"` but feature not compiled, falls back to plaintext with warning.
+- Security module now explicitly exports secure-channel APIs via `src/security/mod.rs`.
 
 ### Changed
 - Unified wire tokens to screaming snake case for all message types:
@@ -63,9 +64,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   - `policy_denied`, `timeout`, `already_bound`, `unknown_target`, `overload`, `peer_left`.
   - Both `RelayBindAck.reason` and `RelayNotify.notif_type` now use `Reason` enum.
 - Switched `send_to_addr` and `send_to_node_id` from blocking `.send().await` to non-blocking `try_send()` to prevent channel backpressure hangs.
+- Runtime networking now uses the SecureChannel factory path in both outbound transport and inbound listener handshakes, removing duplicated inline handshake setup paths.
+- Startup now initializes `PeerStore` from final merged config (`PeerStore::from_config`) and updates plugin context to use that runtime-configured store.
+- Relay store-and-forward queue caps are now runtime-configurable via `network.relay.queue_max_per_target` and `network.relay.queue_max_global` (with safe defaults preserved).
+- HELLO capability advertisement is now centralized and consistently config-driven across listener, outbound transport, and handshake-only transport paths.
 
 ### Fixed
 - Resolved async hang in `enqueue_store_forward`: removed `.await` calls while holding `relay_queue` mutex; notifications now sent after releasing lock.
+- Discovery periodic task now sends real `PEER_REQUEST` messages (replacing placeholder behavior).
+- `PEER_REQUEST` handling now sends actual `PEER_LIST` responses instead of constructing placeholders only.
 - Templates (production/hybrid-app): align to current public APIs so newly scaffolded apps build cleanly.
 	- listener: add the new `emit_console_errors: bool` argument to `start_listener(…)`.
 	- bootstrap: pass `allow_console` based on prompt mode (`!args.prompt`).

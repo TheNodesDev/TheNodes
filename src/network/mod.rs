@@ -16,6 +16,23 @@ pub use peer_manager::PeerManager;
 pub use peer_store::{PeerSource, PeerStore};
 pub use transport::connect_to_peer;
 
+pub(crate) fn advertised_capabilities(config: &crate::config::Config) -> Option<Vec<String>> {
+    let mut caps = Vec::new();
+    if let Some(relay) = config.network.as_ref().and_then(|n| n.relay.as_ref()) {
+        if relay.enabled.unwrap_or(false) {
+            caps.push("relay".to_string());
+            if relay.store_forward.unwrap_or(false) {
+                caps.push("relay_store_forward".to_string());
+            }
+        }
+    }
+    if caps.is_empty() {
+        None
+    } else {
+        Some(caps)
+    }
+}
+
 // Quality-of-Service preferences for relay bindings and forwards
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum QoS {

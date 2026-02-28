@@ -374,12 +374,7 @@ impl SecureChannel for TlsSecureChannel {
             .get_ref()
             .1
             .peer_certificates()
-            .map(|certs| {
-                certs
-                    .iter()
-                    .map(|c| c.clone().into_owned())
-                    .collect()
-            })
+            .map(|certs| certs.iter().map(|c| c.clone().into_owned()).collect())
             .unwrap_or_else(Vec::new);
 
         let policy = EffectiveTrustPolicy::from_config(enc_ref);
@@ -513,18 +508,21 @@ impl SecureChannel for PlaintextChannel {
 pub fn make_secure_channel(cfg: &crate::config::Config) -> Box<dyn SecureChannel> {
     let enc = cfg.encryption.as_ref();
     // Derive backend: default to tls if enabled, plaintext if disabled
-    let backend = enc.and_then(|e| e.backend.clone()).or_else(|| {
-        enc.map(|e| {
-            if e.enabled {
-                "tls".to_string()
-            } else {
-                "plaintext".to_string()
-            }
-        })
-    });
+    let backend = enc
+        .and_then(|e| e.backend.as_deref())
+        .map(|b| b.trim().to_ascii_lowercase())
+        .or_else(|| {
+            enc.map(|e| {
+                if e.enabled {
+                    "tls".to_string()
+                } else {
+                    "plaintext".to_string()
+                }
+            })
+        });
     match backend.as_deref() {
         Some("tls") => Box::new(TlsSecureChannel::new()),
-        Some("plaintext") => Box::new(PlaintextChannel::new()),
+        Some("none") | Some("plaintext") => Box::new(PlaintextChannel::new()),
         Some("noise") => {
             #[cfg(feature = "noise")]
             {
@@ -590,12 +588,25 @@ impl SecureChannel for NoiseSecureChannel {
             .write_message(&[], &mut buf)
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         let (mut rstream, mut wstream) = stream.into_split();
-        tokio::time::timeout(std::time::Duration::from_secs(3), wstream.write_u16(len as u16)).await??;
-        tokio::time::timeout(std::time::Duration::from_secs(3), wstream.write_all(&buf[..len])).await??;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            wstream.write_u16(len as u16),
+        )
+        .await??;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            wstream.write_all(&buf[..len]),
+        )
+        .await??;
         // Receive responder message
-        let rlen = tokio::time::timeout(std::time::Duration::from_secs(3), rstream.read_u16()).await?? as usize;
+        let rlen = tokio::time::timeout(std::time::Duration::from_secs(3), rstream.read_u16())
+            .await?? as usize;
         let mut rbuf = vec![0u8; rlen];
-        tokio::time::timeout(std::time::Duration::from_secs(3), rstream.read_exact(&mut rbuf)).await??;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            rstream.read_exact(&mut rbuf),
+        )
+        .await??;
         pattern
             .read_message(&rbuf, &mut write_msg)
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
@@ -603,8 +614,16 @@ impl SecureChannel for NoiseSecureChannel {
         let len3 = pattern
             .write_message(&[], &mut buf)
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-        tokio::time::timeout(std::time::Duration::from_secs(3), wstream.write_u16(len3 as u16)).await??;
-        tokio::time::timeout(std::time::Duration::from_secs(3), wstream.write_all(&buf[..len3])).await??;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            wstream.write_u16(len3 as u16),
+        )
+        .await??;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            wstream.write_all(&buf[..len3]),
+        )
+        .await??;
         let transport = pattern
             .into_transport_mode()
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
@@ -648,9 +667,14 @@ impl SecureChannel for NoiseSecureChannel {
             .build_responder()
             .unwrap();
         let (mut rstream, mut wstream) = stream.into_split();
-        let rlen1 = tokio::time::timeout(std::time::Duration::from_secs(3), rstream.read_u16()).await?? as usize;
+        let rlen1 = tokio::time::timeout(std::time::Duration::from_secs(3), rstream.read_u16())
+            .await?? as usize;
         let mut rbuf1 = vec![0u8; rlen1];
-        tokio::time::timeout(std::time::Duration::from_secs(3), rstream.read_exact(&mut rbuf1)).await??;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            rstream.read_exact(&mut rbuf1),
+        )
+        .await??;
         let mut out = vec![0u8; 65535];
         pattern
             .read_message(&rbuf1, &mut out)
@@ -658,11 +682,24 @@ impl SecureChannel for NoiseSecureChannel {
         let len2 = pattern
             .write_message(&[], &mut out)
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-        tokio::time::timeout(std::time::Duration::from_secs(3), wstream.write_u16(len2 as u16)).await??;
-        tokio::time::timeout(std::time::Duration::from_secs(3), wstream.write_all(&out[..len2])).await??;
-        let rlen3 = tokio::time::timeout(std::time::Duration::from_secs(3), rstream.read_u16()).await?? as usize;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            wstream.write_u16(len2 as u16),
+        )
+        .await??;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            wstream.write_all(&out[..len2]),
+        )
+        .await??;
+        let rlen3 = tokio::time::timeout(std::time::Duration::from_secs(3), rstream.read_u16())
+            .await?? as usize;
         let mut rbuf3 = vec![0u8; rlen3];
-        tokio::time::timeout(std::time::Duration::from_secs(3), rstream.read_exact(&mut rbuf3)).await??;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            rstream.read_exact(&mut rbuf3),
+        )
+        .await??;
         let mut final_out = vec![0u8; 0];
         pattern
             .read_message(&rbuf3, &mut final_out)
@@ -862,7 +899,11 @@ impl tokio::io::AsyncWrite for NoiseWriter {
             return Poll::Ready(Ok(0));
         }
         let max_chunk: usize = 60_000; // conservative to leave AEAD overhead
-        let to_send = if buf.len() > max_chunk { &buf[..max_chunk] } else { buf };
+        let to_send = if buf.len() > max_chunk {
+            &buf[..max_chunk]
+        } else {
+            buf
+        };
         let mut enc = vec![0u8; to_send.len() + 1024];
         let n = this
             .st

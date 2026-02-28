@@ -61,10 +61,6 @@ impl TlsSecureChannel {
     }
 }
 
-fn redacted_trust_fields() -> (String, Option<String>, Option<String>, Option<String>) {
-    ("redacted".to_string(), None, None, None)
-}
-
 #[async_trait]
 impl SecureChannel for TlsSecureChannel {
     async fn connect(
@@ -200,22 +196,20 @@ impl SecureChannel for TlsSecureChannel {
         if !allow_console {
             meta.suppress_console = true;
         }
-        let (event_reason, event_fingerprint, event_chain_reason, event_time_reason) =
-            redacted_trust_fields();
         let trust_evt = TrustDecisionEvent {
             meta,
             role: ConnectionRole::Outbound,
             decision: format!("{:?}", decision.outcome),
-            reason: event_reason,
+            reason: decision.reason.to_string(),
             mode: format!("{:?}", policy.mode),
-            fingerprint: event_fingerprint,
+            fingerprint: decision.fingerprint.clone(),
             pinned_fingerprint_match: None,
             pinned_subject_match: None,
             realm_binding: BindingStatus::NotApplied,
             chain_valid: decision.chain_valid,
-            chain_reason: event_chain_reason,
+            chain_reason: decision.chain_reason.clone(),
             time_valid: decision.time_valid,
-            time_reason: event_time_reason,
+            time_reason: decision.time_reason.clone(),
             stored: Some(decision.stored.to_string()),
             peer_addr: Some(peer_addr.to_string()),
             realm: Some(realm.canonical_code()),
@@ -400,22 +394,20 @@ impl SecureChannel for TlsSecureChannel {
         if !allow_console {
             meta.suppress_console = true;
         }
-        let (event_reason, event_fingerprint, event_chain_reason, event_time_reason) =
-            redacted_trust_fields();
         let trust_evt = TrustDecisionEvent {
             meta,
             role: ConnectionRole::Inbound,
             decision: format!("{:?}", decision.outcome),
-            reason: event_reason,
+            reason: decision.reason.to_string(),
             mode: format!("{:?}", policy.mode),
-            fingerprint: event_fingerprint,
+            fingerprint: decision.fingerprint.clone(),
             pinned_fingerprint_match: None,
             pinned_subject_match: None,
             realm_binding: BindingStatus::NotApplied,
             chain_valid: decision.chain_valid,
-            chain_reason: event_chain_reason,
+            chain_reason: decision.chain_reason.clone(),
             time_valid: decision.time_valid,
-            time_reason: event_time_reason,
+            time_reason: decision.time_reason.clone(),
             stored: Some(decision.stored.to_string()),
             peer_addr: Some(peer_addr.to_string()),
             realm: Some(realm.canonical_code()),

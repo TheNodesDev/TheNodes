@@ -61,6 +61,10 @@ impl TlsSecureChannel {
     }
 }
 
+fn redacted_trust_fields() -> (String, Option<String>, Option<String>, Option<String>) {
+    ("redacted".to_string(), None, None, None)
+}
+
 fn redacted_auth_fields() -> (Option<String>, String) {
     (None, "redacted".to_string())
 }
@@ -76,6 +80,10 @@ impl SecureChannel for TlsSecureChannel {
         allow_console: bool,
     ) -> Result<Channel> {
         // Lift minimal TLS client setup from transport.rs for adapter scaffolding.
+        use crate::events::{
+            dispatcher,
+            model::{BindingStatus, ConnectionRole, LogEvent, LogLevel, TrustDecisionEvent},
+        };
         use crate::security::trust::{evaluate_peer_cert_chain, EffectiveTrustPolicy};
         use rustls::pki_types::CertificateDer;
         use rustls::{ClientConfig, RootCertStore};
@@ -190,7 +198,35 @@ impl SecureChannel for TlsSecureChannel {
         let decision =
             evaluate_peer_cert_chain(&policy, trusted_dir, observed_dir, &chain, Some(realm));
 
-        let _ = allow_console;
+        // Emit trust event (Info)
+        let mut meta = dispatcher::meta("trust", LogLevel::Info);
+        meta.corr_id = Some(dispatcher::correlation_id());
+        if !allow_console {
+            meta.suppress_console = true;
+        }
+        let (event_reason, event_fingerprint, event_chain_reason, event_time_reason) =
+            redacted_trust_fields();
+        let trust_evt = TrustDecisionEvent {
+            meta,
+            role: ConnectionRole::Outbound,
+            decision: "redacted".to_string(),
+            reason: event_reason,
+            mode: format!("{:?}", policy.mode),
+            fingerprint: event_fingerprint,
+            pinned_fingerprint_match: None,
+            pinned_subject_match: None,
+            realm_binding: BindingStatus::NotApplied,
+            chain_valid: None,
+            chain_reason: event_chain_reason,
+            time_valid: None,
+            time_reason: event_time_reason,
+            stored: None,
+            peer_addr: Some(peer_addr.to_string()),
+            realm: Some(realm.canonical_code()),
+            dry_run: false,
+            override_action: None,
+        };
+        dispatcher::emit(LogEvent::TrustDecision(trust_evt));
         if matches!(
             decision.outcome,
             crate::security::trust::TrustDecisionOutcome::Reject
@@ -218,11 +254,15 @@ impl SecureChannel for TlsSecureChannel {
     async fn accept(
         &self,
         stream: TcpStream,
-        _peer_addr: std::net::SocketAddr,
+        peer_addr: std::net::SocketAddr,
         realm: &crate::realms::RealmInfo,
         config: &crate::config::Config,
         allow_console: bool,
     ) -> Result<Channel> {
+        use crate::events::{
+            dispatcher,
+            model::{BindingStatus, ConnectionRole, LogEvent, LogLevel, TrustDecisionEvent},
+        };
         use crate::security::trust::{evaluate_peer_cert_chain, EffectiveTrustPolicy};
         use rustls::pki_types::CertificateDer;
         use rustls::ServerConfig;
@@ -360,7 +400,34 @@ impl SecureChannel for TlsSecureChannel {
             Some(realm),
         );
 
-        let _ = allow_console;
+        let mut meta = dispatcher::meta("trust", LogLevel::Info);
+        meta.corr_id = Some(dispatcher::correlation_id());
+        if !allow_console {
+            meta.suppress_console = true;
+        }
+        let (event_reason, event_fingerprint, event_chain_reason, event_time_reason) =
+            redacted_trust_fields();
+        let trust_evt = TrustDecisionEvent {
+            meta,
+            role: ConnectionRole::Inbound,
+            decision: "redacted".to_string(),
+            reason: event_reason,
+            mode: format!("{:?}", policy.mode),
+            fingerprint: event_fingerprint,
+            pinned_fingerprint_match: None,
+            pinned_subject_match: None,
+            realm_binding: BindingStatus::NotApplied,
+            chain_valid: None,
+            chain_reason: event_chain_reason,
+            time_valid: None,
+            time_reason: event_time_reason,
+            stored: None,
+            peer_addr: Some(peer_addr.to_string()),
+            realm: Some(realm.canonical_code()),
+            dry_run: false,
+            override_action: None,
+        };
+        dispatcher::emit(LogEvent::TrustDecision(trust_evt));
         if mtls
             && matches!(
                 decision.outcome,

@@ -81,7 +81,7 @@ The generator replaces these placeholders:
 ## Distribution Model
 
 This template follows the **production distribution model:**
-- TheNodes is a library dependency (`thenodes = "0.1.0"`)
+- TheNodes is a library dependency (`thenodes = "0.2.0"`)
 - Plugin compiles independently
 - No TheNodes source code needed in your project
 - Plugin dynamic library works with any compatible TheNodes binary

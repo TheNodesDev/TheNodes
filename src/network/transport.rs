@@ -416,7 +416,7 @@ pub async fn connect_to_peer_handshake_only(
             protocol: Some(PROTOCOL_NAME.to_string()),
             version: Some(PROTOCOL_VERSION.to_string()),
             node_type: config.node.as_ref().and_then(|n| n.node_type.clone()),
-            capabilities: crate::network::advertised_capabilities(&config),
+            capabilities: crate::network::advertised_capabilities(config),
         },
         None,
         Some(our_realm.clone()),

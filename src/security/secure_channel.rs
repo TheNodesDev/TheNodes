@@ -65,10 +65,6 @@ fn redacted_trust_fields() -> (String, Option<String>, Option<String>, Option<St
     ("redacted".to_string(), None, None, None)
 }
 
-fn redacted_auth_fields() -> (Option<String>, String) {
-    (None, "redacted".to_string())
-}
-
 #[async_trait]
 impl SecureChannel for TlsSecureChannel {
     async fn connect(
@@ -209,18 +205,18 @@ impl SecureChannel for TlsSecureChannel {
         let trust_evt = TrustDecisionEvent {
             meta,
             role: ConnectionRole::Outbound,
-            decision: "redacted".to_string(),
+            decision: format!("{:?}", decision.outcome),
             reason: event_reason,
             mode: format!("{:?}", policy.mode),
             fingerprint: event_fingerprint,
             pinned_fingerprint_match: None,
             pinned_subject_match: None,
             realm_binding: BindingStatus::NotApplied,
-            chain_valid: None,
+            chain_valid: decision.chain_valid,
             chain_reason: event_chain_reason,
-            time_valid: None,
+            time_valid: decision.time_valid,
             time_reason: event_time_reason,
-            stored: None,
+            stored: Some(decision.stored.to_string()),
             peer_addr: Some(peer_addr.to_string()),
             realm: Some(realm.canonical_code()),
             dry_run: false,
@@ -235,16 +231,15 @@ impl SecureChannel for TlsSecureChannel {
         }
 
         let (r, w) = tokio::io::split(tls_stream);
-        let (auth_fingerprint, auth_reason) = redacted_auth_fields();
         Ok(Channel {
             reader: Box::new(tokio::io::BufReader::new(r)),
             writer: Box::new(w),
             auth: AuthSummary {
                 backend: SecurityBackend::Tls,
-                fingerprint: auth_fingerprint,
+                fingerprint: decision.fingerprint,
                 subject: None,
                 decision: "Accept".into(),
-                reason: auth_reason,
+                reason: decision.reason.to_string(),
                 chain_valid: decision.chain_valid,
                 time_valid: decision.time_valid,
             },
@@ -410,18 +405,18 @@ impl SecureChannel for TlsSecureChannel {
         let trust_evt = TrustDecisionEvent {
             meta,
             role: ConnectionRole::Inbound,
-            decision: "redacted".to_string(),
+            decision: format!("{:?}", decision.outcome),
             reason: event_reason,
             mode: format!("{:?}", policy.mode),
             fingerprint: event_fingerprint,
             pinned_fingerprint_match: None,
             pinned_subject_match: None,
             realm_binding: BindingStatus::NotApplied,
-            chain_valid: None,
+            chain_valid: decision.chain_valid,
             chain_reason: event_chain_reason,
-            time_valid: None,
+            time_valid: decision.time_valid,
             time_reason: event_time_reason,
-            stored: None,
+            stored: Some(decision.stored.to_string()),
             peer_addr: Some(peer_addr.to_string()),
             realm: Some(realm.canonical_code()),
             dry_run: false,
@@ -438,16 +433,15 @@ impl SecureChannel for TlsSecureChannel {
         }
 
         let (r, w) = tokio::io::split(tls_stream);
-        let (auth_fingerprint, auth_reason) = redacted_auth_fields();
         Ok(Channel {
             reader: Box::new(tokio::io::BufReader::new(r)),
             writer: Box::new(w),
             auth: AuthSummary {
                 backend: SecurityBackend::Tls,
-                fingerprint: auth_fingerprint,
+                fingerprint: decision.fingerprint,
                 subject: None,
                 decision: "Accept".into(),
-                reason: auth_reason,
+                reason: decision.reason.to_string(),
                 chain_valid: decision.chain_valid,
                 time_valid: decision.time_valid,
             },

@@ -28,6 +28,7 @@ jobs:
         with:
           languages: rust
           config-file: ./.github/codeql/codeql-config.yml
+          setup: false
 
       - name: Autobuild
         uses: github/codeql-action/autobuild@v3

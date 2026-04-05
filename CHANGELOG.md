@@ -6,6 +6,53 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+### Breaking
+- **API**: `PluginContext` is now constructed via `PluginContext::new(...)` and carries local node identity, runtime config, console-permission state, and an async plugin-manager handle for framework-owned delivery.
+- **Wire protocol**: `HELLO` now includes optional `udp_listen_addr` and `udp_observed_addr` fields for UDP transport and NAT-traversal metadata exchange.
+- **Config/API**: `NetworkConfig` now includes optional `udp`, `connection_policy`, `nat_traversal`, and `delivery` sections. Manual struct initialization must populate these fields.
+
+### Added
+- **ADR-0004 UDP + Noise transport**
+  - New UDP transport modules: `src/network/udp_session.rs` and `src/network/udp_listener.rs`.
+  - TNCF control-frame handling, Noise XX UDP session management, persistent Noise static key loading, session reaping, and UDP session/path tracking in `PeerManager`.
+  - Optional UDP capability advertisement plus `udp_hello_addr()` support for HELLO metadata.
+- **ADR-0005 connection policy and NAT traversal**
+  - New `src/network/connection.rs` with `connect_with_policy`, `ConnectionPolicy`, `ConnectionStrategy`, and `ConnectionOutcome`.
+  - New `src/network/nat_traversal.rs` with observed-address refresh, cookie-based observation flow, pending-observation matching, relay-coordinated punch helpers, and NAT traversal runtime state.
+  - New config sections for `[network.connection_policy]` and `[network.nat_traversal]`.
+  - New message types for `PUNCH_COORDINATE`, `PUNCH_INVITE`, `PUNCH_READY`, `PUNCH_GO`, and `PUNCH_ABORT`, including `attempt_id` correlation across coordinated punch flows.
+- **ADR-0006 delivery semantics**
+  - New `src/network/delivery.rs` with `DeliveryClass`, `DeliveryOptions`, `DeliveryOutcome`, `DeliveryFailureReason`, `DeliveryPathConstraints`, `DeliveryRuntime`, and stable UUID v7 `MessageId` generation.
+  - New `DELIVERY_ACK` wire message type for framework-level hop acknowledgements.
+  - `Message` now carries optional validated `DeliveryMetadata` (`message_id`, `class`, `ordering_key`, `ordering_sequence`); malformed delivery metadata is rejected at deserialization.
+  - `PeerManager` now tracks delivery attempts, deduplication windows, ordered inbound buffers, relay sequencing, and stale ordered-scope eviction state.
+  - Plugin host now exposes framework-owned async delivery APIs via `PluginContext::deliver_message(...)` and `PluginContext::send_message(...)`.
+  - New `[network.delivery]` config section with keys: `fire_and_forget_timeout_ms`, `reliable_timeout_ms`, `ordered_reliable_timeout_ms`, `reliable_retry_budget`, `ordered_reliable_retry_budget`, `dedup_window_secs`, `ordered_max_buffered_messages`, `retry_interval_ms`.
+
+### Changed
+- Runtime startup now injects delivery config into `PeerManager`, refreshes `PluginContext` with final runtime state, and starts the UDP Noise listener and NAT traversal helpers when enabled.
+- Inbound and outbound transport handling now records TCP/UDP transport metadata, captures peer UDP listen and observed addresses from `HELLO`, and routes TCP, UDP, and relay-carried reliable/ordered messages through the delivery layer before plugin dispatch.
+- Observed-address state now tracks observer/request metadata for pending observation flows and uses explicit correlation for relay-coordinated punch state.
+- Capability advertisement is now config-driven for `udp`, `punch`, and `punch_rendezvous` in addition to existing relay capabilities.
+- `uuid` dependency now enables UUID v7 generation for delivery message IDs.
+- Default config wiring now includes defaults for delivery semantics and explicit support for the new UDP, connection policy, and NAT traversal config sections.
+- Delivery routing now delegates normal path selection to connection policy and can initiate relay-coordinated UDP hole punching when policy selects that path.
+
+### Docs
+- Added decision records:
+  - `docs/adr/0004-udp-noise-transport.md`
+  - `docs/adr/0005-nat-traversal-and-connection-policy.md`
+  - `docs/adr/0006-delivery-semantics-and-reliability-model.md`
+
+### Tests
+- Added unit and integration coverage for UDP transport, NAT traversal, connection policy, and delivery semantics via:
+  - `tests/udp_transport.rs`
+  - `tests/nat_traversal.rs`
+  - `tests/connection_policy.rs`
+  - `tests/delivery_semantics.rs`
+- Added delivery-layer regression coverage for relay ACK flow, plugin-context reliable delivery, ordered buffer limits, and UDP preferred-path bidirectionality.
+- Updated peer store tests to account for the expanded `NetworkConfig` shape.
+
 
 ## [0.2.0] - 2026-02-28
 

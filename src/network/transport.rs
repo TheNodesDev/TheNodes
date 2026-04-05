@@ -9,7 +9,7 @@ use crate::events::model::LogLevel;
 use crate::network::events::emit_network_event;
 use crate::network::message::{Message, MessageType};
 use crate::network::peer::Peer;
-use crate::network::peer_manager::PeerManager;
+use crate::network::peer_manager::{PeerManager, TransportKind};
 use crate::realms::RealmInfo;
 use std::error::Error;
 use std::net::SocketAddr;
@@ -159,6 +159,16 @@ pub async fn connect_to_peer<'a>(
     }
 
     // Reply HELLO with our realm; peers will compare canonical_code() + version.
+    let own_observed_udp = peer_manager
+        .own_udp_observed_addr_if_fresh(
+            config
+                .network
+                .as_ref()
+                .and_then(|n| n.nat_traversal.as_ref())
+                .and_then(|nat| nat.refresh_secs)
+                .unwrap_or(300),
+        )
+        .await;
     let reply = Message::new(
         DEFAULT_APP_NAME,
         &hello.from,
@@ -169,6 +179,8 @@ pub async fn connect_to_peer<'a>(
             version: Some(PROTOCOL_VERSION.to_string()),
             node_type: config.node.as_ref().and_then(|n| n.node_type.clone()),
             capabilities: crate::network::advertised_capabilities(&config),
+            udp_listen_addr: crate::network::udp_hello_addr(&config, local_addr.ip()),
+            udp_observed_addr: own_observed_udp,
         },
         None,
         Some(our_realm.clone()),
@@ -230,19 +242,36 @@ pub async fn connect_to_peer<'a>(
         );
         return Err(e.into());
     }
+    peer_manager
+        .set_transport_kind(&remote_node_id, TransportKind::Tcp)
+        .await;
     // Update peer store with successful handshake metadata
     if let Some(store) = &peer_store {
         store
             .mark_success_with_meta(&addr, Some(remote_node_id.clone()), remote_capabilities)
             .await;
     }
-    // If remote provided a listen_addr in its HELLO, record it for suppression logic
+    // If remote provided a listen_addr or udp_listen_addr in its HELLO, record them.
     if let MessageType::Hello {
-        listen_addr: Some(listen),
+        listen_addr,
+        udp_listen_addr,
+        udp_observed_addr,
         ..
     } = hello.msg_type
     {
-        peer_manager.add_listen_addr(&listen, &remote_node_id).await;
+        if let Some(listen) = listen_addr {
+            peer_manager.add_listen_addr(&listen, &remote_node_id).await;
+        }
+        if let Some(udp_addr) = udp_listen_addr {
+            peer_manager
+                .add_udp_listen_addr(&remote_node_id, &udp_addr)
+                .await;
+        }
+        if let Some(obs_addr) = udp_observed_addr {
+            peer_manager
+                .add_udp_observed_addr(&remote_node_id, &obs_addr, None, None)
+                .await;
+        }
     }
 
     // Spawn periodic PeerRequest gossip if discovery enabled
@@ -317,6 +346,12 @@ pub async fn connect_to_peer<'a>(
         .and_then(|r| r.selection.clone())
         .map(|s| s == "rendezvous")
         .unwrap_or(false);
+    let punch_rendezvous = config
+        .network
+        .as_ref()
+        .and_then(|n| n.nat_traversal.as_ref())
+        .and_then(|nt| nt.serve)
+        .unwrap_or(false);
     receive_and_dispatch(
         &mut reader,
         addr,
@@ -328,6 +363,8 @@ pub async fn connect_to_peer<'a>(
         relay_store_forward_enabled,
         relay_selection_enabled,
         allow_console,
+        local_node_id,
+        punch_rendezvous,
     )
     .await;
     Ok(())
@@ -417,6 +454,8 @@ pub async fn connect_to_peer_handshake_only(
             version: Some(PROTOCOL_VERSION.to_string()),
             node_type: config.node.as_ref().and_then(|n| n.node_type.clone()),
             capabilities: crate::network::advertised_capabilities(config),
+            udp_listen_addr: crate::network::udp_hello_addr(config, local_addr.ip()),
+            udp_observed_addr: None, // handshake-only — no peer_manager available
         },
         None,
         Some(our_realm.clone()),
@@ -448,6 +487,10 @@ pub async fn receive_and_dispatch<R: AsyncBufReadExt + Unpin>(
     relay_store_forward_enabled: bool,
     relay_selection_enabled: bool,
     allow_console: bool,
+    // ADR-0005: local node identity (for PunchGo initiator/responder determination).
+    local_node_id: String,
+    // ADR-0005: whether this node acts as a punch rendezvous (for PunchCoordinate/PunchReady).
+    punch_rendezvous: bool,
 ) {
     let mut line = String::new();
     loop {
@@ -497,190 +540,335 @@ pub async fn receive_and_dispatch<R: AsyncBufReadExt + Unpin>(
             }
             Ok(_) => {
                 if let Some(msg) = Message::from_json(&line) {
-                    plugin_manager.dispatch_message(&msg);
-                    match msg.msg_type {
-                        MessageType::Hello { .. } => {
-                            emit_network_event(
-                                "transport",
-                                LogLevel::Debug,
-                                "duplicate_hello_ignored",
-                                Some(addr.to_string()),
-                                None,
-                                allow_console,
-                            );
+                    let effective_msg =
+                        crate::network::delivery::unwrap_tunneled_message(&msg, &local_node_id)
+                            .unwrap_or(msg);
+                    let disposition = crate::network::delivery::process_incoming_message(
+                        &peer_manager,
+                        &local_node_id,
+                        effective_msg,
+                    )
+                    .await;
+
+                    let dispatch_messages = match disposition {
+                        crate::network::delivery::IncomingMessageDisposition::Consumed => {
+                            Vec::new()
                         }
-                        MessageType::Text(text) => {
-                            emit_network_event(
-                                "transport",
-                                LogLevel::Info,
-                                "message_text",
-                                Some(addr.to_string()),
-                                Some(text),
-                                allow_console,
-                            );
-                        }
-                        MessageType::PeerRequest { want } => {
-                            if discovery_enabled {
-                                if let Some(store) = &peer_store {
-                                    let connected: std::collections::HashSet<_> =
-                                        peer_manager.list_peers().await.into_iter().collect();
-                                    let sample = store.sample(want as usize, &connected).await;
-                                    if !sample.is_empty() {
-                                        let peers_str: Vec<String> =
-                                            sample.iter().map(|s| s.to_string()).collect();
-                                        let list_msg = Message::new(
-                                            &addr.to_string(),
-                                            &addr.to_string(),
-                                            MessageType::PeerList {
-                                                peers: peers_str.clone(),
-                                            },
-                                            None,
-                                            msg.realm.clone(),
-                                        );
-                                        let send_result = peer_manager
-                                            .send_to_addr(&addr, list_msg.as_json())
-                                            .await;
-                                        emit_network_event(
-                                            "transport",
-                                            if send_result.is_ok() {
-                                                LogLevel::Debug
-                                            } else {
-                                                LogLevel::Warn
-                                            },
-                                            "peer_list_sent",
-                                            Some(addr.to_string()),
-                                            Some(format!(
-                                                "count={} ok={} err={:?}",
-                                                sample.len(),
-                                                send_result.is_ok(),
-                                                send_result.err()
-                                            )),
-                                            allow_console,
-                                        );
-                                        use crate::events::{
-                                            dispatcher,
-                                            model::{LogEvent, LogLevel, SystemEvent},
-                                        };
-                                        let mut meta =
-                                            dispatcher::meta("discovery", LogLevel::Info);
-                                        meta.corr_id = Some(dispatcher::correlation_id());
-                                        dispatcher::emit(LogEvent::System(SystemEvent {
-                                            meta,
-                                            action: "peer_request_served".into(),
-                                            detail: Some(format!(
-                                                "addr={} returned={} want={}",
-                                                addr,
-                                                sample.len(),
-                                                want
-                                            )),
-                                        }));
+                        crate::network::delivery::IncomingMessageDisposition::Dispatch(
+                            messages,
+                        ) => messages,
+                    };
+
+                    for msg in dispatch_messages {
+                        plugin_manager.dispatch_message(&msg);
+                        match msg.msg_type {
+                            MessageType::Hello { .. } => {
+                                emit_network_event(
+                                    "transport",
+                                    LogLevel::Debug,
+                                    "duplicate_hello_ignored",
+                                    Some(addr.to_string()),
+                                    None,
+                                    allow_console,
+                                );
+                            }
+                            MessageType::Text(text) => {
+                                emit_network_event(
+                                    "transport",
+                                    LogLevel::Info,
+                                    "message_text",
+                                    Some(addr.to_string()),
+                                    Some(text),
+                                    allow_console,
+                                );
+                            }
+                            MessageType::PeerRequest { want } => {
+                                if discovery_enabled {
+                                    if let Some(store) = &peer_store {
+                                        let connected: std::collections::HashSet<_> =
+                                            peer_manager.list_peers().await.into_iter().collect();
+                                        let sample = store.sample(want as usize, &connected).await;
+                                        if !sample.is_empty() {
+                                            let peers_str: Vec<String> =
+                                                sample.iter().map(|s| s.to_string()).collect();
+                                            let list_msg = Message::new(
+                                                &addr.to_string(),
+                                                &addr.to_string(),
+                                                MessageType::PeerList {
+                                                    peers: peers_str.clone(),
+                                                },
+                                                None,
+                                                msg.realm.clone(),
+                                            );
+                                            let send_result = peer_manager
+                                                .send_to_addr(&addr, list_msg.as_json())
+                                                .await;
+                                            emit_network_event(
+                                                "transport",
+                                                if send_result.is_ok() {
+                                                    LogLevel::Debug
+                                                } else {
+                                                    LogLevel::Warn
+                                                },
+                                                "peer_list_sent",
+                                                Some(addr.to_string()),
+                                                Some(format!(
+                                                    "count={} ok={} err={:?}",
+                                                    sample.len(),
+                                                    send_result.is_ok(),
+                                                    send_result.err()
+                                                )),
+                                                allow_console,
+                                            );
+                                            use crate::events::{
+                                                dispatcher,
+                                                model::{LogEvent, LogLevel, SystemEvent},
+                                            };
+                                            let mut meta =
+                                                dispatcher::meta("discovery", LogLevel::Info);
+                                            meta.corr_id = Some(dispatcher::correlation_id());
+                                            dispatcher::emit(LogEvent::System(SystemEvent {
+                                                meta,
+                                                action: "peer_request_served".into(),
+                                                detail: Some(format!(
+                                                    "addr={} returned={} want={}",
+                                                    addr,
+                                                    sample.len(),
+                                                    want
+                                                )),
+                                            }));
+                                        }
                                     }
                                 }
                             }
-                        }
-                        MessageType::PeerList { peers } => {
-                            if !discovery_enabled {
-                                continue;
+                            MessageType::PeerList { peers } => {
+                                if !discovery_enabled {
+                                    continue;
+                                }
+                                let mut added = 0usize;
+                                if let Some(store) = &peer_store {
+                                    for p in peers {
+                                        if let Ok(sock) = p.parse() {
+                                            store
+                                                .insert(
+                                                    sock,
+                                                    crate::network::peer_store::PeerSource::Gossip,
+                                                )
+                                                .await;
+                                            store.mark_success(&sock).await;
+                                        }
+                                        added += 1;
+                                    }
+                                }
+                                emit_network_event(
+                                    "transport",
+                                    LogLevel::Info,
+                                    "peer_list_received",
+                                    Some(addr.to_string()),
+                                    Some(format!("added={}", added)),
+                                    allow_console,
+                                );
+                                use crate::events::{
+                                    dispatcher,
+                                    model::{LogEvent, LogLevel, SystemEvent},
+                                };
+                                let mut meta = dispatcher::meta("discovery", LogLevel::Info);
+                                meta.corr_id = Some(dispatcher::correlation_id());
+                                dispatcher::emit(LogEvent::System(SystemEvent {
+                                    meta,
+                                    action: "peer_list_received".into(),
+                                    detail: Some(format!("from={} added={}", addr, added)),
+                                }));
                             }
-                            let mut added = 0usize;
-                            if let Some(store) = &peer_store {
-                                for p in peers {
-                                    if let Ok(sock) = p.parse() {
-                                        store
-                                            .insert(
-                                                sock,
-                                                crate::network::peer_store::PeerSource::Gossip,
+                            MessageType::RelayBind { .. } => {
+                                crate::network::relay::handle_bind(
+                                    &msg,
+                                    &addr,
+                                    &peer_manager,
+                                    relay_enabled,
+                                    relay_store_forward_enabled,
+                                    allow_console,
+                                )
+                                .await;
+                            }
+                            MessageType::RelayBindAck {
+                                ok,
+                                reason,
+                                binding_id,
+                                peer_present,
+                                nonce,
+                            } => {
+                                emit_network_event(
+                                    "transport",
+                                    LogLevel::Info,
+                                    "relay_bind_ack",
+                                    Some(addr.to_string()),
+                                    Some(format!(
+                                        "ok={} reason={:?} binding_id={:?} peer_present={:?} nonce={:?}",
+                                        ok, reason, binding_id, peer_present, nonce
+                                    )),
+                                    allow_console,
+                                );
+                            }
+                            MessageType::RelayForward { .. } => {
+                                crate::network::relay::handle_forward(
+                                    &msg,
+                                    &addr,
+                                    &peer_manager,
+                                    relay_enabled,
+                                    relay_store_forward_enabled,
+                                    relay_selection_enabled,
+                                    allow_console,
+                                )
+                                .await;
+                            }
+                            MessageType::RelayUnbind { .. } => {
+                                crate::network::relay::handle_unbind(
+                                    &msg,
+                                    &addr,
+                                    &peer_manager,
+                                    allow_console,
+                                )
+                                .await;
+                            }
+                            MessageType::Ack { .. } => {
+                                crate::network::relay::handle_ack(&msg, &addr, &peer_manager).await;
+                            }
+                            MessageType::DeliveryAck { .. } => {}
+                            MessageType::PunchCoordinate {
+                                attempt_id,
+                                target,
+                                timeout_ms,
+                            } => {
+                                #[cfg(feature = "noise")]
+                                if punch_rendezvous {
+                                    if let Some(from_id) =
+                                        peer_manager.node_id_for_addr(&addr).await
+                                    {
+                                        let timeout_ms = timeout_ms.unwrap_or(5000);
+                                        peer_manager
+                                            .handle_punch_coordinate_msg(
+                                                &attempt_id,
+                                                &from_id,
+                                                &target,
+                                                timeout_ms,
                                             )
                                             .await;
-                                        store.mark_success(&sock).await;
                                     }
-                                    added += 1;
                                 }
+                                #[cfg(not(feature = "noise"))]
+                                let _ = (attempt_id, target, timeout_ms, punch_rendezvous);
                             }
-                            emit_network_event(
-                                "transport",
-                                LogLevel::Info,
-                                "peer_list_received",
-                                Some(addr.to_string()),
-                                Some(format!("added={}", added)),
-                                allow_console,
-                            );
-                            // Emit discovery event
-                            use crate::events::{
-                                dispatcher,
-                                model::{LogEvent, LogLevel, SystemEvent},
-                            };
-                            let mut meta = dispatcher::meta("discovery", LogLevel::Info);
-                            meta.corr_id = Some(dispatcher::correlation_id());
-                            dispatcher::emit(LogEvent::System(SystemEvent {
-                                meta,
-                                action: "peer_list_received".into(),
-                                detail: Some(format!("from={} added={}", addr, added)),
-                            }));
-                        }
-                        MessageType::RelayBind { .. } => {
-                            crate::network::relay::handle_bind(
-                                &msg,
-                                &addr,
-                                &peer_manager,
-                                relay_enabled,
-                                relay_store_forward_enabled,
-                                allow_console,
-                            )
-                            .await;
-                        }
-                        MessageType::RelayBindAck {
-                            ok,
-                            reason,
-                            binding_id,
-                            peer_present,
-                            nonce,
-                        } => {
-                            emit_network_event(
-                                "transport",
-                                LogLevel::Info,
-                                "relay_bind_ack",
-                                Some(addr.to_string()),
-                                Some(format!(
-                                    "ok={} reason={:?} binding_id={:?} peer_present={:?} nonce={:?}",
-                                    ok, reason, binding_id, peer_present, nonce
-                                )),
-                                allow_console,
-                            );
-                        }
-                        MessageType::RelayForward { .. } => {
-                            crate::network::relay::handle_forward(
-                                &msg,
-                                &addr,
-                                &peer_manager,
-                                relay_enabled,
-                                relay_store_forward_enabled,
-                                relay_selection_enabled,
-                                allow_console,
-                            )
-                            .await;
-                        }
-                        MessageType::RelayUnbind { .. } => {
-                            crate::network::relay::handle_unbind(
-                                &msg,
-                                &addr,
-                                &peer_manager,
-                                allow_console,
-                            )
-                            .await;
-                        }
-                        MessageType::Ack { .. } => {
-                            crate::network::relay::handle_ack(&msg, &addr, &peer_manager).await;
-                        }
-                        _ => {
-                            emit_network_event(
-                                "transport",
-                                LogLevel::Debug,
-                                "message_other",
-                                Some(addr.to_string()),
-                                Some(format!("payload={:?}", msg.msg_type)),
-                                allow_console,
-                            );
+                            MessageType::PunchInvite {
+                                attempt_id,
+                                from_node_id,
+                                timeout_ms,
+                            } => {
+                                let max_age_secs =
+                                    peer_manager.nat_observation_refresh_secs().await;
+                                let our_obs = peer_manager
+                                    .own_udp_observed_addr_if_fresh(max_age_secs)
+                                    .await;
+                                let ok = our_obs.is_some();
+                                let ready = Message::new(
+                                    &local_node_id,
+                                    &addr.to_string(),
+                                    MessageType::PunchReady {
+                                        attempt_id,
+                                        target: from_node_id,
+                                        ok,
+                                    },
+                                    None,
+                                    None,
+                                );
+                                let _ = peer_manager.send_to_addr(&addr, ready.as_json()).await;
+                                let _ = timeout_ms;
+                            }
+                            MessageType::PunchReady {
+                                attempt_id,
+                                target,
+                                ok,
+                            } => {
+                                #[cfg(feature = "noise")]
+                                if punch_rendezvous {
+                                    if let Some(responder_id) =
+                                        peer_manager.node_id_for_addr(&addr).await
+                                    {
+                                        peer_manager
+                                            .handle_punch_ready_msg(
+                                                &attempt_id,
+                                                &responder_id,
+                                                &target,
+                                                ok,
+                                            )
+                                            .await;
+                                    }
+                                }
+                                #[cfg(not(feature = "noise"))]
+                                let _ = (attempt_id, target, ok, punch_rendezvous);
+                            }
+                            MessageType::PunchGo {
+                                attempt_id,
+                                initiator,
+                                responder,
+                                initiator_observed_addr,
+                                responder_observed_addr,
+                                start_at_ms,
+                                timeout_ms,
+                            } => {
+                                #[cfg(feature = "noise")]
+                                peer_manager
+                                    .handle_punch_go_msg(
+                                        &local_node_id,
+                                        crate::network::nat_traversal::PunchGoParams {
+                                            attempt_id,
+                                            initiator,
+                                            responder,
+                                            initiator_observed_addr,
+                                            responder_observed_addr,
+                                            start_at_ms,
+                                            timeout_ms,
+                                        },
+                                    )
+                                    .await;
+                                #[cfg(not(feature = "noise"))]
+                                let _ = (
+                                    attempt_id,
+                                    initiator,
+                                    responder,
+                                    initiator_observed_addr,
+                                    responder_observed_addr,
+                                    start_at_ms,
+                                    timeout_ms,
+                                );
+                            }
+                            MessageType::PunchAbort {
+                                attempt_id,
+                                target,
+                                reason,
+                            } => {
+                                emit_network_event(
+                                    "transport",
+                                    LogLevel::Info,
+                                    "punch_abort",
+                                    Some(addr.to_string()),
+                                    Some(format!(
+                                        "attempt_id={} target={} reason={:?}",
+                                        attempt_id, target, reason
+                                    )),
+                                    allow_console,
+                                );
+                            }
+                            _ => {
+                                emit_network_event(
+                                    "transport",
+                                    LogLevel::Debug,
+                                    "message_other",
+                                    Some(addr.to_string()),
+                                    Some(format!("payload={:?}", msg.msg_type)),
+                                    allow_console,
+                                );
+                            }
                         }
                     }
                 } else {

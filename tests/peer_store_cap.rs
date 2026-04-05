@@ -45,6 +45,10 @@ async fn peer_store_cap_enforcement_on_load() {
                 save_interval_secs: Some(60),
             }),
             relay: None,
+            udp: None,
+            connection_policy: None,
+            nat_traversal: None,
+            delivery: None,
         }),
     };
 

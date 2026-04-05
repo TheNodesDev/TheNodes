@@ -92,11 +92,14 @@ async fn main() {
     let peer_store_for_plugins = PeerStore::new();
 
     // Dynamically load plugins from `plugins/`
-    let plugin_context = thenodes::plugin_host::PluginContext {
-        peer_manager: peer_manager.clone(),
-        peer_store: peer_store_for_plugins.clone(),
-        events: thenodes::events::dispatcher::handle(),
-    };
+    let plugin_context = thenodes::plugin_host::PluginContext::new(
+        peer_manager.clone(),
+        peer_store_for_plugins.clone(),
+        thenodes::events::dispatcher::handle(),
+        node_id.clone(),
+        config.clone(),
+        !args.prompt,
+    );
     let mut raw_manager = PluginManager::with_context(plugin_context);
     let mut plugin_loader = PluginLoader::new();
 
@@ -210,7 +213,17 @@ async fn main() {
     let peer_store = PeerStore::from_config(&config).await;
     if let Some(ctx) = raw_manager.context.as_mut() {
         ctx.peer_store = peer_store.clone();
+        ctx.local_node_id = node_id.clone();
+        ctx.config = config.clone();
+        ctx.allow_console = !args.prompt;
     }
+
+    peer_manager.set_delivery_config(
+        config
+            .network
+            .as_ref()
+            .and_then(|network| network.delivery.clone()),
+    );
 
     if let Some(relay) = config.network.as_ref().and_then(|n| n.relay.as_ref()) {
         let (per_target, global) =
@@ -222,6 +235,9 @@ async fn main() {
     }
 
     let plugin_manager = Arc::new(raw_manager);
+    if let Some(ctx) = &plugin_manager.context {
+        ctx.set_plugin_manager(plugin_manager.clone()).await;
+    }
 
     // Load RealmInfo after overrides
     let realm = config.realm.clone().unwrap_or_else(RealmInfo::default);
@@ -256,6 +272,81 @@ async fn main() {
             eprintln!("❌ Listener error: {}", e);
         }
     });
+
+    // Spawn UDP Noise listener (ADR-0004 Phase 1) + NAT traversal (ADR-0005 Phase 2+3) when enabled.
+    #[cfg(feature = "noise")]
+    {
+        let udp_enabled = config
+            .network
+            .as_ref()
+            .and_then(|n| n.udp.as_ref())
+            .and_then(|u| u.enabled)
+            .unwrap_or(false);
+        if udp_enabled {
+            // Build NatState from config when nat_traversal is enabled (ADR-0005).
+            let nat_state_opt: Option<std::sync::Arc<thenodes::network::nat_traversal::NatState>> =
+                config
+                    .network
+                    .as_ref()
+                    .and_then(|n| n.nat_traversal.as_ref())
+                    .filter(|nt| nt.enabled.unwrap_or(false))
+                    .map(|nt| {
+                        std::sync::Arc::new(
+                            thenodes::network::nat_traversal::NatState::from_config(nt),
+                        )
+                    });
+
+            if let Some(ref nat) = nat_state_opt {
+                peer_manager.set_nat_state(nat.clone()).await;
+            }
+
+            match thenodes::network::udp_listener::load_static_key() {
+                Ok((static_private, _static_public)) => {
+                    let udp_port = config
+                        .network
+                        .as_ref()
+                        .and_then(|n| n.udp.as_ref())
+                        .and_then(|u| u.listen_port)
+                        .unwrap_or(config.port + 1);
+                    let bind_addr: std::net::SocketAddr =
+                        format!("0.0.0.0:{}", udp_port).parse().unwrap();
+                    match thenodes::network::udp_listener::spawn_udp_listener(
+                        bind_addr,
+                        (*peer_manager).clone(),
+                        plugin_manager.clone(),
+                        node_id.clone(),
+                        static_private.clone(),
+                        nat_state_opt.clone(),
+                    )
+                    .await
+                    {
+                        Ok((socket, sessions)) => {
+                            println!(
+                                "{}UDP Noise listener bound on 0.0.0.0:{}",
+                                thenodes::constants::ICON_PLACEHOLDER,
+                                udp_port
+                            );
+                            thenodes::network::udp_listener::spawn_session_reaper(sessions);
+                            // Spawn observation refresh loop when NAT traversal is enabled.
+                            if let Some(nat) = nat_state_opt {
+                                thenodes::network::nat_traversal::spawn_observation_refresh_loop(
+                                    nat,
+                                    (*peer_manager).clone(),
+                                    socket,
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("❌ UDP listener failed to bind: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("❌ Failed to load Noise static keypair: {}", e);
+                }
+            }
+        }
+    }
 
     // Connect to bootstrap nodes, pass error buffer
     connect_to_bootstrap_nodes(

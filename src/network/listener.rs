@@ -4,7 +4,7 @@ use crate::constants::*;
 use crate::events::model::LogLevel;
 use crate::network::events::emit_network_event;
 use crate::network::message::{Message, MessageType};
-use crate::network::peer_manager::PeerManager;
+use crate::network::peer_manager::{PeerManager, TransportKind};
 use crate::network::peer_store::PeerStore;
 use crate::plugin_host::manager::PluginManager;
 use crate::realms::RealmInfo;
@@ -145,6 +145,16 @@ async fn handle_connection(
 
     // Embed our realm; its canonical_code() will be used for matching and by consumers.
 
+    let own_observed_udp = peer_manager
+        .own_udp_observed_addr_if_fresh(
+            config
+                .network
+                .as_ref()
+                .and_then(|n| n.nat_traversal.as_ref())
+                .and_then(|nat| nat.refresh_secs)
+                .unwrap_or(300),
+        )
+        .await;
     let hello = Message::new(
         "TheNodes",
         &peer_addr.to_string(),
@@ -155,6 +165,8 @@ async fn handle_connection(
             version: Some(PROTOCOL_VERSION.to_string()),
             node_type: config.node.as_ref().and_then(|n| n.node_type.clone()),
             capabilities: crate::network::advertised_capabilities(&config),
+            udp_listen_addr: crate::network::udp_hello_addr(&config, local_addr.ip()),
+            udp_observed_addr: own_observed_udp,
         },
         None,
         Some(our_realm.clone()),
@@ -258,6 +270,8 @@ async fn handle_connection(
                         ref version,
                         ref node_type,
                         ref capabilities,
+                        ref udp_listen_addr,
+                        ref udp_observed_addr,
                     } => {
                         if remote_node_id == &node_id {
                             log_network_event(
@@ -361,9 +375,24 @@ async fn handle_connection(
                             );
                             return;
                         }
+                        peer_manager
+                            .set_transport_kind(remote_node_id, TransportKind::Tcp)
+                            .await;
                         if let Some(listen) = listen_addr {
                             // Track advertised listen address for suppression logic
                             peer_manager.add_listen_addr(listen, remote_node_id).await;
+                        }
+                        // Record UDP listen address from peer's HELLO (ADR-0004)
+                        if let Some(udp_addr) = udp_listen_addr {
+                            peer_manager
+                                .add_udp_listen_addr(remote_node_id, udp_addr)
+                                .await;
+                        }
+                        // Record observed UDP address from peer's HELLO (ADR-0005 Phase 2)
+                        if let Some(obs_addr) = udp_observed_addr {
+                            peer_manager
+                                .add_udp_observed_addr(remote_node_id, obs_addr, None, None)
+                                .await;
                         }
                         // Drain store-and-forward queue (handled inside add_peer), nothing else needed here
                     }
@@ -415,6 +444,12 @@ async fn handle_connection(
         .and_then(|r| r.selection.clone())
         .map(|s| s == "rendezvous")
         .unwrap_or(false);
+    let punch_rendezvous = config
+        .network
+        .as_ref()
+        .and_then(|n| n.nat_traversal.as_ref())
+        .and_then(|nt| nt.serve)
+        .unwrap_or(false);
     crate::network::transport::receive_and_dispatch(
         &mut reader,
         peer_addr,
@@ -426,6 +461,8 @@ async fn handle_connection(
         relay_store_forward_enabled,
         relay_selection_enabled,
         emit_console_errors,
+        node_id,
+        punch_rendezvous,
     )
     .await;
 }

@@ -1,6 +1,41 @@
 use crate::realms::RealmInfo;
 use serde::Deserialize;
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct DeliveryConfig {
+    /// Default overall timeout for FireAndForget delivery attempts (ms).
+    pub fire_and_forget_timeout_ms: Option<u64>,
+    /// Default overall timeout for Reliable delivery attempts (ms).
+    pub reliable_timeout_ms: Option<u64>,
+    /// Default overall timeout for OrderedReliable delivery attempts (ms).
+    pub ordered_reliable_timeout_ms: Option<u64>,
+    /// Maximum number of retries for Reliable delivery attempts.
+    pub reliable_retry_budget: Option<u32>,
+    /// Maximum number of retries for OrderedReliable delivery attempts.
+    pub ordered_reliable_retry_budget: Option<u32>,
+    /// How long deduplication entries should be retained (seconds).
+    pub dedup_window_secs: Option<u64>,
+    /// Maximum number of pending ordered messages buffered per ordering scope.
+    pub ordered_max_buffered_messages: Option<usize>,
+    /// Delay between retry attempts for ACK-based delivery (ms).
+    pub retry_interval_ms: Option<u64>,
+}
+
+impl Default for DeliveryConfig {
+    fn default() -> Self {
+        Self {
+            fire_and_forget_timeout_ms: Some(1000),
+            reliable_timeout_ms: Some(5000),
+            ordered_reliable_timeout_ms: Some(10000),
+            reliable_retry_budget: Some(3),
+            ordered_reliable_retry_budget: Some(3),
+            dedup_window_secs: Some(3600),
+            ordered_max_buffered_messages: Some(1024),
+            retry_interval_ms: Some(500),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct EncryptionPaths {
     pub own_certificate: Option<String>,
@@ -196,6 +231,10 @@ impl Default for Config {
             network: Some(NetworkConfig {
                 persistence: Some(NetworkPersistenceConfig::default()),
                 relay: Some(RelayConfig::default()),
+                udp: None,
+                connection_policy: None,
+                nat_traversal: None,
+                delivery: Some(DeliveryConfig::default()),
             }),
         }
     }
@@ -336,12 +375,128 @@ impl Default for NetworkPersistenceConfig {
     }
 }
 
+/// Connection preference policy (ADR-0005 Phase 1).
+///
+/// Controls which transport paths are tried and in what order when connecting
+/// to a peer.  The default strategy is `"direct_then_relay"`.
+///
+/// ```toml
+/// [network.connection_policy]
+/// strategy = "direct_then_relay"
+/// direct_tcp_timeout_ms = 3000
+/// direct_udp_timeout_ms = 1000
+/// punch_timeout_ms = 5000
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConnectionPolicyConfig {
+    /// Strategy string.
+    ///
+    /// | Value | Description |
+    /// |---|---|
+    /// | `direct_only` | TCP only; no UDP, no relay. |
+    /// | `direct_then_relay` | TCP, fall back to relay. (**default**) |
+    /// | `direct_then_udp_then_relay` | TCP → direct UDP → relay. |
+    /// | `direct_then_punch_then_relay` | TCP → UDP → hole-punch → relay. (Phase 3) |
+    /// | `relay_only` | Skip direct paths; use relay immediately. |
+    pub strategy: Option<String>,
+    /// Timeout for a direct TCP connect attempt (ms).
+    pub direct_tcp_timeout_ms: Option<u64>,
+    /// Timeout for a direct UDP session attempt (ms).
+    pub direct_udp_timeout_ms: Option<u64>,
+    /// Total time budget for relay-coordinated UDP hole punching (ms).  Phase 3.
+    pub punch_timeout_ms: Option<u64>,
+}
+
+impl Default for ConnectionPolicyConfig {
+    fn default() -> Self {
+        Self {
+            strategy: Some("direct_then_relay".to_string()),
+            direct_tcp_timeout_ms: Some(3000),
+            direct_udp_timeout_ms: Some(1000),
+            punch_timeout_ms: Some(5000),
+        }
+    }
+}
+
+/// NAT traversal and hole-punching configuration (ADR-0005).
+///
+/// ```toml
+/// [network.nat_traversal]
+/// enabled = false
+/// serve = false
+/// refresh_secs = 300
+/// cookie_ttl_secs = 30
+/// probe_count = 6
+/// probe_interval_ms = 100
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct NatTraversalConfig {
+    /// Enable NAT traversal features (`"punch"` capability).
+    pub enabled: Option<bool>,
+    /// Allow this node to serve observation and punch-coordination to others.
+    /// Requires `[network.relay].enabled = true` and `[network.udp].enabled = true`.
+    pub serve: Option<bool>,
+    /// How often to refresh the locally observed UDP address (seconds).
+    pub refresh_secs: Option<u64>,
+    /// Stateless cookie lifetime for the observation challenge/response (seconds).
+    pub cookie_ttl_secs: Option<u64>,
+    /// Number of KEEPALIVE probe datagrams sent during each punch attempt.
+    pub probe_count: Option<u32>,
+    /// Delay between successive probe datagrams (ms).
+    pub probe_interval_ms: Option<u64>,
+}
+
+impl Default for NatTraversalConfig {
+    fn default() -> Self {
+        Self {
+            enabled: Some(false),
+            serve: Some(false),
+            refresh_secs: Some(300),
+            cookie_ttl_secs: Some(30),
+            probe_count: Some(6),
+            probe_interval_ms: Some(100),
+        }
+    }
+}
+
+/// UDP + Noise transport configuration (optional; opt-in, ADR-0004).
+#[derive(Debug, Clone, Deserialize)]
+pub struct UdpConfig {
+    /// Enable the UDP Noise transport listener.  Default: false.
+    pub enabled: Option<bool>,
+    /// UDP port to bind.  Default: TCP port + 1.
+    pub listen_port: Option<u16>,
+    /// Maximum total datagram size enforced on send.  Must not exceed 1200.
+    pub max_datagram_bytes: Option<usize>,
+    /// Maximum application payload bytes.  Must not exceed 1176.
+    pub max_app_payload_bytes: Option<usize>,
+}
+
+impl Default for UdpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: Some(false),
+            listen_port: None,
+            max_datagram_bytes: Some(1200),
+            max_app_payload_bytes: Some(1176),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct NetworkConfig {
     /// Persistent known peer store configuration (optional)
     pub persistence: Option<NetworkPersistenceConfig>,
     /// Relay configuration (optional; opt-in)
     pub relay: Option<RelayConfig>,
+    /// UDP + Noise transport configuration (optional; opt-in, ADR-0004)
+    pub udp: Option<UdpConfig>,
+    /// Connection preference policy (ADR-0005 Phase 1)
+    pub connection_policy: Option<ConnectionPolicyConfig>,
+    /// NAT traversal and hole-punching configuration (ADR-0005)
+    pub nat_traversal: Option<NatTraversalConfig>,
+    /// Delivery semantics configuration (ADR-0006)
+    pub delivery: Option<DeliveryConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

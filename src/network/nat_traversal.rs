@@ -296,9 +296,7 @@ pub async fn send_observe_req(
     socket: &Arc<UdpSocket>,
     target_addr: SocketAddr,
 ) {
-    use rand::RngCore;
-    let mut nonce = [0u8; OBSERVE_NONCE_LEN];
-    rand::thread_rng().fill_bytes(&mut nonce);
+    let nonce: [u8; OBSERVE_NONCE_LEN] = rand::random();
     peer_manager
         .register_pending_observation(observer_node_id, target_addr, nonce)
         .await;

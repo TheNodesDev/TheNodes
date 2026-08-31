@@ -1,8 +1,16 @@
 use std::collections::HashMap;
-use std::sync::Arc; // Mutex unused
+use std::sync::Arc;
+use std::time::Duration;
 
 use super::{Plugin, PluginContext, PluginRegistrar};
-use crate::network::message::Message;
+use crate::events::model::{LogEvent, LogLevel, SystemEvent};
+use crate::network::message::{Message, MessageType};
+
+/// Upper bound on how long a single plugin's `on_message` may run before dispatch
+/// gives up on it and moves on. Without this, one slow or hung plugin could stall
+/// message processing indefinitely for every other plugin and, on the UDP receive
+/// path, for every other peer on the node.
+const PLUGIN_DISPATCH_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct PluginManager {
     plugins: Vec<Arc<dyn Plugin>>,
@@ -33,10 +41,37 @@ impl PluginManager {
         }
     }
 
-    pub fn dispatch_message(&self, message: &Message) {
+    pub async fn dispatch_message(&self, message: &Message) {
         if let Some(ctx) = &self.context {
             for plugin in &self.plugins {
-                plugin.on_message(message, ctx);
+                let accepts_message = match &message.msg_type {
+                    MessageType::Extension { kind } => match plugin.subscribed_extension_kinds() {
+                        Some(kinds) => kinds.contains(&kind.as_str()),
+                        None => true,
+                    },
+                    _ => true,
+                };
+
+                if accepts_message {
+                    let dispatch = tokio::time::timeout(
+                        PLUGIN_DISPATCH_TIMEOUT,
+                        plugin.on_message(message, ctx),
+                    );
+                    if dispatch.await.is_err() {
+                        let mut meta =
+                            crate::events::dispatcher::meta("plugin_host", LogLevel::Warn);
+                        meta.corr_id = Some(crate::events::dispatcher::correlation_id());
+                        ctx.events.emit(LogEvent::System(SystemEvent {
+                            meta,
+                            action: "plugin_dispatch_timeout".to_string(),
+                            detail: Some(format!(
+                                "plugin={:?} timeout_ms={}",
+                                plugin.prompt_prefix(),
+                                PLUGIN_DISPATCH_TIMEOUT.as_millis()
+                            )),
+                        }));
+                    }
+                }
             }
         }
     }

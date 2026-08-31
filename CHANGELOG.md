@@ -7,11 +7,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 ## [Unreleased]
 
 ### Breaking
+- **Plugin API/ABI**: `Plugin::on_message` and `PluginManager::dispatch_message` are now async, and `PLUGIN_ABI_VERSION` is now 2. Plugins must update `on_message` to `async fn` and rebuild before loading.
 - **API**: `PluginContext` is now constructed via `PluginContext::new(...)` and carries local node identity, runtime config, console-permission state, and an async plugin-manager handle for framework-owned delivery.
 - **Wire protocol**: `HELLO` now includes optional `udp_listen_addr` and `udp_observed_addr` fields for UDP transport and NAT-traversal metadata exchange.
 - **Config/API**: `NetworkConfig` now includes optional `udp`, `connection_policy`, `nat_traversal`, and `delivery` sections. Manual struct initialization must populate these fields.
 
 ### Added
+- Plugins can declare exact `MessageType::Extension` kind subscriptions through `Plugin::subscribed_extension_kinds`; the default continues to receive all extension kinds.
 - **ADR-0004 UDP + Noise transport**
   - New UDP transport modules: `src/network/udp_session.rs` and `src/network/udp_listener.rs`.
   - TNCF control-frame handling, Noise XX UDP session management, persistent Noise static key loading, session reaping, and UDP session/path tracking in `PeerManager`.
@@ -30,6 +32,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   - New `[network.delivery]` config section with keys: `fire_and_forget_timeout_ms`, `reliable_timeout_ms`, `ordered_reliable_timeout_ms`, `reliable_retry_budget`, `ordered_reliable_retry_budget`, `dedup_window_secs`, `ordered_max_buffered_messages`, `retry_interval_ms`.
 
 ### Changed
+- Inbound plugin dispatch now awaits each handler before continuing and skips extension messages that do not match a plugin's declared kinds.
 - Runtime startup now injects delivery config into `PeerManager`, refreshes `PluginContext` with final runtime state, and starts the UDP Noise listener and NAT traversal helpers when enabled.
 - Inbound and outbound transport handling now records TCP/UDP transport metadata, captures peer UDP listen and observed addresses from `HELLO`, and routes TCP, UDP, and relay-carried reliable/ordered messages through the delivery layer before plugin dispatch.
 - Observed-address state now tracks observer/request metadata for pending observation flows and uses explicit correlation for relay-coordinated punch state.
@@ -38,13 +41,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - Default config wiring now includes defaults for delivery semantics and explicit support for the new UDP, connection policy, and NAT traversal config sections.
 - Delivery routing now delegates normal path selection to connection policy and can initiate relay-coordinated UDP hole punching when policy selects that path.
 
+### Fixed
+- **Security**: `udp_listener::handle_session_frame` no longer holds the UDP sessions lock across `process_incoming_message`/plugin dispatch. Previously, a plugin replying over UDP from `on_message` (or a framework-level delivery ACK) could re-enter the same non-reentrant sessions mutex via `send_udp`, deadlocking UDP receive processing for every peer on the node.
+- `PluginManager::dispatch_message` now bounds each plugin's `on_message` call with a timeout so a single slow or hung plugin cannot indefinitely stall dispatch to other plugins or the connection's read loop; a `plugin_dispatch_timeout` system event is emitted when the bound is hit.
+
 ### Docs
+- Documented async plugin message handling, extension-kind subscriptions, and the decision to keep plugin storage owned by plugins rather than adding a generic core storage API.
 - Added decision records:
   - `docs/adr/0004-udp-noise-transport.md`
   - `docs/adr/0005-nat-traversal-and-connection-policy.md`
   - `docs/adr/0006-delivery-semantics-and-reliability-model.md`
 
 ### Tests
+- Added plugin dispatch coverage proving async handlers are awaited and non-subscribed extension kinds are filtered.
+- Added a regression test proving `handle_session_frame` does not deadlock when a plugin replies over UDP from `on_message`.
 - Added unit and integration coverage for UDP transport, NAT traversal, connection policy, and delivery semantics via:
   - `tests/udp_transport.rs`
   - `tests/nat_traversal.rs`

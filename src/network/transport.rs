@@ -560,7 +560,7 @@ pub async fn receive_and_dispatch<R: AsyncBufReadExt + Unpin>(
                     };
 
                     for msg in dispatch_messages {
-                        plugin_manager.dispatch_message(&msg);
+                        plugin_manager.dispatch_message(&msg).await;
                         match msg.msg_type {
                             MessageType::Hello { .. } => {
                                 emit_network_event(

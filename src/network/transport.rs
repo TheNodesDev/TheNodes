@@ -543,9 +543,13 @@ pub async fn receive_and_dispatch<R: AsyncBufReadExt + Unpin>(
                     let effective_msg =
                         crate::network::delivery::unwrap_tunneled_message(&msg, &local_node_id)
                             .unwrap_or(msg);
+                    // The node_id actually bound to this TCP connection (from HELLO), used to
+                    // reject messages whose `from` field doesn't match the real sender.
+                    let verified_sender = peer_manager.node_id_for_addr(&addr).await;
                     let disposition = crate::network::delivery::process_incoming_message(
                         &peer_manager,
                         &local_node_id,
+                        verified_sender.as_deref(),
                         effective_msg,
                     )
                     .await;

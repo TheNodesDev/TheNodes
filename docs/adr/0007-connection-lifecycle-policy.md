@@ -32,6 +32,16 @@ Any inbound peer activity refreshes the liveness deadline. If no activity is
 seen within `heartbeat_timeout_ms`, active routes are marked unresponsive and
 the connection is removed from active routing.
 
+Liveness credit and heartbeat replies require a verified sender: the framework
+only refreshes a peer's deadline (and only answers a `liveness_probe_v1`) when
+the message's claimed `from` matches the node_id actually bound to the
+connection or session it arrived on. `Message.from` is peer-supplied
+application payload, so trusting it unconditionally would let any connected
+peer forge another peer's identity, refresh that peer's deadline, and mask a
+real disconnect. Relayed/tunneled messages are never treated as verified for
+this purpose, since their `from` describes the original sender, not the
+adjacent hop that delivered them.
+
 ### Reconnection
 
 Disconnected or unresponsive peers with a known TCP listening address are
@@ -47,12 +57,21 @@ state belong to `PeerManager`.
 The runtime tracks `Unknown`, `Healthy`, `Suspect`, or `Unresponsive` for each
 peer and transport route. Inbound activity and successful delivery refresh a
 route to healthy. Delivery or reconnect failures make it suspect, while a
-liveness timeout makes it unresponsive.
+liveness timeout makes it unresponsive. `Unresponsive` is sticky: only a
+subsequent successful delivery or handshake (not an ordinary failure) may
+clear it, so a route the liveness monitor already excluded cannot be
+resurrected to `Suspect` by an unrelated in-flight failure.
 
 `connect_with_policy` preserves the candidate order defined by the configured
 strategy when candidates have equal health. A healthy or unknown candidate is
 preferred over a suspect candidate, and unresponsive candidates are excluded.
 This allows route re-evaluation without replacing the strategy state machine.
+
+Route-health records are keyed by peer-supplied node_id, so entries are pruned
+once they are older than the retention window rather than removed immediately
+on disconnect; this keeps recent state (e.g. the reason a peer was excluded)
+queryable for a while after teardown while bounding memory growth from
+peers that churn through many distinct identities.
 
 ## Configuration
 

@@ -413,6 +413,7 @@ impl PeerManager {
                 } else {
                     self.lifecycle_generations.lock().await.remove(dup_node_id);
                     self.transport_kind.lock().await.remove(dup_node_id);
+                    self.last_peer_activity.lock().await.remove(dup_node_id);
                 }
                 self.pending_punches.lock().await.retain(|_, pending| {
                     pending.initiator_node_id != *dup_node_id
@@ -464,6 +465,7 @@ impl PeerManager {
             .or_insert_with(RouteHealthRecord::default);
         record.health = RouteHealth::Healthy;
         record.last_success = Some(Instant::now());
+        Self::prune_stale_route_health(&mut health);
     }
 
     pub async fn mark_route_failure(&self, node_id: &str, kind: RouteKind) {
@@ -471,8 +473,32 @@ impl PeerManager {
         let record = health
             .entry((node_id.to_string(), kind))
             .or_insert_with(RouteHealthRecord::default);
-        record.health = RouteHealth::Suspect;
+        // An ordinary delivery/heartbeat failure must not resurrect a route that the
+        // liveness monitor already excluded; only `mark_route_success` may clear
+        // `Unresponsive` (ADR-0007: "unresponsive candidates are excluded").
+        if record.health != RouteHealth::Unresponsive {
+            record.health = RouteHealth::Suspect;
+        }
         record.last_failure = Some(Instant::now());
+        Self::prune_stale_route_health(&mut health);
+    }
+
+    /// Bound `route_health` growth by evicting entries with no activity in over an hour.
+    ///
+    /// `node_id` is peer-supplied, so without this the map would grow without bound as
+    /// short-lived or malicious peers churn through distinct ids (a resource-exhaustion
+    /// risk). Kept separate from peer teardown so a route's last-known health (in
+    /// particular `Unresponsive`) remains queryable for a while after a peer disconnects.
+    fn prune_stale_route_health(health: &mut HashMap<(String, RouteKind), RouteHealthRecord>) {
+        const RETENTION: std::time::Duration = std::time::Duration::from_secs(3600);
+        health.retain(|_, record| {
+            record
+                .last_success
+                .is_some_and(|t| t.elapsed() <= RETENTION)
+                || record
+                    .last_failure
+                    .is_some_and(|t| t.elapsed() <= RETENTION)
+        });
     }
 
     pub async fn mark_route_unresponsive(&self, node_id: &str, kind: RouteKind) {
@@ -604,6 +630,7 @@ impl PeerManager {
             self.remove_peer(&addr).await;
         } else {
             self.lifecycle_generations.lock().await.remove(node_id);
+            self.last_peer_activity.lock().await.remove(node_id);
         }
 
         emit_network_event(

@@ -18,6 +18,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   - New UDP transport modules: `src/network/udp_session.rs` and `src/network/udp_listener.rs`.
   - TNCF control-frame handling, Noise XX UDP session management, persistent Noise static key loading, session reaping, and UDP session/path tracking in `PeerManager`.
   - Optional UDP capability advertisement plus `udp_hello_addr()` support for HELLO metadata.
+  - `handle_session_frame` processes each frame without holding the UDP sessions lock across `process_incoming_message`/plugin dispatch, so a plugin replying over UDP from `on_message` (or a framework-level delivery ACK) cannot re-enter the non-reentrant sessions mutex via `send_udp` and deadlock UDP receive processing.
 - **ADR-0005 connection policy and NAT traversal**
   - New `src/network/connection.rs` with `connect_with_policy`, `ConnectionPolicy`, `ConnectionStrategy`, and `ConnectionOutcome`.
   - New `src/network/nat_traversal.rs` with observed-address refresh, cookie-based observation flow, pending-observation matching, relay-coordinated punch helpers, and NAT traversal runtime state.
@@ -30,6 +31,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   - `PeerManager` now tracks delivery attempts, deduplication windows, ordered inbound buffers, relay sequencing, and stale ordered-scope eviction state.
   - Plugin host now exposes framework-owned async delivery APIs via `PluginContext::deliver_message(...)` and `PluginContext::send_message(...)`.
   - New `[network.delivery]` config section with keys: `fire_and_forget_timeout_ms`, `reliable_timeout_ms`, `ordered_reliable_timeout_ms`, `reliable_retry_budget`, `ordered_reliable_retry_budget`, `dedup_window_secs`, `ordered_max_buffered_messages`, `retry_interval_ms`.
+- **ADR-0007 framework-owned connection lifecycle policy**
+  - `PeerManager` now runs one asynchronous liveness monitor per active peer, sending tagged `HEARTBEAT` probes (`liveness_probe_v1`/`liveness_response_v1`) and tracking per-route `RouteHealth` (`Unknown`, `Healthy`, `Suspect`, `Unresponsive`).
+  - Liveness credit and heartbeat replies require a verified sender: `process_incoming_message` only trusts `Message.from` when it matches the node_id actually bound to the connection/session the message arrived on, so a connected peer cannot forge another peer's identity to keep its liveness deadline refreshed.
+  - `RouteHealth::Unresponsive` is sticky; only a subsequent successful delivery or handshake clears it, so an unrelated in-flight failure cannot resurrect an excluded route to `Suspect`.
+  - Route-health and last-activity bookkeeping is bounded via age-based pruning, since `node_id` is peer-supplied and would otherwise grow unbounded as peers churn through distinct identities.
+  - Disconnected or unresponsive peers with a known TCP listen address are retried automatically with exponential backoff, symmetric jitter, and a configurable attempt budget tracked in `PeerStore`.
+  - `connect_with_policy` now re-evaluates candidate routes by health, preferring healthy/unknown routes over suspect ones and excluding unresponsive routes, while preserving the configured strategy's candidate order for ties.
+  - New `[network.connection_policy]` keys: `heartbeat_interval_ms`, `heartbeat_timeout_ms`, `reconnect_base_delay_ms`, `reconnect_multiplier`, `reconnect_max_delay_ms`, `reconnect_max_attempts`, `reconnect_jitter_ratio`.
 
 ### Changed
 - Inbound plugin dispatch now awaits each handler before continuing and skips extension messages that do not match a plugin's declared kinds.
@@ -42,7 +51,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - Delivery routing now delegates normal path selection to connection policy and can initiate relay-coordinated UDP hole punching when policy selects that path.
 
 ### Fixed
-- **Security**: `udp_listener::handle_session_frame` no longer holds the UDP sessions lock across `process_incoming_message`/plugin dispatch. Previously, a plugin replying over UDP from `on_message` (or a framework-level delivery ACK) could re-enter the same non-reentrant sessions mutex via `send_udp`, deadlocking UDP receive processing for every peer on the node.
 - `PluginManager::dispatch_message` now bounds each plugin's `on_message` call with a timeout so a single slow or hung plugin cannot indefinitely stall dispatch to other plugins or the connection's read loop; a `plugin_dispatch_timeout` system event is emitted when the bound is hit.
 
 ### Docs
@@ -51,6 +59,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   - `docs/adr/0004-udp-noise-transport.md`
   - `docs/adr/0005-nat-traversal-and-connection-policy.md`
   - `docs/adr/0006-delivery-semantics-and-reliability-model.md`
+  - `docs/adr/0007-connection-lifecycle-policy.md`
 
 ### Tests
 - Added plugin dispatch coverage proving async handlers are awaited and non-subscribed extension kinds are filtered.
@@ -61,6 +70,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   - `tests/connection_policy.rs`
   - `tests/delivery_semantics.rs`
 - Added delivery-layer regression coverage for relay ACK flow, plugin-context reliable delivery, ordered buffer limits, and UDP preferred-path bidirectionality.
+- Added inline unit tests in `delivery.rs` for delivery-option validation, duplicate suppression, ordered gap-fill release, and UUID v7 message ID generation.
+- Added inline unit tests in `message.rs` validating delivery-metadata round-tripping and rejecting malformed ordering/sequence combinations.
+- Added inline unit tests for UDP capability advertisement and `udp_hello_addr()` gating by feature flag and config.
+- Added `tests/connection_lifecycle.rs` covering heartbeat liveness monitoring, automatic reconnect with backoff, route-health tracking, spoofed-sender heartbeat rejection, and sticky `Unresponsive` route health.
 - Updated peer store tests to account for the expanded `NetworkConfig` shape.
 
 

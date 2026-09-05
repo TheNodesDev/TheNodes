@@ -496,6 +496,7 @@ async fn handle_session_frame(
                     let disposition = crate::network::delivery::process_incoming_message(
                         peer_manager,
                         local_node_id,
+                        Some(node_id.as_str()),
                         message,
                     )
                     .await;

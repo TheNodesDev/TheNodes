@@ -2,7 +2,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use thenodes::config::{Config, ConnectionPolicyConfig};
-use thenodes::network::{PeerManager, PeerStore, RouteHealth, RouteKind};
+use thenodes::network::delivery::{process_incoming_message, IncomingMessageDisposition};
+use thenodes::network::message::{MessageType, Payload};
+use thenodes::network::{Message, PeerManager, PeerStore, RouteHealth, RouteKind};
 use thenodes::plugin_host::manager::PluginManager;
 
 #[tokio::test]
@@ -79,5 +81,83 @@ async fn indirect_activity_does_not_credit_a_direct_route() {
             .route_health("indirect-peer", RouteKind::Tcp)
             .await,
         RouteHealth::Unknown
+    );
+}
+
+/// A connected peer must not be able to refresh another peer's liveness deadline (or
+/// receive a heartbeat reply meant for someone else) by forging `Message::from`.
+#[tokio::test]
+async fn spoofed_heartbeat_sender_is_ignored() {
+    let peer_manager = PeerManager::new();
+
+    let addr_a: std::net::SocketAddr = "127.0.0.1:43001".parse().unwrap();
+    let (sender_a, _receiver_a) = tokio::sync::mpsc::channel(8);
+    peer_manager
+        .add_peer(addr_a, sender_a, "peer-a".to_string())
+        .await
+        .unwrap();
+
+    let addr_b: std::net::SocketAddr = "127.0.0.1:43002".parse().unwrap();
+    let (sender_b, mut receiver_b) = tokio::sync::mpsc::channel(8);
+    peer_manager
+        .add_peer(addr_b, sender_b, "peer-b".to_string())
+        .await
+        .unwrap();
+
+    // Delivered on peer-a's connection but claims to be from peer-b.
+    let spoofed = Message::new(
+        "peer-b",
+        "local-node",
+        MessageType::Heartbeat,
+        Some(Payload::Text("liveness_probe_v1".to_string())),
+        None,
+    );
+    let disposition =
+        process_incoming_message(&peer_manager, "local-node", Some("peer-a"), spoofed).await;
+    assert!(matches!(disposition, IncomingMessageDisposition::Consumed));
+
+    // peer-b never sent anything, so it must not receive a heartbeat reply.
+    assert!(receiver_b.try_recv().is_err());
+
+    // A genuine heartbeat from peer-b (verified sender matches `from`) does get a reply.
+    let genuine = Message::new(
+        "peer-b",
+        "local-node",
+        MessageType::Heartbeat,
+        Some(Payload::Text("liveness_probe_v1".to_string())),
+        None,
+    );
+    let disposition =
+        process_incoming_message(&peer_manager, "local-node", Some("peer-b"), genuine).await;
+    assert!(matches!(disposition, IncomingMessageDisposition::Consumed));
+    assert!(receiver_b.try_recv().is_ok());
+}
+
+/// Once the liveness monitor excludes a route as `Unresponsive`, an ordinary later
+/// delivery failure must not downgrade it back to `Suspect` (which would make
+/// `connect_with_policy` treat it as usable again).
+#[tokio::test]
+async fn unresponsive_route_is_not_downgraded_by_later_failure() {
+    let peer_manager = PeerManager::new();
+
+    peer_manager
+        .mark_route_unresponsive("gone-peer", RouteKind::Tcp)
+        .await;
+    peer_manager
+        .mark_route_failure("gone-peer", RouteKind::Tcp)
+        .await;
+
+    assert_eq!(
+        peer_manager.route_health("gone-peer", RouteKind::Tcp).await,
+        RouteHealth::Unresponsive
+    );
+
+    peer_manager
+        .mark_route_success("gone-peer", RouteKind::Tcp)
+        .await;
+
+    assert_eq!(
+        peer_manager.route_health("gone-peer", RouteKind::Tcp).await,
+        RouteHealth::Healthy
     );
 }

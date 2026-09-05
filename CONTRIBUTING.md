@@ -15,6 +15,7 @@ Thanks for your interest in contributing! This guide explains how to propose cha
   - [Branching \& Workflow](#branching--workflow)
   - [Commit Message Conventions](#commit-message-conventions)
   - [Pull Request Checklist](#pull-request-checklist)
+  - [Release Documentation](#release-documentation)
   - [Testing Guidelines](#testing-guidelines)
   - [Plugin Development](#plugin-development)
     - [Put Your Application Logic in Plugins](#put-your-application-logic-in-plugins)
@@ -75,7 +76,7 @@ See `SECURITY.md` for responsible disclosure guidance.
    cargo test
    ```
 3. (Optional) Run two local nodes with different configs for manual peer interaction.
-4. Toolchain: This repo pins Rust via `rust-toolchain.toml`. MSRV is 1.74; avoid nightly-only features.
+4. Toolchain: `rust-toolchain.toml` selects the stable channel for development. MSRV is Rust 1.83, declared by `rust-version` in `Cargo.toml` and tested in CI with default and all features; avoid APIs or language features requiring newer Rust.
 
 ### Async-first APIs
 Design new APIs as async by default. Prefer `async fn` and async traits (use `async-trait` when needed), and avoid blocking calls in async contexts.
@@ -113,7 +114,15 @@ Breaking changes (post-1.0) would include `!` (e.g., `feat!: change handshake fi
    ```
 - [ ] Added/updated docs where behavior is user-visible (README, SECURITY, STABILITY, or inline `//!`).
 - [ ] Updated `CHANGELOG.md` (under `[Unreleased]` with correct category) if user-facing. Suggested categories: Added, Changed, Fixed, Removed, Security, Docs, Build.
+- [ ] For a release PR, added/updated `docs/releases/vMAJOR.MINOR.PATCH.md` according to `docs/releases/README.md`.
 - [ ] Ensures license headers not needed (we rely on root licenses).
+
+## Release Documentation
+
+`CHANGELOG.md` is the canonical detailed history and is updated continuously.
+For each release, add a concise, user-facing note under `docs/releases/` that
+focuses on adoption, migration, compatibility, and known limitations. Follow
+the naming, structure, and release process in `docs/releases/README.md`.
 
 ## Testing Guidelines
 - Fast unit tests should live near code or in `tests/`.

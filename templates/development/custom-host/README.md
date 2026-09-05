@@ -76,7 +76,7 @@ Network ←→ TheNodes ←→ Plugin Manager ←→ Custom Host ←→ Custom P
 
 ## Interactive Commands
 
-When running with `--prompt`, you can use these commands (with tab completion):
+When running with `--prompt`, enter `app` to open the application command prompt, then use these commands:
 
 ### Information Commands
 - `help` or `?`: Show available commands
@@ -161,12 +161,12 @@ For `.so`/`.dll` plugins, follow the TheNodes plugin interface and place them in
 
 1. Define message types in your plugin or host:
    ```rust
-   MessageType::Custom("my_message_type".to_string())
+    MessageType::Extension { kind: "my_message_type".to_string() }
    ```
 
 2. Handle them in `handle_network_message()`:
    ```rust
-   MessageType::Custom(ref msg_type) if msg_type == "my_message_type" => {
+    MessageType::Extension { kind } if kind == "my_message_type" => {
        // Your custom handling
    }
    ```

@@ -100,7 +100,9 @@ When TLS is enabled, each incoming peer certificate is evaluated according to th
 | `tofu` (Trust On First Use) | Accept the first time a fingerprint is seen, record it, and require the same fingerprint on subsequent connections. | Gradual rollout where you harvest fingerprints during an onboarding phase. | Stores the first-seen cert so future rotations can be reviewed. |
 | `hybrid` (placeholder) | Currently behaves like `open` but emits metadata allowing future staged enforcement. | Migration experiments before full hybrid enforcement ships. | Stores newly seen certs, same as `open`. |
 
-> Note: a future `ca` mode is reserved for full chain-of-trust enforcement and is not yet active.
+> v0.3.0 limitation: chain analysis is heuristic, not cryptographic CA path validation. Certificate validity-window extraction is still a placeholder, so `reject_expired` and `reject_before_valid` do not currently enforce certificate dates. Do not rely on these flags as production certificate validation. CRL/OCSP enforcement remains future work.
+>
+> Selecting `backend = "noise"` without the compiled `noise` feature fails secure-channel creation and rejects the connection; it never falls back to plaintext.
 
 If you enable `store_new_certs = "observed"`, ensure the `observed_dir` path is configured in
 `[encryption.trust_policy.paths]`. Keep in mind that the setting has no effect in `allowlist`
@@ -180,7 +182,7 @@ versioned function tables instead of raw Rust trait objects.
 ```toml
 # Cargo.toml - Pin compatible TheNodes version
 [dependencies]
-thenodes = "=0.1.0"  # Exact version for ABI compatibility
+thenodes = "=0.3.0"  # Exact version for ABI compatibility
 ```
 
 #### For Node Operators

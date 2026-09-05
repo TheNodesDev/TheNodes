@@ -96,7 +96,7 @@
 
 ## Versioning & Backward Compatibility
 
-- Initial development (pre-0.1.0) policy: Do not keep backward-compatibility shims. Prefer clean APIs and remove transitional wrappers.
+- Pre-1.0 policy: Do not keep backward-compatibility shims. Prefer clean APIs and remove transitional wrappers.
 - When an API needs to change, update templates and examples accordingly instead of preserving old entry points.
 - Add concise migration notes in PRs/CHANGELOG when behavior changes.
 

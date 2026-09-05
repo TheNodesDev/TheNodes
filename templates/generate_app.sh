@@ -28,8 +28,8 @@ usage() {
     echo "Arguments:"
     echo "  app-name      Name of your application (e.g., 'my-chat-app')"
     echo "  template-type Available templates:"
-    echo "                Production: cal-app, nep-plugin, minimal-app" 
-    echo "                Development: custom-host, hybrid-app"
+    echo "                Production: cal-app, hybrid-app, nep-plugin"
+    echo "                Development: custom-host"
     echo ""
     echo "Options:"
     echo "  -o, --output DIR        Output directory (default: ../workspaces/)"
@@ -46,11 +46,10 @@ usage() {
     echo "Production templates (end-user applications):"
     echo "  cal-app        - Simple P2P app using TheNodes as library (CAL)"
     echo "  nep-plugin     - Plugin for existing TheNodes host (NEP)"
-    echo "  minimal-app    - Bare minimum integration"
+    echo "  hybrid-app     - CAL daemon that loads NEP plugins"
     echo ""
     echo "Development templates (TheNodes core development):"
     echo "  custom-host    - Custom plugin host with interactive interface"
-    echo "  hybrid-app     - Combined approach (CAL + NEP)"
 }
 
 # Print colored message
@@ -102,17 +101,14 @@ generate_description() {
     local app_name=$1
     local template=$2
     case "$template" in
-        "basic-app")
+        "cal-app")
             echo "A P2P application built with TheNodes framework"
             ;;
-        "plugin-host-app")
+        "custom-host")
             echo "An extensible plugin host application built with TheNodes framework"
             ;;
         "hybrid-app")
             echo "A hybrid application combining library and plugin approaches with TheNodes framework"
-            ;;
-        "minimal-app")
-            echo "A minimal P2P application demonstrating TheNodes integration"
             ;;
         *)
             echo "A custom application built with TheNodes framework"
@@ -176,11 +172,11 @@ PY
     fi
 
     # Update thenodes path dep if present
-    if grep -qE '^thenodes\s*=\s*\{\s*path\s*=\s*"' "$cargo_file"; then
+    if grep -qE '^thenodes[[:space:]]*=.*path[[:space:]]*=' "$cargo_file"; then
         if [[ "$OSTYPE" == "darwin"* ]]; then
-            sed -i '' -E "s|^thenodes\s*=\s*\{\s*path\s*=\s*\"[^\"]*\"\s*\}|thenodes = { path = \"$rel\" }|" "$cargo_file"
+            sed -i '' -E "/^thenodes[[:space:]]*=/ s|path[[:space:]]*=[[:space:]]*\"[^\"]*\"|path = \"$rel\"|" "$cargo_file"
         else
-            sed -i -E "s|^thenodes\s*=\s*\{\s*path\s*=\s*\"[^\"]*\"\s*\}|thenodes = { path = \"$rel\" }|" "$cargo_file"
+            sed -i -E "/^thenodes[[:space:]]*=/ s|path[[:space:]]*=[[:space:]]*\"[^\"]*\"|path = \"$rel\"|" "$cargo_file"
         fi
     fi
 }
@@ -300,6 +296,13 @@ generate_project() {
 
     # Normalize thenodes path dependency relative to output location
     adjust_thenodes_path_dep "$output_path"
+
+    # Seed the release-tested dependency graph so generated projects retain the 1.83 MSRV.
+    local repo_root
+    repo_root=$(cd "$TEMPLATE_DIR/.." && pwd)
+    if [ -f "$repo_root/Cargo.lock" ]; then
+        cp "$repo_root/Cargo.lock" "$output_path/Cargo.lock"
+    fi
     
     # Make executable files executable
     if [ -f "$output_path/run.sh" ]; then
@@ -313,16 +316,22 @@ generate_project() {
     log $BLUE "🎯 Next steps:"
     echo "  1. cd \"$output_path\""
     echo "  2. # Review and customize config.toml"
-    echo "  3. cargo build"
     
     case "$template" in
-        "basic-app")
+        "cal-app")
+            echo "  3. cargo build"
             echo "  4. cargo run -- --config config.toml"
             ;;
-        "plugin-host-app")
+        "custom-host")
+            echo "  3. cargo build"
             echo "  4. cargo run -- --config config.toml --prompt"
             ;;
+        "nep-plugin")
+            echo "  3. cargo build --release"
+            echo "  4. # Deploy the shared library as described in README.md"
+            ;;
         *)
+            echo "  3. cargo build"
             echo "  4. cargo run -- --config config.toml"
             ;;
     esac

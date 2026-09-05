@@ -26,7 +26,8 @@
 //! See `CHANGELOG.md` for unreleased changes while pre-1.0.
 //!
 //! ## Status
-//! Pre-initial public release. APIs may change without notice until version 0.1.0 is tagged.
+//! Version 0.3.0 is pre-1.0. Minor releases may introduce breaking changes;
+//! see `CHANGELOG.md` and `STABILITY.md` for compatibility guidance.
 //!
 //! ## Roadmap (High-Level)
 //! * Policy-based role / node_type communication matrix (incl. data diode semantics)

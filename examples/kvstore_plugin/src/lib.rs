@@ -33,7 +33,10 @@ impl Plugin for KvStorePlugin {
                         let key = json["key"].as_str().unwrap_or_default();
                         let value = json["value"].as_str().unwrap_or_default();
                         println!("📝 Storing: {} = {}", key, value);
-                        self.store.lock().unwrap().insert(key.to_string(), value.to_string());
+                        self.store
+                            .lock()
+                            .unwrap()
+                            .insert(key.to_string(), value.to_string());
                     }
                 }
                 "kvstore.get" => {
@@ -47,15 +50,13 @@ impl Plugin for KvStorePlugin {
                     println!("⚠️ Unknown extension kind: {}", kind);
                 }
             },
-            MessageType::Text(text) => {
+            MessageType::Text(text) if text.starts_with("!kvstore ") => {
                 // Optional: parse simple prompt-style messages sent as Text
-                if text.starts_with("!kvstore ") {
-                    let parts: Vec<&str> = text.trim().splitn(3, ' ').collect();
-                    if parts.len() == 3 && parts[1] == "get" {
-                        let key = parts[2];
-                        let result = self.store.lock().unwrap().get(key).cloned();
-                        println!("🔍 (Text) Lookup for '{}': {:?}", key, result);
-                    }
+                let parts: Vec<&str> = text.trim().splitn(3, ' ').collect();
+                if parts.len() == 3 && parts[1] == "get" {
+                    let key = parts[2];
+                    let result = self.store.lock().unwrap().get(key).cloned();
+                    println!("🔍 (Text) Lookup for '{}': {:?}", key, result);
                 }
             }
             _ => {}
@@ -78,7 +79,10 @@ impl Plugin for KvStorePlugin {
         let parts: Vec<&str> = input.trim().splitn(3, ' ').collect();
         match parts.as_slice() {
             ["put", key, value] => {
-                self.store.lock().unwrap().insert(key.to_string(), value.to_string());
+                self.store
+                    .lock()
+                    .unwrap()
+                    .insert(key.to_string(), value.to_string());
                 // Broadcast to all peers
                 let msg = Message::new(
                     "plugin:kvstore",
@@ -111,6 +115,10 @@ impl Plugin for KvStorePlugin {
     }
 }
 
+/// # Safety
+///
+/// `api` must be a valid pointer to the host's v0.3 plugin registrar API and
+/// remain valid for the duration of this call.
 #[no_mangle]
 pub unsafe extern "C" fn register_plugin(api: *const PluginRegistrarApi) {
     let api = match PluginRegistrarApi::from_raw(api) {

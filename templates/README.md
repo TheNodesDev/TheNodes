@@ -13,20 +13,19 @@ Use the `generate_app.sh` script to create new applications:
 ## Template Categories
 
 ### Production Templates (`production/`)
-Ready-to-use templates for end-user applications. These use TheNodes as a published crate dependency.
+Ready-to-use templates for end-user applications. Generated manifests target TheNodes 0.3.0 and use a path dependency to the current checkout; remove the `path` key to use the published crate alone.
 
 - **cal-app** - Simple P2P application using TheNodes as library (CAL mode)
 - **nep-plugin** - Plugin for existing TheNodes host (NEP mode, builds a dynamic library: .so/.dylib/.dll)
-- **minimal-app** - Bare minimum integration example
 - **hybrid-app** - CAL daemon binary that loads NEP plugins (best of both)
 
 Security defaults:
-- Production templates enable TLS by default and include PKI paths; place your certs/keys under the generated `pki/` directories before running.
+- Production application templates enable TLS by default and include PKI paths; place your certs/keys under the generated `pki/` directories before running.
 - To run quickly for local development, you may set `encryption.enabled = false` in the generated `config.toml` (not recommended for production).
 
 Generate self-signed certs for testing:
 ```bash
-cargo run --bin thenodes-cert -- --realm {{APP_REALM}} --copy-to-trusted
+cargo run --bin thenodes-cert -- --realm <realm> --copy-to-trusted
 ```
 This creates cert/key under `pki/` and prints an SPKI fingerprint. You can pin it in `[encryption.trust_policy]`.
 
@@ -34,17 +33,14 @@ This creates cert/key under `pki/` and prints an SPKI fingerprint. You can pin i
 Templates for TheNodes core development and advanced customization. These use path dependencies to the TheNodes source.
 
 - **custom-host** - Custom plugin host with interactive interface
-- **hybrid-app** - Combined CAL + NEP approach
 
-### 2. `nep-plugin/` - Node-Embedded Plugin (NEP)
-**Best for:** Extensible applications, development platforms, complex systems
+### `nep-plugin/` - Node-Embedded Plugin (NEP)
+**Best for:** Adding dynamically loaded application logic to a TheNodes host
 
-- Acts as a plugin host for both TheNodes and custom plugins
-- Interactive command interface with tab completion
-- Trust management commands (observed/trusted list; promote observed → trusted)
-- Session management
-- Custom message routing
-- Extensible architecture
+- Builds a dynamic library for Linux, macOS, or Windows
+- Implements the v0.3 plugin registration ABI
+- Handles extension messages and prompt commands
+- Supplies optional configuration defaults
 
 **Example use cases:**
 - Plugin-based development platforms
@@ -52,22 +48,13 @@ Templates for TheNodes core development and advanced customization. These use pa
 - Testing and development tools
 - Custom network protocols with plugins
 
-### 3. `hybrid-app/` - Combined Approach
+### `hybrid-app/` - Combined Approach
 **Best for:** Complex applications needing both approaches
 
 - Combines CAL and NEP patterns
 - Core functionality as library integration
 - Optional plugin extensibility
 - Flexible architecture
-
-### 4. `minimal-app/` - Bare Minimum
-**Best for:** Learning, prototyping, minimal footprint
-*(Coming Soon)*
-
-- Absolute minimal TheNodes integration
-- Educational purposes
-- Quick prototypes
-- Resource-constrained environments
 
 ## Quick Start
 
@@ -89,6 +76,7 @@ cd templates/
 ```
 
 > **Note:** By default, generated apps are created in the parent directory (outside of `templates/`) to keep the template directory clean. Use `--output` to specify a different location.
+> The generator seeds `Cargo.lock` from the release-tested dependency graph so the first Cargo build remains compatible with Rust 1.83.
 
 ### Developer Config (hardcoded values)
 
@@ -116,14 +104,14 @@ Each production template includes `src/app_identity.rs`. Use it to hardcode valu
 
 ## Template Comparison
 
-| Feature | cal-app | nep-plugin | hybrid-app | minimal-app |
-|---------|-----------|-----------------|------------|-------------|
-| **Integration** | Library (CAL) | Plugin Host (NEP) | Both | Library |
-| **Complexity** | Low | Medium | High | Minimal |
-| **Extensibility** | Code changes | Runtime plugins | Both | Limited |
-| **Resource Usage** | Low | Medium | High | Minimal |
-| **Learning Curve** | Easy | Medium | Advanced | Beginner |
-| **Best For** | Simple apps | Platforms | Complex systems | Learning |
+| Feature | cal-app | nep-plugin | hybrid-app |
+|---------|---------|------------|------------|
+| **Integration** | Library (CAL) | Dynamic plugin (NEP) | Both |
+| **Complexity** | Low | Medium | High |
+| **Extensibility** | Code changes | Loaded by a host | Both |
+| **Resource Usage** | Low | Host-dependent | High |
+| **Learning Curve** | Easy | Medium | Advanced |
+| **Best For** | Simple apps | Plugin logic | Extensible daemons |
 
 ## Architecture Patterns
 
@@ -239,7 +227,6 @@ state_dir = "/var/lib/my-app"
 - **Building a simple P2P app?** → `cal-app`
 - **Need plugin extensibility?** → `nep-plugin`
 - **Complex requirements?** → `hybrid-app`
-- **Just learning/prototyping?** → `minimal-app`
 
 ### 2. Generate and Customize
 

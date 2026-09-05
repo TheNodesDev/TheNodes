@@ -56,6 +56,11 @@ impl Plugin for {{APP_NAME_PASCAL}}Plugin {
 }
 
 /// Plugin registration function required for NEP mode.
+///
+/// # Safety
+///
+/// `api` must be a valid pointer to the host's v0.3 plugin registrar API and
+/// remain valid for the duration of this call.
 #[no_mangle]
 pub unsafe extern "C" fn register_plugin(api: *const PluginRegistrarApi) {
     let Ok(api) = PluginRegistrarApi::from_raw(api) else {

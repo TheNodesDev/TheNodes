@@ -24,12 +24,10 @@ Security defaults:
 
 **Current Setup (Development):**
 - Clone the TheNodes repository
-- Generate apps from within the `templates/` directory
-- Templates use `path = "../../"` dependency to local TheNodes
+- Run the generator from the repository checkout
+- The generator rewrites the local `path` dependency for the selected output directory
 
-**Future Setup (Production):**
-- When TheNodes is published to crates.io, templates will use `thenodes = "0.x.x"`
-- Users won't need to clone the full repository
+The generated manifest also pins `thenodes = "=0.3.0"`; remove the local `path` key when building solely from crates.io.
 
 ## Usage
 
@@ -64,7 +62,7 @@ Copy-Item target\release\my_plugin.dll C:\path\to\thenodes\plugins\
 
 ## Key Features
 
-- **Production Ready:** Uses proper crate dependencies, not path dependencies
+- **Version Pinned:** Targets TheNodes 0.3.0 for plugin ABI compatibility
 - **Plugin Defaults:** Provides configuration defaults without overriding user config
 - **Message Handling:** Template for custom message processing
 - **Prompt Integration:** Commands available in `--prompt` mode
@@ -75,15 +73,14 @@ Copy-Item target\release\my_plugin.dll C:\path\to\thenodes\plugins\
 The generator replaces these placeholders:
 - `{{APP_NAME}}` - Plugin name (e.g., "my-plugin")
 - `{{APP_NAME_PASCAL}}` - PascalCase version (e.g., "MyPlugin")
-- `{{APP_NAME_SHORT}}` - Short name for prompt (e.g., "mp")
-- `{{REALM_NAME}}` - Target realm name
+- `{{APP_REALM}}` - Target realm name
 
 ## Distribution Model
 
 This template follows the **production distribution model:**
-- TheNodes is a library dependency (`thenodes = "0.2.0"`)
+- TheNodes is an exact library dependency (`thenodes = "=0.3.0"`)
 - Plugin compiles independently
-- No TheNodes source code needed in your project
+- The generated development manifest points to the local TheNodes checkout
 - Plugin dynamic library works with any compatible TheNodes binary
 
 ## Next Steps

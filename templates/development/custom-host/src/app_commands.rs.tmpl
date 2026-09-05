@@ -1,25 +1,34 @@
+use crate::custom_plugin_host::{unix_timestamp, CustomPluginHost};
 use std::sync::Arc;
-use crate::custom_plugin_host::CustomPluginHost;
+use thenodes::plugin_host::PluginContext;
 
 /// Application-specific command handler for the prompt interface
 pub struct AppCommands {
     host: Arc<CustomPluginHost>,
+    context: PluginContext,
 }
 
 impl AppCommands {
-    pub fn new(host: Arc<CustomPluginHost>) -> Self {
-        Self { host }
+    pub fn new(host: Arc<CustomPluginHost>, context: PluginContext) -> Self {
+        Self { host, context }
     }
 
     /// Handle application commands
-    pub async fn handle_command(&self, input: &str) -> Result<Option<String>, Box<dyn std::error::Error>> {
-        let parts: Vec<&str> = input.trim().split_whitespace().collect();
+    pub async fn handle_command(
+        &self,
+        input: &str,
+    ) -> Result<Option<String>, Box<dyn std::error::Error>> {
+        let parts: Vec<&str> = input.split_whitespace().collect();
         if parts.is_empty() {
             return Ok(None);
         }
 
         let command = parts[0];
-        let args = if parts.len() > 1 { parts[1..].to_vec() } else { vec![] };
+        let args = if parts.len() > 1 {
+            parts[1..].to_vec()
+        } else {
+            vec![]
+        };
 
         match command {
             // Application-specific commands
@@ -42,14 +51,15 @@ impl AppCommands {
             }
             "send" => self.handle_send_command(args).await,
             "session" => self.handle_session_command(args).await,
-            
+
             // Let custom plugins handle unknown commands
-            _ => {
-                match self.host.handle_custom_command(command, args).await {
-                    Ok(result) => Ok(Some(result)),
-                    Err(_) => Ok(Some(format!("❓ Unknown command: '{}'. Type 'help' for available commands.", command))),
-                }
-            }
+            _ => match self.host.handle_custom_command(command, args).await {
+                Ok(result) => Ok(Some(result)),
+                Err(_) => Ok(Some(format!(
+                    "❓ Unknown command: '{}'. Type 'help' for available commands.",
+                    command
+                ))),
+            },
         }
     }
 
@@ -80,15 +90,21 @@ impl AppCommands {
   (Custom plugin commands will appear here when plugins are loaded)
 
 💡 Tips:
-  - Use Tab completion for commands
   - Commands are case-sensitive
   - Use Ctrl+C to exit
-        "#.trim().to_string()
+        "#
+        .trim()
+        .to_string()
     }
 
-    async fn handle_send_command(&self, args: Vec<&str>) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    async fn handle_send_command(
+        &self,
+        args: Vec<&str>,
+    ) -> Result<Option<String>, Box<dyn std::error::Error>> {
         if args.len() < 3 {
-            return Ok(Some("Usage: send <message_type> <target> <payload_json>".to_string()));
+            return Ok(Some(
+                "Usage: send <message_type> <target> <payload_json>".to_string(),
+            ));
         }
 
         let msg_type = args[0];
@@ -104,13 +120,20 @@ impl AppCommands {
             }
         };
 
-        self.host.send_custom_message(msg_type, payload, target).await?;
+        self.host
+            .send_custom_message(msg_type, payload, target, &self.context)
+            .await?;
         Ok(Some(format!("📤 Sent {} message to {}", msg_type, target)))
     }
 
-    async fn handle_session_command(&self, args: Vec<&str>) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    async fn handle_session_command(
+        &self,
+        args: Vec<&str>,
+    ) -> Result<Option<String>, Box<dyn std::error::Error>> {
         if args.is_empty() {
-            return Ok(Some("Usage: session [create <id> | destroy <id> | list]".to_string()));
+            return Ok(Some(
+                "Usage: session [create <id> | destroy <id> | list]".to_string(),
+            ));
         }
 
         match args[0] {
@@ -118,27 +141,33 @@ impl AppCommands {
                 let session_id = args[1];
                 let payload = serde_json::json!({
                     "session_id": session_id,
-                    "timestamp": chrono::Utc::now().timestamp()
+                    "timestamp": unix_timestamp()
                 });
-                
-                self.host.send_custom_message("session_create", payload, "*").await?;
+
+                self.host
+                    .send_custom_message("session_create", payload, "*", &self.context)
+                    .await?;
                 Ok(Some(format!("🎯 Creating session: {}", session_id)))
             }
             "destroy" if args.len() >= 2 => {
                 let session_id = args[1];
                 let payload = serde_json::json!({
                     "session_id": session_id,
-                    "timestamp": chrono::Utc::now().timestamp()
+                    "timestamp": unix_timestamp()
                 });
-                
-                self.host.send_custom_message("session_destroy", payload, "*").await?;
+
+                self.host
+                    .send_custom_message("session_destroy", payload, "*", &self.context)
+                    .await?;
                 Ok(Some(format!("🗑️ Destroying session: {}", session_id)))
             }
             "list" => {
                 let result = self.host.handle_custom_command("sessions", vec![]).await?;
                 Ok(Some(result))
             }
-            _ => Ok(Some("Usage: session [create <id> | destroy <id> | list]".to_string())),
+            _ => Ok(Some(
+                "Usage: session [create <id> | destroy <id> | list]".to_string(),
+            )),
         }
     }
 }
@@ -146,24 +175,13 @@ impl AppCommands {
 // Integration with TheNodes prompt system
 impl AppCommands {
     /// Handle prompt input - this integrates with TheNodes' prompt system
-    pub async fn handle_prompt_input(&self, input: &str) -> Result<String, Box<dyn std::error::Error>> {
+    pub async fn handle_prompt_input(
+        &self,
+        input: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
         match self.handle_command(input).await? {
             Some(response) => Ok(response),
             None => Ok("".to_string()),
         }
-    }
-
-    /// Get command completions for tab completion
-    pub fn get_completions(&self, partial: &str) -> Vec<String> {
-        let commands = vec![
-            "help", "?", "status", "info", "sessions", "plugins",
-            "data", "send", "session",
-        ];
-
-        commands
-            .into_iter()
-            .filter(|cmd| cmd.starts_with(partial))
-            .map(|cmd| cmd.to_string())
-            .collect()
     }
 }

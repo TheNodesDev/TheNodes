@@ -2,18 +2,23 @@ use clap::Parser;
 use std::future;
 use std::path::PathBuf;
 use std::sync::Arc;
-use thenodes::{config::Config, plugin_host::{PluginManager, PluginLoader}, events, constants::ICON_PLACEHOLDER};
+use thenodes::{
+    config::Config,
+    constants::ICON_PLACEHOLDER,
+    events,
+    plugin_host::{PluginContext, PluginLoader, PluginManager},
+};
 mod app_identity;
 
 #[derive(Parser, Debug)]
-#[command(name = "{{APP_NAME}}", about = "{{APP_DESCRIPTION}}")]
+#[command(name = env!("CARGO_PKG_NAME"), about = env!("CARGO_PKG_DESCRIPTION"))]
 struct Args {
     /// Path to config file (TOML)
     #[arg(long, default_value = "config.toml")]
     config: PathBuf,
 
     /// Plugin directory to load (.so/.dylib/.dll)
-    #[arg(long, default_value = "plugins")] 
+    #[arg(long, default_value = "plugins")]
     plugins: PathBuf,
 
     /// Start an interactive prompt
@@ -35,25 +40,52 @@ async fn main() -> anyhow::Result<()> {
     // Initialize events (console + json)
     events::init::init_events_from_config(cfg.logging.as_ref()).await;
 
-    // Load plugins (NEP) using TheNodes plugin host
-    println!("{}Loading plugins from {}", ICON_PLACEHOLDER, args.plugins.display());
-    let mut plugin_manager = PluginManager::new();
-    let mut loader = PluginLoader::new();
-    loader.load_plugins(&args.plugins, &mut plugin_manager)?;
-
     // Start networking listener and bootstrap peers
-    // Use the existing main entry points in the library to align with current project structure
-    let realm = cfg.realm.clone().unwrap_or_else(|| thenodes::realms::RealmInfo::default());
+    let realm = cfg.realm.clone().unwrap_or_default();
     let port = cfg.port;
     let node_cfg = cfg.node.clone().unwrap_or_default();
     let node_id = node_cfg.resolve_node_id();
 
-    // Peer manager and plugin manager arc
-    let peer_manager = thenodes::network::peer_manager::PeerManager::new();
+    let peer_store = thenodes::network::peer_store::PeerStore::from_config(&cfg).await;
+    let peer_manager = Arc::new(thenodes::network::peer_manager::PeerManager::new());
+    peer_manager.set_delivery_config(
+        cfg.network
+            .as_ref()
+            .and_then(|network| network.delivery.clone()),
+    );
+
+    // Load plugins (NEP) using a context connected to the runtime.
+    println!(
+        "{}Loading plugins from {}",
+        ICON_PLACEHOLDER,
+        args.plugins.display()
+    );
+    let plugin_context = PluginContext::new(
+        peer_manager.clone(),
+        peer_store.clone(),
+        events::dispatcher::handle(),
+        node_id.clone(),
+        cfg.clone(),
+        !args.prompt,
+    );
+    let mut plugin_manager = PluginManager::with_context(plugin_context);
+    let mut loader = PluginLoader::new();
+    loader.load_plugins(&args.plugins, &mut plugin_manager)?;
     let plugin_manager_arc = Arc::new(plugin_manager);
+    if let Some(context) = &plugin_manager_arc.context {
+        context.set_plugin_manager(plugin_manager_arc.clone()).await;
+    }
+    peer_manager
+        .configure_connection_lifecycle(
+            cfg.clone(),
+            node_id.clone(),
+            &plugin_manager_arc,
+            peer_store.clone(),
+            !args.prompt,
+        )
+        .await;
 
     // Start listener
-    let peer_store = thenodes::network::peer_store::PeerStore::new();
     let emit_listener_errors = !args.prompt;
     let _listen_task = tokio::spawn({
         let pm = peer_manager.clone();
@@ -67,13 +99,15 @@ async fn main() -> anyhow::Result<()> {
             if let Err(e) = thenodes::network::listener::start_listener(
                 port,
                 realm,
-                pm,
+                (*pm).clone(),
                 pmgr,
                 &cfg_clone,
                 node_id,
                 peer_store,
                 emit_console_errors,
-            ).await {
+            )
+            .await
+            {
                 eprintln!("listener error: {}", e);
             }
         }
@@ -86,13 +120,14 @@ async fn main() -> anyhow::Result<()> {
         thenodes::network::bootstrap::connect_to_bootstrap_nodes(
             &cfg,
             realm.clone(),
-            peer_manager.clone(),
+            (*peer_manager).clone(),
             plugin_manager_arc.clone(),
             error_buffer,
             !args.prompt,
             node_id.clone(),
             peer_store.clone(),
-        ).await;
+        )
+        .await;
     }
 
     // Optional interactive prompt

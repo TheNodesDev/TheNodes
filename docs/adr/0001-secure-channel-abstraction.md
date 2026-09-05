@@ -62,7 +62,7 @@ Implementations:
 
 Factory:
 ```rust
-pub fn make_secure_channel(cfg: &crate::config::Config) -> Box<dyn SecureChannel> { /* select by cfg + features */ }
+pub fn make_secure_channel(cfg: &crate::config::Config) -> anyhow::Result<Box<dyn SecureChannel>> { /* select by cfg + features */ }
 ```
 
 Config addition (non-breaking default):
@@ -71,7 +71,7 @@ Config addition (non-breaking default):
 enabled = true
 backend = "tls"  # tls | noise | plaintext (plaintext implied if enabled=false)
 ```
-If `backend = "noise"` but the `noise` feature is not compiled, we fall back to `plaintext` (documented behavior) and may log a warning.
+Since v0.3.0, if `backend = "noise"` but the `noise` feature is not compiled, channel creation returns an error and the connection is rejected. The earlier plaintext fallback is removed.
 
 Events/Trust:
 - TLS: unchanged trust decision events (SPKI, pins, realm binding, chain/time flags).

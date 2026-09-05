@@ -4,8 +4,8 @@ This document explains how to build and ship plugins for TheNodes. It focuses on
 
 ## 1. Prerequisites
 
-- Rust 1.74 or newer with the `cargo` toolchain (matches this repo's MSRV in CI).
-- Access to a TheNodes checkout (until the crate is published on crates.io).
+- Rust 1.83 or newer with the `cargo` toolchain (matches this repo's declared MSRV and CI).
+- Access to a TheNodes 0.3.0 checkout or the matching published crate.
 - Familiarity with basic Rust crate structure, `cargo build`, and dynamic library basics for your platform.
 - Optional: OpenSSL or other tooling if you plan to test TLS locally.
 
@@ -23,7 +23,7 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-thenodes = { path = "../../" } # replace with `thenodes = "0.1"` once published
+thenodes = { path = "../../" } # or `thenodes = "=0.3.0"` for the matching published host version
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] } # plugin-specific
 ```

@@ -505,7 +505,8 @@ impl SecureChannel for PlaintextChannel {
     }
 }
 
-pub fn make_secure_channel(cfg: &crate::config::Config) -> Box<dyn SecureChannel> {
+/// Select a secure channel, rejecting Noise when its feature is unavailable.
+pub fn make_secure_channel(cfg: &crate::config::Config) -> Result<Box<dyn SecureChannel>> {
     let enc = cfg.encryption.as_ref();
     // Derive backend: default to tls if enabled, plaintext if disabled
     let backend = enc
@@ -520,7 +521,7 @@ pub fn make_secure_channel(cfg: &crate::config::Config) -> Box<dyn SecureChannel
                 }
             })
         });
-    match backend.as_deref() {
+    let channel: Box<dyn SecureChannel> = match backend.as_deref() {
         Some("tls") => Box::new(TlsSecureChannel::new()),
         Some("none") | Some("plaintext") => Box::new(PlaintextChannel::new()),
         Some("noise") => {
@@ -530,8 +531,7 @@ pub fn make_secure_channel(cfg: &crate::config::Config) -> Box<dyn SecureChannel
             }
             #[cfg(not(feature = "noise"))]
             {
-                // Feature not enabled; fall back to plaintext
-                Box::new(PlaintextChannel::new())
+                anyhow::bail!("encryption.backend = noise requires a build with --features noise");
             }
         }
         _ => {
@@ -542,7 +542,8 @@ pub fn make_secure_channel(cfg: &crate::config::Config) -> Box<dyn SecureChannel
                 Box::new(PlaintextChannel::new())
             }
         }
-    }
+    };
+    Ok(channel)
 }
 
 #[cfg(feature = "noise")]

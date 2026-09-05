@@ -2,12 +2,13 @@
 name = "{{APP_NAME}}"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.83"
 description = "Custom plugin host application using TheNodes framework"
 license = "Apache-2.0 OR MIT"
 
 [dependencies]
 # TheNodes as a library dependency
-thenodes = { path = "../..", features = [] }
+thenodes = { version = "0.3.0", path = "../..", features = [] }
 
 # Standard async runtime
 tokio = { version = "1.35", features = ["full"] }

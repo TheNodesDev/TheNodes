@@ -1205,7 +1205,7 @@ impl PeerManager {
         let mut results: Vec<(String, Option<String>)> = Vec::new();
         // Build reverse index of (from,to) -> binding_id for quick lookup
         let ids = self.relay_binding_ids.lock().await;
-        for ((from, to), _prefs) in bindings.iter() {
+        for (from, to) in bindings.keys() {
             if from == from_node_id {
                 let bid = ids.iter().find_map(|(id, pair)| {
                     if pair.0 == *from && pair.1 == *to {

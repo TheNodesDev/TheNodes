@@ -9,7 +9,7 @@ use libloading::{Library, Symbol};
 
 use super::{Plugin, PluginRegistrar};
 
-pub const PLUGIN_ABI_VERSION: u32 = 1;
+pub const PLUGIN_ABI_VERSION: u32 = 2;
 
 /// Opaque handle representing a boxed plugin instance.
 #[repr(C)]

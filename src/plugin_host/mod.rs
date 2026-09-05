@@ -90,7 +90,15 @@ impl PluginContext {
 
 #[async_trait::async_trait]
 pub trait Plugin: Send + Sync {
-    fn on_message(&self, message: &Message, ctx: &PluginContext);
+    async fn on_message(&self, message: &Message, ctx: &PluginContext);
+
+    /// Extension kinds this plugin wants to receive.
+    ///
+    /// `None` preserves the default behavior of receiving every extension kind.
+    /// `Some(&[])` opts out of all extension messages.
+    fn subscribed_extension_kinds(&self) -> Option<&[&str]> {
+        None
+    }
 
     /// Called when user enters a prompt for this plugin. Can return a response and optionally broadcast.
     async fn on_prompt(&self, _input: &str, _ctx: &PluginContext) -> Option<String> {

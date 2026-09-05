@@ -1,6 +1,6 @@
 // src/network/bootstrap.rs
 
-use super::{Peer, PeerSource, PeerStore};
+use super::{ConnectionPolicy, Peer, PeerSource, PeerStore};
 use crate::config::Config;
 use crate::events::model::LogLevel;
 use crate::network::events::emit_network_event;
@@ -33,6 +33,7 @@ pub async fn connect_to_bootstrap_nodes(
             let plugin_manager_clone = plugin_manager.clone();
             let error_buffer = error_buffer.clone();
             let config_clone = config.clone();
+            let connection_policy = ConnectionPolicy::from_network_config(config);
             let node_id_for_task = node_id_arc.clone();
             let peer_store_clone = peer_store.clone();
             // Seed into store
@@ -69,6 +70,7 @@ pub async fn connect_to_bootstrap_nodes(
                                 None,
                                 allow_console,
                             );
+                            break;
                         }
                         Err(e) => {
                             emit_network_event(
@@ -84,13 +86,36 @@ pub async fn connect_to_bootstrap_nodes(
                             {
                                 error_buffer.lock().await.push(msg);
                             }
+                            if let Ok(sock) = addr_clone.parse() {
+                                peer_store_clone.mark_failure(&sock).await;
+                                let Some(attempt) = peer_store_clone
+                                    .next_reconnect_attempt(
+                                        &sock,
+                                        connection_policy.reconnect_max_attempts,
+                                    )
+                                    .await
+                                else {
+                                    emit_network_event(
+                                        "bootstrap",
+                                        LogLevel::Warn,
+                                        "bootstrap_reconnect_exhausted",
+                                        Some(addr_clone.clone()),
+                                        None,
+                                        allow_console,
+                                    );
+                                    break;
+                                };
+                                tokio::time::sleep(
+                                    connection_policy.reconnect_delay_with_random_jitter(attempt),
+                                )
+                                .await;
+                            } else {
+                                break;
+                            }
                         }
                     }
                     // On any outcome, persist latest store periodically if enabled
                     peer_store_clone.save_if_enabled(&config_clone).await;
-                    // Wait before retrying
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                    // Optionally buffer retry message as well
                 }
             });
         }

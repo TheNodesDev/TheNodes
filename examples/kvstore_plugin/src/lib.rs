@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use thenodes::plugin_host::{Plugin, PluginContext, PluginRegistrarApi};
-use thenodes::network::message::{Message, MessageType, Payload};
-use serde_json::json;
 use async_trait::async_trait;
+use serde_json::json;
+use thenodes::network::message::{Message, MessageType, Payload};
+use thenodes::plugin_host::{Plugin, PluginContext, PluginRegistrarApi};
 
 #[derive(Default)]
 pub struct KvStorePlugin {
@@ -21,8 +21,11 @@ impl KvStorePlugin {
 
 #[async_trait]
 impl Plugin for KvStorePlugin {
-    fn on_message(&self, message: &Message, _ctx: &PluginContext) {
-        println!("[kvstore_plugin] on_message: self={:p} message={:?}", self, message);
+    async fn on_message(&self, message: &Message, _ctx: &PluginContext) {
+        println!(
+            "[kvstore_plugin] on_message: self={:p} message={:?}",
+            self, message
+        );
         match &message.msg_type {
             MessageType::Extension { kind } => match kind.as_str() {
                 "kvstore.put" => {
@@ -59,12 +62,19 @@ impl Plugin for KvStorePlugin {
         }
     }
 
+    fn subscribed_extension_kinds(&self) -> Option<&[&str]> {
+        Some(&["kvstore.put", "kvstore.get"])
+    }
+
     fn prompt_prefix(&self) -> Option<&str> {
         Some("kvstore")
     }
 
     async fn on_prompt(&self, input: &str, ctx: &PluginContext) -> Option<String> {
-        println!("[kvstore_plugin] on_prompt: self={:p} input={:?}", self, input);
+        println!(
+            "[kvstore_plugin] on_prompt: self={:p} input={:?}",
+            self, input
+        );
         let parts: Vec<&str> = input.trim().splitn(3, ' ').collect();
         match parts.as_slice() {
             ["put", key, value] => {
@@ -73,7 +83,9 @@ impl Plugin for KvStorePlugin {
                 let msg = Message::new(
                     "plugin:kvstore",
                     "*",
-                    MessageType::Extension { kind: "kvstore.put".to_string() },
+                    MessageType::Extension {
+                        kind: "kvstore.put".to_string(),
+                    },
                     Some(Payload::Json(json!({"key": key, "value": value}))),
                     None,
                 );
@@ -87,7 +99,11 @@ impl Plugin for KvStorePlugin {
             }
             ["list"] => {
                 let map = self.store.lock().unwrap();
-                let list = map.iter().map(|(k, v)| format!("{k} = {v}")).collect::<Vec<_>>().join("\n");
+                let list = map
+                    .iter()
+                    .map(|(k, v)| format!("{k} = {v}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
                 Some(format!("📦 All entries:\n{}", list))
             }
             _ => Some(format!("⚠️ Unknown command: '{}'", input)),

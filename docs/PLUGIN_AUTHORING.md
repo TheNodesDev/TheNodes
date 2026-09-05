@@ -24,7 +24,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 thenodes = { path = "../../" } # replace with `thenodes = "0.1"` once published
-async-trait = "0.1"            # only if you use async hooks
+async-trait = "0.1"
 serde = { version = "1", features = ["derive"] } # plugin-specific
 ```
 
@@ -45,8 +45,12 @@ pub struct MyPlugin;
 
 #[async_trait::async_trait]
 impl Plugin for MyPlugin {
-    fn on_message(&self, message: &Message, ctx: &PluginContext) {
-        // handle inbound messages
+    async fn on_message(&self, message: &Message, ctx: &PluginContext) {
+        // Handle inbound messages. Async I/O can be awaited directly.
+    }
+
+    fn subscribed_extension_kinds(&self) -> Option<&[&str]> {
+        Some(&["my.records.updated", "my.records.deleted"])
     }
 
     async fn on_prompt(&self, input: &str, ctx: &PluginContext) -> Option<String> {
@@ -65,9 +69,12 @@ impl Plugin for MyPlugin {
 ```
 
 Notes:
-- `on_prompt` is async; if you implement it, add `async-trait` to your dependencies. If you don’t override it, you can omit `async-trait`.
+- `on_message` and `on_prompt` are async. Add `async-trait` to plugin dependencies and annotate the implementation as shown.
+- The host awaits each plugin's `on_message` work before dispatch completes. Avoid blocking operations; use async APIs for I/O, database access, or session/state lookups.
+- Dispatch bounds each plugin's `on_message` call with an internal timeout (currently 5 seconds). If a plugin does not return within that window, the host abandons the call, logs a `plugin_dispatch_timeout` event, and continues dispatching to the remaining plugins. Design `on_message` to complete quickly and offload long-running work to a spawned task if needed.
+- `subscribed_extension_kinds()` filters only `MessageType::Extension` messages by exact `kind` match. Returning `None` (the default) receives every extension kind for backward-compatible behavior. Returning `Some(&[])` receives no extension messages. Non-extension messages are still delivered.
 
-`PluginContext` exposes shared facilities (peer manager, event dispatcher). Avoid long blocking work inside handlers; spawn async tasks via Tokio if needed.
+`PluginContext` exposes shared facilities such as the peer manager and event dispatcher.
 
 ## 4. Registration Entry Point (FFI ABI)
 
@@ -99,12 +106,12 @@ Important details:
 
 ## 5. ABI Versioning and Compatibility
 
-`thenodes::plugin_host::PLUGIN_ABI_VERSION` is bumped whenever the host changes the layout or semantics of `PluginRegistrarApi`. Steps for plugin authors:
+`thenodes::plugin_host::PLUGIN_ABI_VERSION` is bumped whenever the dynamic plugin boundary changes layout or semantics, including changes to `PluginRegistrarApi` or the `Plugin` trait. Steps for plugin authors:
 
 1. Depend on a compatible TheNodes release. Cargo will rebuild when the host updates.
 2. Inside your plugin, you can assert the expected version:
    ```rust
-   assert_eq!(thenodes::plugin_host::PLUGIN_ABI_VERSION, 1);
+   assert_eq!(thenodes::plugin_host::PLUGIN_ABI_VERSION, 2);
    ```
    This guards against accidental mismatches when multiple host binaries exist.
 3. During load, `PluginRegistrarApi::register_plugin` validates the version automatically and returns an error if it differs.
@@ -234,8 +241,9 @@ Plugins receive relay lifecycle events through `on_message`. Handle `RelayNotify
 ```rust
 use thenodes::network::message::{Message, MessageType, Reason};
 
+#[async_trait::async_trait]
 impl Plugin for MyPlugin {
-    fn on_message(&self, message: &Message, ctx: &PluginContext) {
+    async fn on_message(&self, message: &Message, ctx: &PluginContext) {
         if let MessageType::RelayNotify { notif_type, binding_id, detail } = &message.msg_type {
             match notif_type {
                 Reason::Overload => {
@@ -253,6 +261,12 @@ impl Plugin for MyPlugin {
     }
 }
 ```
+
+### Plugin State and Storage
+
+TheNodes does not provide a generic plugin storage API. Plugins own their state and persistence choices so the core remains application-neutral and does not impose a data model, consistency contract, or storage backend. The async `on_message` boundary allows plugins to await their own I/O, database access, or session/state lookups without blocking the runtime.
+
+See [`PLUGIN_STORAGE_DECISION.md`](PLUGIN_STORAGE_DECISION.md) for the scope and rationale.
 
 ## 11. Next Steps and Resources
 

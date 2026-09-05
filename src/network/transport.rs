@@ -506,7 +506,7 @@ pub async fn receive_and_dispatch<R: AsyncBufReadExt + Unpin>(
                     allow_console,
                 );
                 // Remove peer and capture node_id for lifecycle notifications
-                let removed_node_id = peer_manager.remove_peer(&addr).await;
+                let removed_node_id = peer_manager.handle_peer_disconnected(&addr).await;
                 use crate::events::{
                     dispatcher,
                     model::{LogEvent, LogLevel, SystemEvent},
@@ -543,9 +543,13 @@ pub async fn receive_and_dispatch<R: AsyncBufReadExt + Unpin>(
                     let effective_msg =
                         crate::network::delivery::unwrap_tunneled_message(&msg, &local_node_id)
                             .unwrap_or(msg);
+                    // The node_id actually bound to this TCP connection (from HELLO), used to
+                    // reject messages whose `from` field doesn't match the real sender.
+                    let verified_sender = peer_manager.node_id_for_addr(&addr).await;
                     let disposition = crate::network::delivery::process_incoming_message(
                         &peer_manager,
                         &local_node_id,
+                        verified_sender.as_deref(),
                         effective_msg,
                     )
                     .await;
@@ -560,7 +564,7 @@ pub async fn receive_and_dispatch<R: AsyncBufReadExt + Unpin>(
                     };
 
                     for msg in dispatch_messages {
-                        plugin_manager.dispatch_message(&msg);
+                        plugin_manager.dispatch_message(&msg).await;
                         match msg.msg_type {
                             MessageType::Hello { .. } => {
                                 emit_network_event(

@@ -11,6 +11,7 @@
 //! - Phase 3: relay-coordinated UDP hole punching (`direct_then_punch_then_relay`).
 
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use crate::config::{Config, ConnectionPolicyConfig};
 use crate::network::peer_manager::PeerManager;
@@ -30,6 +31,24 @@ pub enum ConnectionStrategy {
     RelayOnly,
     /// TCP → direct UDP → relay-coordinated hole punch → relay.
     DirectThenPunchThenRelay,
+}
+
+/// Transport route tracked by the connection lifecycle policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RouteKind {
+    Tcp,
+    Udp,
+    Relay,
+}
+
+/// Coarse runtime health used to re-evaluate otherwise valid policy routes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RouteHealth {
+    #[default]
+    Unknown,
+    Healthy,
+    Suspect,
+    Unresponsive,
 }
 
 impl ConnectionStrategy {
@@ -56,11 +75,22 @@ pub struct ConnectionPolicy {
     pub direct_udp_timeout_ms: u64,
     /// Time budget for relay-coordinated UDP hole-punching (ms).  Phase 3.
     pub punch_timeout_ms: u64,
+    pub heartbeat_interval: Duration,
+    pub heartbeat_timeout: Duration,
+    pub reconnect_base_delay: Duration,
+    pub reconnect_multiplier: f64,
+    pub reconnect_max_delay: Duration,
+    pub reconnect_max_attempts: u32,
+    pub reconnect_jitter_ratio: f64,
 }
 
 impl ConnectionPolicy {
     /// Build from an explicit [`ConnectionPolicyConfig`].
     pub fn from_config(cfg: &ConnectionPolicyConfig) -> Self {
+        let heartbeat_interval_ms = cfg.heartbeat_interval_ms.unwrap_or(30_000).max(1);
+        let reconnect_base_delay_ms = cfg.reconnect_base_delay_ms.unwrap_or(1_000).max(1);
+        let reconnect_multiplier = cfg.reconnect_multiplier.unwrap_or(2.0);
+        let reconnect_jitter_ratio = cfg.reconnect_jitter_ratio.unwrap_or(0.2);
         Self {
             strategy: ConnectionStrategy::from_str(
                 cfg.strategy.as_deref().unwrap_or("direct_then_relay"),
@@ -68,6 +98,29 @@ impl ConnectionPolicy {
             direct_tcp_timeout_ms: cfg.direct_tcp_timeout_ms.unwrap_or(3000),
             direct_udp_timeout_ms: cfg.direct_udp_timeout_ms.unwrap_or(1000),
             punch_timeout_ms: cfg.punch_timeout_ms.unwrap_or(5000),
+            heartbeat_interval: Duration::from_millis(heartbeat_interval_ms),
+            heartbeat_timeout: Duration::from_millis(
+                cfg.heartbeat_timeout_ms
+                    .unwrap_or(90_000)
+                    .max(heartbeat_interval_ms),
+            ),
+            reconnect_base_delay: Duration::from_millis(reconnect_base_delay_ms),
+            reconnect_multiplier: if reconnect_multiplier.is_finite() {
+                reconnect_multiplier.max(1.0)
+            } else {
+                2.0
+            },
+            reconnect_max_delay: Duration::from_millis(
+                cfg.reconnect_max_delay_ms
+                    .unwrap_or(60_000)
+                    .max(reconnect_base_delay_ms),
+            ),
+            reconnect_max_attempts: cfg.reconnect_max_attempts.unwrap_or(8),
+            reconnect_jitter_ratio: if reconnect_jitter_ratio.is_finite() {
+                reconnect_jitter_ratio.clamp(0.0, 1.0)
+            } else {
+                0.2
+            },
         }
     }
 
@@ -84,6 +137,35 @@ impl ConnectionPolicy {
             Self::default()
         }
     }
+
+    /// Calculate the delay for a one-based reconnect attempt.
+    ///
+    /// `jitter_sample` is clamped to `-1.0..=1.0`; zero produces the exact
+    /// exponential progression and makes the calculation deterministic in tests.
+    pub fn reconnect_delay(&self, attempt: u32, jitter_sample: f64) -> Duration {
+        let base_delay_ms = self.reconnect_base_delay.as_secs_f64() * 1_000.0;
+        let max_delay_ms = self.reconnect_max_delay.as_secs_f64() * 1_000.0;
+        let uncapped_delay = base_delay_ms
+            * self
+                .reconnect_multiplier
+                .powf(f64::from(attempt.saturating_sub(1)));
+        let delay_ms = if uncapped_delay.is_finite() {
+            uncapped_delay.min(max_delay_ms)
+        } else {
+            max_delay_ms
+        };
+        let jitter_sample = if jitter_sample.is_finite() {
+            jitter_sample.clamp(-1.0, 1.0)
+        } else {
+            0.0
+        };
+        let jitter_factor = 1.0 + self.reconnect_jitter_ratio * jitter_sample;
+        Duration::from_secs_f64((delay_ms * jitter_factor).max(1.0) / 1_000.0)
+    }
+
+    pub fn reconnect_delay_with_random_jitter(&self, attempt: u32) -> Duration {
+        self.reconnect_delay(attempt, rand::random::<f64>() * 2.0 - 1.0)
+    }
 }
 
 impl Default for ConnectionPolicy {
@@ -93,6 +175,13 @@ impl Default for ConnectionPolicy {
             direct_tcp_timeout_ms: 3000,
             direct_udp_timeout_ms: 1000,
             punch_timeout_ms: 5000,
+            heartbeat_interval: Duration::from_secs(30),
+            heartbeat_timeout: Duration::from_secs(90),
+            reconnect_base_delay: Duration::from_secs(1),
+            reconnect_multiplier: 2.0,
+            reconnect_max_delay: Duration::from_secs(60),
+            reconnect_max_attempts: 8,
+            reconnect_jitter_ratio: 0.2,
         }
     }
 }
@@ -140,144 +229,144 @@ pub async fn connect_with_policy(
     peer_manager: &PeerManager,
     config: &Config,
 ) -> ConnectionOutcome {
-    // Peer already has an active TCP or UDP connection.
-    if peer_manager.has_node_id(target_node_id).await
-        || peer_manager
-            .udp_session_id_for(target_node_id)
+    let mut candidates = Vec::new();
+
+    if !matches!(policy.strategy, ConnectionStrategy::RelayOnly) {
+        if let Some(candidate) = tcp_candidate(peer_manager, target_node_id).await {
+            candidates.push(candidate);
+        }
+    }
+
+    if matches!(
+        policy.strategy,
+        ConnectionStrategy::DirectThenUdpThenRelay | ConnectionStrategy::DirectThenPunchThenRelay
+    ) {
+        if let Some(candidate) = udp_candidate(peer_manager, target_node_id).await {
+            candidates.push(candidate);
+        }
+    }
+
+    if matches!(
+        policy.strategy,
+        ConnectionStrategy::DirectThenPunchThenRelay
+    ) && local_punch_enabled(config)
+        && peer_manager
+            .peer_has_capability(target_node_id, "punch")
             .await
-            .is_some()
     {
-        return ConnectionOutcome::AlreadyConnected;
-    }
-
-    match policy.strategy {
-        ConnectionStrategy::RelayOnly => relay_route(peer_manager).await,
-
-        ConnectionStrategy::DirectOnly => resolve_tcp(peer_manager, target_node_id)
+        if let Some(obs_addr) = peer_manager
+            .udp_observed_addr_for_if_fresh(target_node_id, observed_addr_max_age_secs(config))
             .await
-            .map(|addr| ConnectionOutcome::DirectTcp { addr })
-            .unwrap_or_else(|| ConnectionOutcome::NoRoute {
-                reason: "no TCP address known for peer (direct_only)".to_string(),
-            }),
-
-        ConnectionStrategy::DirectThenRelay => {
-            if let Some(addr) = resolve_tcp(peer_manager, target_node_id).await {
-                ConnectionOutcome::DirectTcp { addr }
-            } else {
-                relay_route(peer_manager).await
+        {
+            if let (Some(relay_node_id), Ok(addr)) = (
+                punch_rendezvous_route(peer_manager).await,
+                obs_addr.parse::<SocketAddr>(),
+            ) {
+                candidates.push(RouteCandidate {
+                    health_node_id: relay_node_id.clone(),
+                    kind: RouteKind::Relay,
+                    outcome: ConnectionOutcome::HolePunchUdp {
+                        relay_node_id,
+                        addr,
+                    },
+                });
             }
-        }
-
-        ConnectionStrategy::DirectThenUdpThenRelay => {
-            // 1. TCP address known?
-            if let Some(addr) = resolve_tcp(peer_manager, target_node_id).await {
-                return ConnectionOutcome::DirectTcp { addr };
-            }
-            // 2. Active UDP Noise session?
-            if peer_manager
-                .udp_session_id_for(target_node_id)
-                .await
-                .is_some()
-            {
-                let udp_addr = peer_manager
-                    .udp_listen_addr_for(target_node_id)
-                    .await
-                    .unwrap_or_default();
-                if let Ok(addr) = udp_addr.parse::<SocketAddr>() {
-                    return ConnectionOutcome::DirectUdp { addr };
-                }
-            }
-            // 3. Peer advertises UDP and we know their UDP listen address — initiate session.
-            if peer_manager
-                .peer_has_capability(target_node_id, "udp")
-                .await
-            {
-                if let Some(udp_addr) = peer_manager.udp_listen_addr_for(target_node_id).await {
-                    if let Ok(addr) = udp_addr.parse::<SocketAddr>() {
-                        return ConnectionOutcome::DirectUdp { addr };
-                    }
-                }
-            }
-            // 4. Relay fallback.
-            relay_route(peer_manager).await
-        }
-
-        // Phase 3: hole-punch via relay-coordinated observed addresses.
-        ConnectionStrategy::DirectThenPunchThenRelay => {
-            let observed_addr_max_age_secs = observed_addr_max_age_secs(config);
-
-            // 1. Direct TCP.
-            if let Some(addr) = resolve_tcp(peer_manager, target_node_id).await {
-                return ConnectionOutcome::DirectTcp { addr };
-            }
-            // 2. Active UDP Noise session already established.
-            if peer_manager
-                .udp_session_id_for(target_node_id)
-                .await
-                .is_some()
-            {
-                let udp_addr = peer_manager
-                    .udp_listen_addr_for(target_node_id)
-                    .await
-                    .unwrap_or_default();
-                if let Ok(addr) = udp_addr.parse::<SocketAddr>() {
-                    return ConnectionOutcome::DirectUdp { addr };
-                }
-            }
-            // 3. Direct UDP via advertised listen address.
-            if peer_manager
-                .peer_has_capability(target_node_id, "udp")
-                .await
-            {
-                if let Some(udp_addr) = peer_manager.udp_listen_addr_for(target_node_id).await {
-                    if let Ok(addr) = udp_addr.parse::<SocketAddr>() {
-                        return ConnectionOutcome::DirectUdp { addr };
-                    }
-                }
-            }
-            // 4. Relay-coordinated hole punch via observed addresses.
-            if local_punch_enabled(config)
-                && peer_manager
-                    .peer_has_capability(target_node_id, "punch")
-                    .await
-            {
-                if let Some(obs_addr) = peer_manager
-                    .udp_observed_addr_for_if_fresh(target_node_id, observed_addr_max_age_secs)
-                    .await
-                {
-                    if let Some(relay_node_id) = punch_rendezvous_route(peer_manager).await {
-                        if let Ok(addr) = obs_addr.parse::<SocketAddr>() {
-                            return ConnectionOutcome::HolePunchUdp {
-                                relay_node_id,
-                                addr,
-                            };
-                        }
-                    }
-                }
-            }
-            // 5. Relay fallback.
-            relay_route(peer_manager).await
         }
     }
+
+    if !matches!(policy.strategy, ConnectionStrategy::DirectOnly) {
+        candidates.extend(relay_candidates(peer_manager).await);
+    }
+
+    choose_healthiest_route(peer_manager, candidates)
+        .await
+        .unwrap_or_else(|| ConnectionOutcome::NoRoute {
+            reason: format!("no healthy route available for {:?}", policy.strategy),
+        })
+}
+
+struct RouteCandidate {
+    health_node_id: String,
+    kind: RouteKind,
+    outcome: ConnectionOutcome,
+}
+
+async fn tcp_candidate(peer_manager: &PeerManager, node_id: &str) -> Option<RouteCandidate> {
+    let outcome = if peer_manager.has_node_id(node_id).await {
+        ConnectionOutcome::AlreadyConnected
+    } else {
+        ConnectionOutcome::DirectTcp {
+            addr: resolve_tcp(peer_manager, node_id).await?,
+        }
+    };
+    Some(RouteCandidate {
+        health_node_id: node_id.to_string(),
+        kind: RouteKind::Tcp,
+        outcome,
+    })
+}
+
+async fn udp_candidate(peer_manager: &PeerManager, node_id: &str) -> Option<RouteCandidate> {
+    let has_session = peer_manager.udp_session_id_for(node_id).await.is_some();
+    if !has_session && !peer_manager.peer_has_capability(node_id, "udp").await {
+        return None;
+    }
+    let addr = peer_manager
+        .udp_listen_addr_for(node_id)
+        .await?
+        .parse::<SocketAddr>()
+        .ok()?;
+    Some(RouteCandidate {
+        health_node_id: node_id.to_string(),
+        kind: RouteKind::Udp,
+        outcome: ConnectionOutcome::DirectUdp { addr },
+    })
+}
+
+async fn relay_candidates(peer_manager: &PeerManager) -> Vec<RouteCandidate> {
+    let mut candidates = Vec::new();
+    for node_id in peer_manager.list_node_ids().await {
+        if peer_manager.peer_has_capability(&node_id, "relay").await {
+            candidates.push(RouteCandidate {
+                health_node_id: node_id.clone(),
+                kind: RouteKind::Relay,
+                outcome: ConnectionOutcome::ViaRelay {
+                    relay_node_id: node_id,
+                },
+            });
+        }
+    }
+    candidates
+}
+
+async fn choose_healthiest_route(
+    peer_manager: &PeerManager,
+    candidates: Vec<RouteCandidate>,
+) -> Option<ConnectionOutcome> {
+    let mut best: Option<(u8, ConnectionOutcome)> = None;
+    for candidate in candidates {
+        let health = peer_manager
+            .route_health(&candidate.health_node_id, candidate.kind)
+            .await;
+        if health == RouteHealth::Unresponsive {
+            continue;
+        }
+        let rank = match health {
+            RouteHealth::Healthy | RouteHealth::Unknown => 0,
+            RouteHealth::Suspect => 1,
+            RouteHealth::Unresponsive => unreachable!(),
+        };
+        if best.as_ref().is_none_or(|(best_rank, _)| rank < *best_rank) {
+            best = Some((rank, candidate.outcome));
+        }
+    }
+    best.map(|(_, outcome)| outcome)
 }
 
 /// Return the TCP listen address advertised by `node_id` in their HELLO, if known.
 async fn resolve_tcp(peer_manager: &PeerManager, node_id: &str) -> Option<SocketAddr> {
     let addr_str = peer_manager.tcp_listen_addr_for(node_id).await?;
     addr_str.parse::<SocketAddr>().ok()
-}
-
-/// Find a connected peer advertising the `"relay"` capability.
-async fn relay_route(peer_manager: &PeerManager) -> ConnectionOutcome {
-    let node_ids = peer_manager.list_node_ids().await;
-    for nid in node_ids {
-        if peer_manager.peer_has_capability(&nid, "relay").await {
-            return ConnectionOutcome::ViaRelay { relay_node_id: nid };
-        }
-    }
-    ConnectionOutcome::NoRoute {
-        reason: "no relay peer available".to_string(),
-    }
 }
 
 async fn punch_rendezvous_route(peer_manager: &PeerManager) -> Option<String> {

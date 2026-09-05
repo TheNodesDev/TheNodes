@@ -238,6 +238,15 @@ async fn main() {
     if let Some(ctx) = &plugin_manager.context {
         ctx.set_plugin_manager(plugin_manager.clone()).await;
     }
+    peer_manager
+        .configure_connection_lifecycle(
+            config.clone(),
+            node_id.clone(),
+            &plugin_manager,
+            peer_store.clone(),
+            !args.prompt,
+        )
+        .await;
 
     // Load RealmInfo after overrides
     let realm = config.realm.clone().unwrap_or_else(RealmInfo::default);

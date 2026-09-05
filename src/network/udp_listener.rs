@@ -437,70 +437,98 @@ async fn handle_session_frame(
     let session_id: [u8; SESSION_ID_LEN] = datagram[..SESSION_ID_LEN].try_into().unwrap();
     let ciphertext = &datagram[SESSION_ID_LEN..];
 
+    // Decrypt (and capture everything needed afterwards) while the sessions lock is
+    // held, then drop the guard before awaiting any further work. `process_incoming_message`
+    // and `dispatch_message` may deliver a reply through `PluginContext`/`PeerManager`,
+    // which can route back into `send_udp` and try to re-lock this same, non-reentrant
+    // `tokio::sync::Mutex` — holding the guard across those awaits would deadlock the
+    // entire UDP receive loop for every peer on the node.
+    enum Decrypted {
+        Ok {
+            node_id: Option<String>,
+            payload: Vec<u8>,
+        },
+        Err(String),
+    }
+
     let mut map = sessions.lock().await;
-    if let Some(session) = map.get_mut(&session_id) {
-        if session.is_established() {
-            let mut plaintext = vec![0u8; ciphertext.len()];
-            match session.decrypt(ciphertext, &mut plaintext, src) {
-                Ok(n) => {
-                    let payload = &plaintext[..n];
-                    // Dispatch the plaintext payload to the plugin system or app layer.
-                    // For Phase 1, we just log/emit an event.  Full routing is Phase 2+.
-                    crate::network::events::emit_network_event(
-                        "udp_listener",
-                        crate::events::model::LogLevel::Debug,
-                        "udp_data_received",
-                        Some(src.to_string()),
-                        Some(format!(
-                            "session={} node_id={:?} bytes={}",
-                            hex::encode(session_id),
-                            session.node_id,
-                            n
-                        )),
-                        false,
-                    );
-                    // Dispatch to the PeerManager so callers can receive UDP messages.
-                    // (The peer_manager UDP receive API is defined in peer_manager.rs.)
-                    if let Some(node_id) = session.node_id.clone() {
-                        if let Ok(payload_text) = std::str::from_utf8(payload) {
-                            if let Some(message) = Message::from_json(payload_text) {
-                                let disposition =
-                                    crate::network::delivery::process_incoming_message(
-                                        peer_manager,
-                                        local_node_id,
-                                        message,
-                                    )
-                                    .await;
-
-                                match disposition {
-                                    crate::network::delivery::IncomingMessageDisposition::Consumed => {}
-                                    crate::network::delivery::IncomingMessageDisposition::Dispatch(messages) => {
-                                        for message in messages {
-                                            plugin_manager.dispatch_message(&message);
-                                        }
-                                    }
-                                }
-                                return;
-                            }
-                        }
-
-                        peer_manager.dispatch_udp_payload(&node_id, payload).await;
-                    }
-                    let _ = payload; // suppress unused warning if dispatch is a no-op
-                }
-                Err(e) => {
-                    crate::network::events::emit_network_event(
-                        "udp_listener",
-                        crate::events::model::LogLevel::Warn,
-                        "udp_decrypt_failed",
-                        Some(src.to_string()),
-                        Some(format!("session={} err={}", hex::encode(session_id), e)),
-                        false,
-                    );
+    let outcome = map.get_mut(&session_id).and_then(|session| {
+        if !session.is_established() {
+            // Frames arriving for a still-Handshaking session by session-ID prefix are dropped.
+            return None;
+        }
+        let mut plaintext = vec![0u8; ciphertext.len()];
+        Some(match session.decrypt(ciphertext, &mut plaintext, src) {
+            Ok(n) => {
+                plaintext.truncate(n);
+                crate::network::events::emit_network_event(
+                    "udp_listener",
+                    crate::events::model::LogLevel::Debug,
+                    "udp_data_received",
+                    Some(src.to_string()),
+                    Some(format!(
+                        "session={} node_id={:?} bytes={}",
+                        hex::encode(session_id),
+                        session.node_id,
+                        plaintext.len()
+                    )),
+                    false,
+                );
+                Decrypted::Ok {
+                    node_id: session.node_id.clone(),
+                    payload: plaintext,
                 }
             }
+            Err(e) => Decrypted::Err(e.to_string()),
+        })
+    });
+    drop(map);
+
+    match outcome {
+        Some(Decrypted::Ok {
+            node_id: Some(node_id),
+            payload,
+        }) => {
+            // Dispatch to the PeerManager so callers can receive UDP messages.
+            // (The peer_manager UDP receive API is defined in peer_manager.rs.)
+            if let Ok(payload_text) = std::str::from_utf8(&payload) {
+                if let Some(message) = Message::from_json(payload_text) {
+                    let disposition = crate::network::delivery::process_incoming_message(
+                        peer_manager,
+                        local_node_id,
+                        Some(node_id.as_str()),
+                        message,
+                    )
+                    .await;
+
+                    match disposition {
+                        crate::network::delivery::IncomingMessageDisposition::Consumed => {}
+                        crate::network::delivery::IncomingMessageDisposition::Dispatch(
+                            messages,
+                        ) => {
+                            for message in messages {
+                                plugin_manager.dispatch_message(&message).await;
+                            }
+                        }
+                    }
+                    return;
+                }
+            }
+
+            peer_manager.dispatch_udp_payload(&node_id, &payload).await;
         }
-        // Frames arriving for a still-Handshaking session by session-ID prefix are dropped.
+        Some(Decrypted::Ok { node_id: None, .. }) => {}
+        Some(Decrypted::Err(e)) => {
+            crate::network::events::emit_network_event(
+                "udp_listener",
+                crate::events::model::LogLevel::Warn,
+                "udp_decrypt_failed",
+                Some(src.to_string()),
+                Some(format!("session={} err={}", hex::encode(session_id), e)),
+                false,
+            );
+        }
+        None => {}
     }
 }
 
@@ -664,4 +692,152 @@ async fn reap_sessions(sessions: &UdpSessions) {
 pub fn load_static_key() -> std::io::Result<(Vec<u8>, Vec<u8>)> {
     let key_path = std::path::Path::new("pki/noise/static.key");
     load_or_generate_static_keypair(key_path)
+}
+
+// ─── Tests ──────────────────────────────────────────────────────────────────────
+
+#[cfg(all(test, feature = "noise"))]
+mod tests {
+    use super::*;
+    use crate::network::message::MessageType;
+    use crate::network::peer_manager::PeerManager;
+    use crate::network::peer_store::PeerStore;
+    use crate::plugin_host::{Plugin, PluginContext, PluginManager, PluginRegistrar};
+    use async_trait::async_trait;
+
+    fn generate_noise_private_key() -> Vec<u8> {
+        let params: snow::params::NoiseParams =
+            "Noise_XX_25519_ChaChaPoly_BLAKE2s".parse().unwrap();
+        snow::Builder::new(params)
+            .generate_keypair()
+            .unwrap()
+            .private
+    }
+
+    /// Run a full in-memory Noise XX handshake between two sessions sharing the same
+    /// `session_id`, returning (local_view, remote_view) both `Established`.
+    fn establish_pair(
+        local_addr: SocketAddr,
+        remote_addr: SocketAddr,
+        remote_node_id: &str,
+        local_node_id: &str,
+    ) -> (NoiseUdpSession, NoiseUdpSession) {
+        let local_key = generate_noise_private_key();
+        let remote_key = generate_noise_private_key();
+
+        let (mut local, msg1) =
+            NoiseUdpSession::new_initiator(remote_addr, &local_key).expect("initiator");
+        let (mut remote, msg2) = NoiseUdpSession::new_responder(
+            local.session_id,
+            local_addr,
+            &msg1,
+            &remote_key,
+            remote_node_id,
+        )
+        .expect("responder");
+        let msg3 = local
+            .advance_handshake(&msg2, Some(local_node_id))
+            .expect("advance initiator")
+            .expect("initiator must produce msg3");
+        assert!(remote
+            .advance_handshake(&msg3, None)
+            .expect("advance responder")
+            .is_none());
+
+        assert!(local.is_established());
+        assert!(remote.is_established());
+        (local, remote)
+    }
+
+    /// Plugin that answers every message by replying to `target_node_id` over UDP,
+    /// re-entering `send_udp` on the same `sessions` map used by `handle_session_frame`.
+    struct ReplyingPlugin {
+        target_node_id: String,
+    }
+
+    #[async_trait]
+    impl Plugin for ReplyingPlugin {
+        async fn on_message(&self, _message: &Message, ctx: &PluginContext) {
+            let _ = ctx
+                .peer_manager
+                .send_udp_message_to_node(&self.target_node_id, b"pong")
+                .await;
+        }
+    }
+
+    /// Regression test for the sessions-lock reentrancy deadlock: a plugin replying
+    /// over UDP from inside `on_message` must not hang `handle_session_frame`, which
+    /// would otherwise freeze UDP receive processing for every peer on the node.
+    #[tokio::test]
+    async fn handle_session_frame_does_not_deadlock_when_plugin_replies_over_udp() {
+        let local_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let remote_addr: SocketAddr = "127.0.0.1:2".parse().unwrap();
+        let remote_node_id = "remote-peer";
+        let local_node_id = "local-node";
+
+        let (local_session, mut remote_session) =
+            establish_pair(local_addr, remote_addr, remote_node_id, local_node_id);
+        let session_id = local_session.session_id;
+
+        let sessions: UdpSessions = Arc::new(Mutex::new(HashMap::new()));
+        sessions.lock().await.insert(session_id, local_session);
+
+        // Encrypt an inbound message as the remote peer would, addressed to us.
+        let inbound = Message::new(
+            remote_node_id,
+            local_node_id,
+            MessageType::Heartbeat,
+            None,
+            None,
+        );
+        let plaintext = inbound.as_json();
+        let mut ciphertext = vec![0u8; plaintext.len() + 64];
+        let n = remote_session
+            .encrypt(plaintext.as_bytes(), &mut ciphertext)
+            .expect("encrypt");
+        ciphertext.truncate(n);
+        let datagram = build_session_frame(&session_id, &ciphertext);
+
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let peer_manager = PeerManager::new();
+        peer_manager
+            .set_udp_handle(socket, sessions.clone(), generate_noise_private_key())
+            .await;
+        peer_manager
+            .set_udp_session_id(remote_node_id, session_id)
+            .await;
+
+        let ctx = PluginContext::new(
+            Arc::new(peer_manager.clone()),
+            PeerStore::new(),
+            crate::events::dispatcher::handle(),
+            local_node_id.to_string(),
+            crate::config::Config::default(),
+            false,
+        );
+        let mut plugin_manager = PluginManager::with_context(ctx);
+        plugin_manager.register_handler(Box::new(ReplyingPlugin {
+            target_node_id: remote_node_id.to_string(),
+        }));
+        let plugin_manager = Arc::new(plugin_manager);
+
+        // Bound the regression test so a sessions-lock reentrancy bug fails promptly
+        // instead of hanging the test suite.
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            handle_session_frame(
+                &datagram,
+                remote_addr,
+                &sessions,
+                &peer_manager,
+                &plugin_manager,
+                local_node_id,
+            ),
+        )
+        .await
+        .expect(
+            "handle_session_frame must not deadlock when a plugin replies over UDP \
+             from on_message",
+        );
+    }
 }

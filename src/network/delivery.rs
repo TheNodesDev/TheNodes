@@ -318,7 +318,19 @@ impl DeliveryRuntime {
         options: &DeliveryOptions,
         relay_sequence: Option<u64>,
     ) -> Result<(), DeliveryOutcome> {
-        match self.select_route(&message.to, options).await? {
+        let route = self.select_route(&message.to, options).await?;
+        let health_route = match &route {
+            DeliveryRoute::Connected | DeliveryRoute::DirectTcp { .. } => {
+                (message.to.clone(), crate::network::RouteKind::Tcp)
+            }
+            DeliveryRoute::Udp | DeliveryRoute::Punch { .. } => {
+                (message.to.clone(), crate::network::RouteKind::Udp)
+            }
+            DeliveryRoute::Relay { relay_node_id } => {
+                (relay_node_id.clone(), crate::network::RouteKind::Relay)
+            }
+        };
+        let result = match route {
             DeliveryRoute::Connected => self
                 .peer_manager
                 .send_to_node_id(&message.to, message.as_json())
@@ -355,7 +367,17 @@ impl DeliveryRuntime {
                 self.dispatch_via_hole_punch(&relay_node_id, message, timeout)
                     .await
             }
+        };
+        if result.is_ok() {
+            self.peer_manager
+                .mark_route_success(&health_route.0, health_route.1)
+                .await;
+        } else {
+            self.peer_manager
+                .mark_route_failure(&health_route.0, health_route.1)
+                .await;
         }
+        result
     }
 
     async fn select_route(
@@ -386,11 +408,16 @@ impl DeliveryRuntime {
                 });
         }
 
-        if self.peer_manager.has_node_id(target_node_id).await {
-            return Ok(DeliveryRoute::Connected);
-        }
-
         if matches!(preferred_transport, Some(DeliveryTransportPreference::Tcp)) {
+            if self.peer_manager.has_node_id(target_node_id).await
+                && self
+                    .peer_manager
+                    .route_health(target_node_id, crate::network::RouteKind::Tcp)
+                    .await
+                    != crate::network::RouteHealth::Unresponsive
+            {
+                return Ok(DeliveryRoute::Connected);
+            }
             return self
                 .peer_manager
                 .tcp_listen_addr_for(target_node_id)
@@ -657,8 +684,59 @@ pub fn unwrap_tunneled_message(message: &Message, local_node_id: &str) -> Option
 pub async fn process_incoming_message(
     peer_manager: &PeerManager,
     local_node_id: &str,
+    // The node_id actually bound to the connection/session this message arrived on
+    // (TCP: `PeerManager::node_id_for_addr`; UDP: the Noise session's verified peer),
+    // as opposed to `message.from`, which is attacker-controlled application payload.
+    // `None` for paths that cannot establish a verified identity (e.g. handshake-only).
+    verified_sender: Option<&str>,
     message: Message,
 ) -> IncomingMessageDisposition {
+    // Only credit liveness/health for the connection that actually delivered the
+    // message. Trusting `message.from` unconditionally would let any connected peer
+    // (or a multi-hop relayed message) spoof another peer's `from` field and keep that
+    // peer's liveness deadline refreshed indefinitely, masking a real disconnect and
+    // defeating the ADR-0007 liveness monitor.
+    let sender_verified = verified_sender == Some(message.from.as_str());
+    if sender_verified {
+        peer_manager
+            .record_peer_activity_on_preferred_route(&message.from)
+            .await;
+    }
+
+    if matches!(message.msg_type, MessageType::Heartbeat) {
+        match &message.payload {
+            Some(Payload::Text(kind)) if kind == "liveness_probe_v1" => {
+                if sender_verified {
+                    let response = Message::new(
+                        local_node_id,
+                        &message.from,
+                        MessageType::Heartbeat,
+                        Some(Payload::Text("liveness_response_v1".to_string())),
+                        message.realm.clone(),
+                    );
+                    if peer_manager.has_node_id(&message.from).await {
+                        let _ = peer_manager
+                            .send_to_node_id(&message.from, response.as_json())
+                            .await;
+                    } else if peer_manager
+                        .udp_session_id_for(&message.from)
+                        .await
+                        .is_some()
+                    {
+                        let _ = peer_manager
+                            .send_udp_message_to_node(&message.from, response.as_json().as_bytes())
+                            .await;
+                    }
+                }
+                return IncomingMessageDisposition::Consumed;
+            }
+            Some(Payload::Text(kind)) if kind == "liveness_response_v1" => {
+                return IncomingMessageDisposition::Consumed;
+            }
+            _ => {}
+        }
+    }
+
     if let MessageType::DeliveryAck { message_id, .. } = &message.msg_type {
         let message_id = MessageId::from(message_id.clone());
         peer_manager
@@ -939,8 +1017,11 @@ mod tests {
             .with_delivery(DeliveryMetadata::new(DeliveryClass::Reliable))
             .expect("valid delivery metadata");
 
-        let first = process_incoming_message(&peer_manager, "node-b", message.clone()).await;
-        let second = process_incoming_message(&peer_manager, "node-b", message).await;
+        let first =
+            process_incoming_message(&peer_manager, "node-b", Some("node-a"), message.clone())
+                .await;
+        let second =
+            process_incoming_message(&peer_manager, "node-b", Some("node-a"), message).await;
 
         assert!(matches!(first, IncomingMessageDisposition::Dispatch(_)));
         assert!(matches!(second, IncomingMessageDisposition::Consumed));
@@ -970,8 +1051,10 @@ mod tests {
         )
         .expect("valid ordered metadata");
 
-        let buffered = process_incoming_message(&peer_manager, "node-b", second).await;
-        let released = process_incoming_message(&peer_manager, "node-b", first).await;
+        let buffered =
+            process_incoming_message(&peer_manager, "node-b", Some("node-a"), second).await;
+        let released =
+            process_incoming_message(&peer_manager, "node-b", Some("node-a"), first).await;
 
         assert!(matches!(buffered, IncomingMessageDisposition::Consumed));
         match released {
@@ -1158,9 +1241,10 @@ mod tests {
             )
             .expect("valid ordered metadata");
 
-        let _ = process_incoming_message(&peer_manager, "node-b", third).await;
-        let _ = process_incoming_message(&peer_manager, "node-b", second).await;
-        let released = process_incoming_message(&peer_manager, "node-b", first).await;
+        let _ = process_incoming_message(&peer_manager, "node-b", Some("node-a"), third).await;
+        let _ = process_incoming_message(&peer_manager, "node-b", Some("node-a"), second).await;
+        let released =
+            process_incoming_message(&peer_manager, "node-b", Some("node-a"), first).await;
 
         match released {
             IncomingMessageDisposition::Dispatch(messages) => assert_eq!(messages.len(), 1),

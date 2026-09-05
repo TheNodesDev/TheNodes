@@ -2,11 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
-The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project adheres to [Semantic Versioning](https://semver.org/) once the first public release is cut.
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-05
+
 ### Breaking
+- **Security/API**: `make_secure_channel` now returns a `Result`. Selecting Noise without the compiled `noise` feature returns an error instead of falling back to plaintext; inbound and outbound connection paths propagate or log the failure.
+- **MSRV**: Raised the minimum supported Rust version from 1.74 to 1.83 to support the existing version 4 lockfile and locked dependencies. The minimum is now declared in `Cargo.toml` and checked in CI with default and all features.
 - **Plugin API/ABI**: `Plugin::on_message` and `PluginManager::dispatch_message` are now async, and `PLUGIN_ABI_VERSION` is now 2. Plugins must update `on_message` to `async fn` and rebuild before loading.
 - **API**: `PluginContext` is now constructed via `PluginContext::new(...)` and carries local node identity, runtime config, console-permission state, and an async plugin-manager handle for framework-owned delivery.
 - **Wire protocol**: `HELLO` now includes optional `udp_listen_addr` and `udp_observed_addr` fields for UDP transport and NAT-traversal metadata exchange.
@@ -52,6 +56,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ### Fixed
 - `PluginManager::dispatch_message` now bounds each plugin's `on_message` call with a timeout so a single slow or hung plugin cannot indefinitely stall dispatch to other plugins or the connection's read loop; a `plugin_dispatch_timeout` system event is emitted when the bound is hit.
+- The template generator now gives NEP plugins build and deployment instructions instead of suggesting that a library crate be run directly.
+- The custom-host template now uses standard-library Unix timestamps, keeping all generated dependencies within the release-seeded Rust 1.83-compatible graph.
 
 ### Docs
 - Documented async plugin message handling, extension-kind subscriptions, and the decision to keep plugin storage owned by plugins rather than adding a generic core storage API.
@@ -75,6 +81,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - Added inline unit tests for UDP capability advertisement and `udp_hello_addr()` gating by feature flag and config.
 - Added `tests/connection_lifecycle.rs` covering heartbeat liveness monitoring, automatic reconnect with backoff, route-health tracking, spoofed-sender heartbeat rejection, and sticky `Unresponsive` route health.
 - Updated peer store tests to account for the expanded `NetworkConfig` shape.
+- CI now tests the standalone plugin example and verifies that every generated template is formatted and builds on Rust 1.83, including a repeat build with the reconciled lockfile.
 
 
 ## [0.2.0] - 2026-02-28

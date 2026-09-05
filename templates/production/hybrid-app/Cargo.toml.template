@@ -2,10 +2,11 @@
 name = "{{APP_NAME}}"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.83"
 description = "{{APP_DESCRIPTION}}"
 
 [dependencies]
-thenodes = { path = "../../" }
+thenodes = { version = "0.3.0", path = "../../" }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }

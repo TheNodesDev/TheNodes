@@ -66,13 +66,13 @@ Network ←→ TheNodes Framework ←→ Your Business Logic
 
 1. Define your message types in `business_logic.rs`:
    ```rust
-   MessageType::Custom("my_message_type".to_string())
+   MessageType::Extension { kind: "my_message_type".to_string() }
    ```
 
 2. Handle them in `handle_network_message()`:
    ```rust
-   match message.msg_type {
-       MessageType::Custom(ref msg_type) if msg_type == "my_message_type" => {
+   match &message.msg_type {
+      MessageType::Extension { kind } if kind == "my_message_type" => {
            // Handle your message
        }
        _ => { /* ... */ }

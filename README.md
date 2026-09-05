@@ -8,14 +8,18 @@ Repository: https://github.com/TheNodesDev/TheNodes
 
 ## Install
 
+TheNodes 0.3.0 requires Rust 1.83 or newer.
+
 Add to your Cargo.toml:
 
 ```toml
 [dependencies]
-thenodes = "0.2.0"
+thenodes = "0.3.0"
 ```
 
-This guide targets version 0.2.0.
+This guide targets version 0.3.0.
+
+Dynamic plugins must use the same TheNodes release as the host because 0.3.0 uses plugin ABI version 2. Pin plugin dependencies to `thenodes = "=0.3.0"` when reproducible ABI matching is required.
 
 ## What Is TheNodes?
 
@@ -24,6 +28,8 @@ TheNodes is a modular, async-first peer-to-peer (P2P) node framework. It supplie
 ### Core Value Proposition
 - Reuse a battle-tested networking + trust substrate instead of re‑inventing sockets, identity, and message routing.
 - Isolate your domain code into loadable plugins for easier upgrades, selective deployment, and cleaner boundaries.
+- Select among direct TCP, UDP + Noise, relay, and relay-coordinated UDP hole punching through framework-owned connection policy.
+- Choose explicit fire-and-forget, reliable, or ordered-reliable delivery semantics instead of implementing retries and deduplication in every application.
 - Optionally host multiple distinct realms (each a discrete, durable network) side‑by‑side with one binary for development, testing, or specialized gateway nodes. (In normal production operation a node process commits to a single realm for its lifetime; a realm name is analogous to a public network identity like a "mainnet" label and is not something nodes hop between.)
 - Gain structured events (JSONL) for auditing, metrics, and security introspection.
 
@@ -59,27 +65,11 @@ If your requirement is only basic request/response between a few services, a sim
 This reference implementation is written in Rust to leverage strong compile-time guarantees, memory safety without GC, and an async ecosystem (Tokio) well-suited for high concurrency. Other implementations (different languages or specialized runtime targets) are welcome and encouraged; the architectural concepts—realms, message types, plugin-driven extension—are intentionally portable.
 
 ### High-Level Architecture
-```
- +-------------------+            +--------------------+
- |   Plugin A        |            |    Plugin B        |
- +---------+---------+            +----------+---------+
-     |                                 |
-     v                                 v
-   +----------+    events/logs      +-----------+
-   | Plugin   |<------------------->| Event /   |
-   | Host     |                     | Dispatch  |
-   +----+-----+                     +-----------+
-     | network API
-     v
-   +----------+   TLS / Trust   +-----------+
-   | Transport|<--------------->| Security  |
-   +----+-----+                 +-----------+
-     |
-     v
-   +----------+
-   |  Peers   |
-   +----------+
-```
+![TheNodes 0.3.0 high-level architecture](docs/architecture.svg)
+
+The editable diagram source is available in [Mermaid format](docs/architecture.mmd).
+
+Outbound traffic uses the delivery layer and connection policy to select TCP, UDP, or relay. Inbound traffic is authenticated and decoded by its transport, processed by the delivery layer, and asynchronously dispatched to subscribed plugins. Configuration, realm checks, trust policy, peer state, and structured events are framework-owned concerns shared across these paths.
 
 ### Design Principles
 - Async-first (non-blocking everywhere it matters).
@@ -97,16 +87,20 @@ TheNodes/
 ├── CHANGELOG.md                   # Changelog (Keep a Changelog format)
 ├── STABILITY.md                   # Declared stability surface
 ├── CONTRIBUTING.md                # Contribution guidelines
-├── config/                        # Example configs + (optional) pki layout
-│   └── config.toml
+├── config/                        # Example node configurations
+│   └── example.toml
 ├── pki/                           # Runtime PKI material (own/trusted/observed)
 │   ├── own/
 │   ├── trusted/
 │   ├── observed/
+│   ├── rejected/
 │   └── issuers/                   # (optional, may be empty)
 ├── data/                          # Node state directories (node_id persistence)
 ├── logs/                          # JSONL audit/event logs
 ├── src/
+│   ├── bin/
+│   │   ├── thenodes-cert.rs       # Self-signed certificate helper
+│   │   └── thenodes-ctl.rs        # Offline trust and certificate administration
 │   ├── lib.rs                     # Library entry point (CAL mode)
 │   ├── main.rs                    # Standalone host binary (NEP mode)
 │   ├── prelude.rs                 # Curated stable-intent exports
@@ -122,14 +116,20 @@ TheNodes/
 │   ├── network/                   # P2P networking & discovery
 │   │   ├── mod.rs
 │   │   ├── bootstrap.rs
+│   │   ├── connection.rs          # Path selection and connection lifecycle policy
+│   │   ├── delivery.rs            # Delivery classes, retries, ACKs, ordering
+│   │   ├── events.rs              # Internal network event helpers
 │   │   ├── listener.rs
 │   │   ├── peer.rs
 │   │   ├── peer_manager.rs
 │   │   ├── peer_store.rs
 │   │   ├── message.rs
+│   │   ├── nat_traversal.rs       # Observation and UDP hole-punch coordination
 │   │   ├── protocol.rs
 │   │   ├── relay.rs               # Relay node handlers (bind, forward, unbind)
-│   │   └── transport.rs
+│   │   ├── transport.rs
+│   │   ├── udp_listener.rs        # Feature-gated UDP + Noise listener
+│   │   └── udp_session.rs         # TNCF framing and Noise UDP sessions
 │   ├── plugin_host/               # Dynamic plugin loading & orchestration
 │   │   ├── mod.rs
 │   │   ├── loader.rs
@@ -154,19 +154,36 @@ TheNodes/
 ├── plugins/                       # Deployed runtime plugin artifacts (.so/.dylib/.dll)
 │   └── libkvstore_plugin.so
 ├── tests/                         # Integration / behavioral tests
+│   ├── connection_lifecycle.rs
+│   ├── connection_policy.rs
+│   ├── delivery_semantics.rs
 │   ├── mtls.rs
+│   ├── nat_traversal.rs
 │   ├── node_id_uniqueness.rs
 │   ├── pins.rs
+│   ├── plugin_dispatch.rs
 │   ├── promotion_event.rs
-│   └── trust_policy.rs
-├── docs/                          # Design / security plans
+│   ├── trust_policy.rs
+│   └── udp_transport.rs
+├── docs/                          # Architecture, guides, security, and releases
+│   ├── architecture.mmd           # Editable Mermaid architecture source
+│   ├── architecture.svg           # Rendered architecture diagram
+│   ├── EVENTS_RELIABILITY_AND_CONSENSUS_PLAN.md
+│   ├── PLUGIN_AUTHORING.md
+│   ├── PLUGIN_STORAGE_DECISION.md
 │   ├── SECURITY.md
 │   ├── SECURITY_TRUST_POLICY_PLAN.md
-│   ├── EVENTS_RELIABILITY_AND_CONSENSUS_PLAN.md
+│   ├── releases/                  # Release-note standard and published notes
+│   │   ├── README.md
+│   │   └── v0.3.0.md
 │   └── adr/                       # Architecture Decision Records
 │       ├── 0001-secure-channel-abstraction.md
 │       ├── 0002-persistent-peer-store.md
-│       └── 0003-relay-nodes.md
+│       ├── 0003-relay-nodes.md
+│       ├── 0004-udp-noise-transport.md
+│       ├── 0005-nat-traversal-and-connection-policy.md
+│       ├── 0006-delivery-semantics-and-reliability-model.md
+│       └── 0007-connection-lifecycle-policy.md
 └── README.md
 ```
 
@@ -174,7 +191,9 @@ TheNodes/
 
 - **Node-Embedded Plugins (NEP):** Main binary hosts plugins for app logic.
 - **Core-as-a-Library (CAL):** Node logic as a reusable library.
-- **Realms:** Logical isolation domains; nodes must share a realm (and optionally version/capabilities) to fully interact.
+- **Realms:** Logical isolation domains; nodes must have matching canonical realm codes and versions to interact.
+- **Connection policy:** Framework-owned selection among direct TCP, direct UDP, hole punching, and relay routes.
+- **Delivery semantics:** Fire-and-forget, reliable, and ordered-reliable message delivery with stable message IDs and runtime-scoped deduplication.
 
 ## Distribution Model (Both Modes)
 
@@ -189,14 +208,14 @@ my-app/
 ├── config/
 │   └── app.toml
 └── my-plugin-src/        # Separate plugin development project
-    ├── Cargo.toml        # Depends on thenodes = "0.2.0" for Plugin trait
+    ├── Cargo.toml        # Depends on thenodes = "0.3.0" for Plugin trait
     └── src/lib.rs        # Your plugin code
 ```
 
 **CAL Mode:**
 ```
 my-app/
-├── Cargo.toml            # Lists thenodes = "0.2.0" as dependency
+├── Cargo.toml            # Lists thenodes = "0.3.0" as dependency
 ├── src/
 │   └── main.rs           # Your app using TheNodes APIs  
 └── config/
@@ -248,19 +267,100 @@ CAL Mode Note: When embedding as a library, you *may* still internally structure
   ```
 - **Run with config:**
   ```sh
-  cargo run --bin thenodes -- --config config/myconfig.toml
+  cargo run --bin thenodes -- --config config/example.toml
   ```
 - **Prompt mode:**
   ```sh
-  cargo run --bin thenodes -- --config config/myconfig.toml --prompt
+  cargo run --bin thenodes -- --config config/example.toml --prompt
   ```
   In prompt mode you can type `version` (or `about`) to display the running application version, protocol version, git commit (if embedded), and build timestamp.
 
+## Networking and Delivery in 0.3.0
+
+Version 0.3.0 adds optional UDP + Noise transport, policy-driven route selection, NAT traversal, connection lifecycle monitoring, and framework-owned delivery semantics. Existing configurations remain valid because these sections are optional and default conservatively.
+
+### UDP + Noise Transport
+
+UDP transport is opt-in and requires the `noise` Cargo feature:
+
+```sh
+cargo build --release --features noise
+```
+
+```toml
+[network.udp]
+enabled = true
+listen_port = 50002          # Defaults to the TCP port + 1
+max_datagram_bytes = 1200    # Maximum supported value
+max_app_payload_bytes = 1176 # Maximum supported value
+```
+
+The UDP listener uses Noise XX sessions and TNCF control frames. When enabled, HELLO can include optional UDP listen and observed addresses, and the framework tracks UDP sessions independently of mutable network paths.
+
+### Connection Policy and Lifecycle
+
+Connection policy chooses routes and owns heartbeat, route-health, and automatic reconnect behavior:
+
+```toml
+[network.connection_policy]
+strategy = "direct_then_relay"
+direct_tcp_timeout_ms = 3000
+direct_udp_timeout_ms = 1000
+punch_timeout_ms = 5000
+heartbeat_interval_ms = 30000
+heartbeat_timeout_ms = 90000
+reconnect_base_delay_ms = 1000
+reconnect_multiplier = 2.0
+reconnect_max_delay_ms = 60000
+reconnect_max_attempts = 8
+reconnect_jitter_ratio = 0.2
+```
+
+Supported strategies are `direct_only`, `direct_then_relay` (default), `direct_then_udp_then_relay`, `direct_then_punch_then_relay`, and `relay_only`. Active routes are tracked as unknown, healthy, suspect, or unresponsive. Known TCP peers can be reconnected with bounded exponential backoff and jitter.
+
+### NAT Traversal
+
+NAT traversal uses the same UDP socket as the Noise transport. It performs observed-address discovery and can coordinate UDP hole punching through an authenticated relay or rendezvous peer. Hole punching is best-effort; relay remains the fallback for networks where direct UDP is unavailable.
+
+```toml
+[network.nat_traversal]
+enabled = false
+serve = false
+refresh_secs = 300
+cookie_ttl_secs = 30
+probe_count = 6
+probe_interval_ms = 100
+```
+
+Enabling traversal requires `[network.udp].enabled = true` and a build with the `noise` feature. Serving observation and punch coordination additionally requires `[network.relay].enabled = true`.
+
+### Delivery Semantics
+
+The delivery layer provides three classes:
+
+- `FireAndForget`: succeeds when the local framework accepts the message for transmission; no remote acknowledgement is required.
+- `Reliable`: uses a stable UUID v7 message ID, framework acknowledgements, retries, and duplicate suppression.
+- `OrderedReliable`: adds ordering within a required caller-supplied ordering key.
+
+Plugins send through `PluginContext::deliver_message(...)` or `PluginContext::send_message(...)` with `DeliveryOptions`. Delivery state, deduplication, retries, and ordering are scoped to the current process lifetime; 0.3.0 does not promise durable delivery across restarts.
+
+```toml
+[network.delivery]
+fire_and_forget_timeout_ms = 1000
+reliable_timeout_ms = 5000
+ordered_reliable_timeout_ms = 10000
+reliable_retry_budget = 3
+ordered_reliable_retry_budget = 3
+dedup_window_secs = 3600
+ordered_max_buffered_messages = 1024
+retry_interval_ms = 500
+```
+
 ## Security
 
-Security by design and secure by default.
+Security controls are explicit and configurable. Network encryption is off by default and must be enabled for production deployments.
 
-- Production templates and examples enable TLS by default and recommend mTLS with a restrictive trust policy (allowlist/pins) for production.
+- Production templates enable TLS by default and recommend mTLS with a restrictive trust policy (allowlist/pins) for production.
 - The runtime default remains configurable; if `encryption.enabled = false`, transport is plaintext (suitable for local/development only).
 - Read the full guidance and PKI layout in `docs/SECURITY.md`.
 
@@ -286,17 +386,11 @@ Configuration example:
 [encryption]
 enabled = true
 backend = "noise"    # or "tls" (default) or "none"
-
-# Noise-specific settings (optional)
-[encryption.noise]
-pattern = "XX"           # Handshake pattern
-curve = "25519"          # Key exchange curve
-cipher = "ChaChaPoly"    # Symmetric cipher
-hash = "BLAKE2s"         # Hash function
-# static_key_path = "pki/own/noise_static.key"  # Optional static key for identity
 ```
 
-When `backend = "noise"` but the `noise` feature is not compiled in, TheNodes falls back to plaintext with a warning.
+The 0.3.0 Noise implementation uses `Noise_XX_25519_ChaChaPoly_BLAKE2s`. The fields under `[encryption.noise]` are reserved for future backend configurability and do not select alternative algorithms in this release.
+
+When `backend = "noise"` but the `noise` feature is not compiled in, secure-channel creation fails with an explicit error. Connections are rejected without falling back to plaintext. Build with `--features noise` to use this backend.
 
 ### TLS & Trust Policy (Overview)
 TheNodes supports optional TLS. When disabled, traffic is plaintext (development / controlled environments). When TLS is enabled, the `[encryption.trust_policy]` `mode` controls how peer certificates are evaluated. The currently implemented modes behave as follows:
@@ -341,7 +435,7 @@ Operational notes:
 - Certificate rotations require updating pins first to avoid availability loss.
 - If any subject-based constraint (pins or realm binding) is active and the subject cannot be parsed, the connection is currently rejected (future soft-fail option planned).
 
-Roadmap (selected upcoming): full CA path validation, real time validity enforcement, `ca` / `hybrid` modes, JSON audit logs, CRL/OCSP integration, hot reloadable pin sets, CLI utilities for promotion & pin generation.
+Roadmap (selected upcoming): full CA path validation, real time validity enforcement, `ca` / `hybrid` modes, CRL/OCSP integration, and hot reloadable pin sets.
 
 See `SECURITY_TRUST_POLICY_PLAN.md` for detailed status.
 
@@ -378,7 +472,7 @@ Operational tips:
 - Populate `trusted_cert_dir` before switching to `allowlist` + mTLS or connections will be rejected.
 - Missing client cert (on outbound) logs a warning and falls back to one-way TLS; inbound without a cert is rejected when mTLS is enabled.
 
-Future phases will add CA / hybrid chain validation and pinning without changing the `mtls` flag semantics.
+Future phases will add full CA / hybrid chain validation without changing the `mtls` flag semantics.
 
 ### Logging / Events Configuration
 Add an optional `[logging]` section to control event sinks:
@@ -460,6 +554,7 @@ Plugins can capture events (for metrics, forwarding, alerting) by registering a 
 Minimal sink pattern:
 ```rust
 use thenodes::events::{sink::LogSink, model::LogEvent};
+use thenodes::plugin_host::PluginContext;
 use async_trait::async_trait;
 use std::sync::Arc;
 
@@ -474,8 +569,8 @@ impl LogSink for MetricsSink {
   }
 }
 
-fn register(ctx: &mut PluginContext) {
-  ctx.events().register_sink(Arc::new(MetricsSink));
+fn register(ctx: &PluginContext) {
+  ctx.events.register_sink(Arc::new(MetricsSink));
 }
 ```
 
@@ -483,10 +578,10 @@ Emitting a plugin-defined event:
 ```rust
 use thenodes::events::{dispatcher, model::{LogEvent, SystemEvent, LogLevel}};
 let meta = dispatcher::meta("plugin.example", LogLevel::Info);
-ctx.events().emit(LogEvent::System(SystemEvent { meta, action: "started".into(), detail: None }));
+ctx.events.emit(LogEvent::System(SystemEvent { meta, action: "started".into(), detail: None }));
 ```
 
-Roadmap additions: policy checksum embedding, metrics sink example crate, CLI-driven promotion with explicit operator tagging, richer trust audit tooling.
+Roadmap additions: a metrics sink example crate, explicit operator tagging for CLI-driven promotion, and richer trust audit tooling.
 
 ## Relay Nodes
 
@@ -623,10 +718,11 @@ Think of a realm name as the identity of an entire logical network. A node insta
 Production guidance: pick a concise, stable realm name early (e.g., `prod-messaging`), evolve semantics via capabilities and version numbers, and avoid churn in the name itself. If you truly need a clean‑slate incompatible environment with different trust roots or business purpose, create a **new** realm name and deploy a separate set of node processes.
 
 ### Components
-- Name / ID (primary discriminator)
-- Version (coordinate breaking protocol evolution)
-- Capabilities (future optional feature negotiation)
+- Name and canonical code (primary discriminator)
+- Version (coordinates breaking protocol evolution)
 - Handshake validation logic
+
+Peer capabilities are separate HELLO metadata used by connection policy and routing. In 0.3.0 the framework advertises configured support for relay, UDP, punching, and punch rendezvous.
 
 ### Example Realm Catalog
 | Realm              | Purpose                                 | Notes |
@@ -643,14 +739,13 @@ Production guidance: pick a concise, stable realm name early (e.g., `prod-messag
 [realm]
 name = "prod-messaging"
 version = "1"
-# capabilities = ["kv", "metrics"]  # optional / future
 ```
 
 ### Multi-Realm Deployment
 Run a separate process (or systemd template instance) per realm with distinct config, state directory, and (if TLS) PKI material. Pin binary versions per realm if they diverge.
 
 ### Upgrade Strategy
-1. Add capabilities additively where possible.
+1. Add HELLO capabilities additively where possible.
 2. Deploy dual-compatible version across realm.
 3. Bump `version` only when removing or changing semantics.
 
@@ -663,7 +758,7 @@ Run a separate process (or systemd template instance) per realm with distinct co
 Symptom: Disconnect shortly after handshake; event log may show a mismatch. Checklist:
 1. Compare `[realm].name`.
 2. Check `version` alignment.
-3. Ensure required capabilities overlap.
+3. Check that peers advertise any capabilities required by the selected route.
 4. Confirm correct config file loaded by process.
 
 See `src/realms/realm.rs` for validation logic.
@@ -682,13 +777,15 @@ See `src/realms/realm.rs` for validation logic.
 3. **Run TheNodes:**
    ```sh
    cd ../../
-   cargo run -- --config config.toml
+   cargo run --bin thenodes -- --config config/example.toml
    ```
    The plugin loader will load all plugins from the `plugins/` directory at runtime.
 
 ### Plugin ABI Basics
 
-Plugins are compiled as dynamic libraries that expose a single registration symbol with a C-friendly signature. TheNodes now provides a stable function-table ABI so plugin crates do not rely on Rust-specific calling conventions across the FFI boundary.
+Plugins are compiled as dynamic libraries that expose a single registration symbol with a C-layout function-table boundary. The boundary is explicitly versioned but remains pre-1.0 and can change between TheNodes minor releases.
+
+Version 0.3.0 uses `PLUGIN_ABI_VERSION = 2`. Plugins written for 0.2 must update `Plugin::on_message` to `async fn`, use `async-trait`, and be rebuilt against 0.3.0. Plugins can optionally narrow extension delivery through `subscribed_extension_kinds()`. Custom hosts must construct the expanded context through `PluginContext::new(...)` instead of a struct literal.
 
 - The host exports `thenodes::plugin_host::PluginRegistrarApi` and `PLUGIN_ABI_VERSION`. Plugins receive a raw pointer to this struct when they are loaded.
 - The struct contains only FFI-safe fields (version, opaque context pointer, function pointers). Helper methods convert it into the familiar `PluginRegistrar` behavior inside the host.
@@ -715,7 +812,7 @@ pub unsafe extern "C" fn register_plugin(api: *const PluginRegistrarApi) {
 }
 ```
 
-`PluginRegistrarApi::register_plugin` will return an error if the host and plugin were built against different `PLUGIN_ABI_VERSION` values, making version skew easy to detect during load. Because the ABI is now C-compatible, plugins can be authored in other languages (or with different Rust toolchains) as long as they construct the same function table.
+`PluginRegistrarApi::register_plugin` returns an error if the host and plugin expose different `PLUGIN_ABI_VERSION` values. The current `PluginHandle` carries a Rust trait object, so this is not yet a stable cross-language or arbitrary-toolchain plugin ABI; use matching TheNodes releases and rebuild plugins with the host.
 
 See `docs/PLUGIN_AUTHORING.md` for a complete walkthrough of project setup, registration patterns, testing, and distribution tips.
 

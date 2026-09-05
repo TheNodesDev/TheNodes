@@ -90,7 +90,6 @@ pub async fn start_listener(
 
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::unnecessary_unwrap)]
-#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     stream: TcpStream,
     peer_addr: SocketAddr,
@@ -112,7 +111,19 @@ async fn handle_connection(
     );
 
     let local_addr = stream.local_addr().unwrap();
-    let secure_channel = crate::security::secure_channel::make_secure_channel(&config);
+    let secure_channel = match crate::security::secure_channel::make_secure_channel(&config) {
+        Ok(channel) => channel,
+        Err(error) => {
+            log_network_event(
+                LogLevel::Error,
+                "secure_channel_config_failed",
+                Some(peer_addr.to_string()),
+                Some(error.to_string()),
+                emit_console_errors,
+            );
+            return;
+        }
+    };
     let channel = match secure_channel
         .accept(stream, peer_addr, &our_realm, &config, emit_console_errors)
         .await

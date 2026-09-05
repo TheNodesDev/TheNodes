@@ -13,7 +13,7 @@ templates/
 ├── production/                   # Templates targeting end-user apps
 │   ├── cal-app/                  # CAL: TheNodes as a library
 │   ├── nep-plugin/               # NEP: Plugin crate (dynamic lib: .so/.dylib/.dll)
-│   └── minimal-app/              # Minimal example
+│   └── hybrid-app/               # CAL daemon with NEP plugin loading
 └── development/                  # Templates for framework dev/custom hosts
 	└── custom-host/              # Custom plugin host with interactive prompt
 ```
@@ -29,7 +29,7 @@ templates/
 #### NEP Pattern (two sides)
 - **Plugin crate (production/nep-plugin)**: Build a dynamic library (.so/.dylib/.dll) implementing the Plugin trait; deploy into a host’s `plugins/` folder.
 - **Custom Host (development/custom-host)**: An example host application that loads plugins at runtime and offers an interactive prompt.
-	- Features: interactive commands, tab completion, trust management commands, session management, runtime extensibility.
+	- Features: interactive commands, trust management commands, session management, runtime extensibility.
 
 ### 3. Generator Script Features
 
@@ -43,13 +43,13 @@ The `generate_app.sh` script provides:
 Usage examples:
 ```bash
 # Basic usage
-./generate_app.sh my-chat-app basic-app
+./generate_app.sh my-chat-app cal-app
 
 # With custom settings
-./generate_app.sh my-platform plugin-host-app --realm production-net --output ../projects/
+./generate_app.sh my-platform custom-host --realm production-net --output ../projects/
 
 # Force overwrite
-./generate_app.sh test-app basic-app --force
+./generate_app.sh test-app cal-app --force
 ```
 
 ## Architecture Benefits
@@ -81,15 +81,12 @@ This writes PKI files under `pki/` and prints an SPKI fingerprint you can pin in
 
 ## Template Comparison
 
-| Aspect | basic-app | plugin-host-app |
-|--------|-----------|-----------------|
-| **Complexity** | Low | Medium |
-| **Resource Usage** | Minimal | Moderate |
-| **Extensibility** | Code changes | Runtime plugins |
-| **Learning Curve** | Easy | Medium |
-| **Interactive Mode** | No | Yes (prompt) |
-| **Plugin Support** | No | Yes (custom + TheNodes) |
-| **Best For** | Simple apps | Platforms/Tools |
+| Aspect | cal-app | nep-plugin | hybrid-app | custom-host |
+|--------|---------|------------|------------|-------------|
+| **Complexity** | Low | Medium | High | High |
+| **Extensibility** | Code changes | Host-loaded | Runtime plugins | Runtime plugins + custom commands |
+| **Interactive Mode** | No | Host-dependent | Optional | Optional |
+| **Best For** | Simple apps | Plugin logic | Extensible daemons | Framework development |
 
 ## Key Features
 
@@ -100,7 +97,7 @@ This writes PKI files under `pki/` and prints an SPKI fingerprint you can pin in
 - Comprehensive documentation
 - Input validation and error handling
 
-### CAL Template (basic-app)
+### CAL Template (cal-app)
 - TheNodes library integration
 - Custom business logic framework
 - Network message handling
@@ -114,7 +111,6 @@ This writes PKI files under `pki/` and prints an SPKI fingerprint you can pin in
 	- Provides optional config defaults
 - **Custom host (custom-host)**
 	- Plugin host implementation with interactive command system
-	- Tab completion for core and plugin commands
 	- Trust management commands: list observed/trusted, promote observed → trusted
 	- Message routing and runtime extensibility
 
@@ -149,7 +145,6 @@ This writes PKI files under `pki/` and prints an SPKI fingerprint you can pin in
 ## Future Enhancements
 
 ### Additional Templates
-- **hybrid-app**: Combine CAL + NEP approaches (planned)
 - **microservice-app**: Optimized for microservice deployments (planned)
 - **embedded-app**: Resource-constrained environments (planned)
 
@@ -168,7 +163,7 @@ This writes PKI files under `pki/` and prints an SPKI fingerprint you can pin in
 
 ### When to Use Each Template
 
-**Choose `basic-app` when:**
+**Choose `cal-app` when:**
 - Building a focused P2P application
 - Need minimal resource usage
 - Want direct control over TheNodes integration
@@ -176,12 +171,12 @@ This writes PKI files under `pki/` and prints an SPKI fingerprint you can pin in
 
 **Choose `custom-host` (development) when:**
 - Building an extensible platform or tools
-- Need interactive development/debugging with tab completion
+- Need interactive development/debugging commands
 - Want to support custom plugins at runtime
 
 ### Best Practices
 
-1. **Start Simple**: Begin with `basic-app`, upgrade to `plugin-host-app` if needed
+1. **Start Simple**: Begin with `cal-app`, then move to `hybrid-app` or `custom-host` if runtime plugins are needed
 2. **Custom Realm**: Always use a custom realm name for your network
 3. **Security**: Enable encryption in production environments (default in production templates). Consider mTLS and fingerprint pinning.
 4. **Documentation**: Maintain your custom documentation alongside templates

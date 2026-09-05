@@ -65,7 +65,8 @@ pub async fn connect_to_peer<'a>(
         allow_console,
     );
 
-    let secure_channel = crate::security::secure_channel::make_secure_channel(&config);
+    let secure_channel = crate::security::secure_channel::make_secure_channel(&config)
+        .map_err(|e| -> Box<dyn Error + Send + Sync> { e.into() })?;
     let channel = secure_channel
         .connect(stream, addr, &our_realm, &config, allow_console)
         .await
@@ -400,7 +401,8 @@ pub async fn connect_to_peer_handshake_only(
         allow_console,
     );
 
-    let secure_channel = crate::security::secure_channel::make_secure_channel(config);
+    let secure_channel = crate::security::secure_channel::make_secure_channel(config)
+        .map_err(|e| -> Box<dyn Error + Send + Sync> { e.into() })?;
     let channel = secure_channel
         .connect(stream, addr, &our_realm, config, allow_console)
         .await

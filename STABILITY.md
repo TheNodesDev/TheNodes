@@ -28,13 +28,13 @@ The following are intentionally softened pre‑1.0 (treat as Evolving unless oth
 - `ConfigDefaults` merging heuristics (port detection heuristic may change)
 - Trust policy depth features (pinning, realm binding, CA enforcement flags) beyond simple modes
 - Future `node_type` / role policy engine
-- Heartbeat presence / cadence (currently optional / deferred)
+- Connection lifecycle policy, route-health semantics, and heartbeat cadence
+- Capability names and handshake negotiation semantics
 
 ## Experimental / Planned
 - Data diode (unidirectional) communication policies
-- Reliability tiers (WAL, replay, durability guarantees)
+- Durable reliability tiers (WAL, cross-restart replay, and persistence guarantees)
 - QUIC transport & pluggable crypto layer
-- Capability negotiation during handshake
 
 ## Internal (Not Public API)
 - `peer_store` structure and its method set
@@ -89,7 +89,7 @@ These are practices, not hard guarantees before 1.0:
 - Document stability level in module or item docs (e.g., "Status: Stable‑intent (best‑effort)", "Evolving", "Experimental").
 
 ## Future Formalization
-Before tagging 0.1.0:
+As part of future release planning:
 - Re‑evaluate the declared stable‑intent list and promote items that proved stable in practice.
 - Add a `prelude` test ensuring only stable‑intent items are exported.
 - Provide event action registry documentation.

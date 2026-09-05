@@ -27,7 +27,7 @@ jobs:
       - name: Build
         run: cargo build --workspace --all-targets --locked
       - name: Tests
-        run: cargo test --workspace --all-features -- --nocapture
+        run: cargo test --workspace --all-features --locked -- --nocapture
 
   msrv:
     name: build (MSRV)
@@ -36,8 +36,26 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.74.0
+          toolchain: 1.83.0
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
       - name: Build (locked)
         run: cargo build --workspace --all-targets --locked
+      - name: Build all features (locked)
+        run: cargo build --workspace --all-targets --all-features --locked
+      - name: Tests all features (locked)
+        run: cargo test --workspace --all-features --locked -- --nocapture
+      - name: Check standalone plugin example (locked)
+        run: cargo check --manifest-path examples/kvstore_plugin/Cargo.toml --locked
+      - name: Check generated templates
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target/template-check
+        run: |
+          output_dir="$RUNNER_TEMP/thenodes-template-check"
+          for template in cal-app hybrid-app nep-plugin custom-host; do
+            app_name="ci-${template}"
+            ./templates/generate_app.sh "$app_name" "$template" --output "$output_dir"
+            cargo fmt --manifest-path "$output_dir/$app_name/Cargo.toml" -- --check
+            cargo check --manifest-path "$output_dir/$app_name/Cargo.toml"
+            cargo check --manifest-path "$output_dir/$app_name/Cargo.toml" --locked
+          done

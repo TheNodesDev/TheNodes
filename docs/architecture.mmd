@@ -1,0 +1,28 @@
+flowchart TB
+    config[Config, realm and PKI] --> runtime[TheNodes runtime]
+
+    cal[CAL application] <--> api[Public API]
+    plugins[NEP plugins] <--> host[PluginContext and PluginManager]
+    api --> delivery[Delivery runtime<br/>reliability, deduplication and ordering]
+    host --> delivery
+
+    delivery --> policy[Connection policy]
+    policy <--> state[PeerManager and PeerStore<br/>peers, routes and health]
+
+    policy --> tcp[TCP<br/>TLS, Noise or plaintext]
+    policy --> udp[UDP + Noise<br/>NAT traversal]
+    policy --> relay[Relay<br/>store and forward]
+
+    tcp <--> peers[Remote peers]
+    udp <--> peers
+    relay <--> peers
+
+    tcp --> inbound[Inbound validation,<br/>deduplication and ordering]
+    udp --> inbound
+    relay --> inbound
+    inbound --> host
+
+    runtime -. structured events .-> events[Event dispatcher]
+    delivery -. structured events .-> events
+    state -. structured events .-> events
+    events --> sinks[Console, JSONL and plugin sinks]

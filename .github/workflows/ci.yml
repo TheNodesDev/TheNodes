@@ -52,6 +52,7 @@ jobs:
           CARGO_TARGET_DIR: ${{ github.workspace }}/target/template-check
         run: |
           output_dir="$RUNNER_TEMP/thenodes-template-check"
+          mkdir -p "$output_dir"
           for template in cal-app hybrid-app nep-plugin custom-host; do
             app_name="ci-${template}"
             ./templates/generate_app.sh "$app_name" "$template" --output "$output_dir"

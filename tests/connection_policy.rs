@@ -1,6 +1,7 @@
 use thenodes::config::{ConnectionPolicyConfig, NetworkConfig};
 use thenodes::network::{
     connect_with_policy, ConnectionOutcome, ConnectionPolicy, ConnectionStrategy, PeerManager,
+    RouteKind,
 };
 
 fn make_policy(strategy: &str) -> ConnectionPolicy {
@@ -9,6 +10,7 @@ fn make_policy(strategy: &str) -> ConnectionPolicy {
         direct_tcp_timeout_ms: None,
         direct_udp_timeout_ms: None,
         punch_timeout_ms: None,
+        ..ConnectionPolicyConfig::default()
     })
 }
 
@@ -101,6 +103,55 @@ async fn default_policy_from_config_without_section() {
     assert_eq!(policy.strategy, ConnectionStrategy::DirectThenRelay);
 }
 
+#[test]
+fn reconnect_backoff_progresses_exponentially_and_caps() {
+    let policy = ConnectionPolicy::from_config(&ConnectionPolicyConfig {
+        reconnect_base_delay_ms: Some(100),
+        reconnect_multiplier: Some(2.0),
+        reconnect_max_delay_ms: Some(450),
+        reconnect_jitter_ratio: Some(0.25),
+        ..ConnectionPolicyConfig::default()
+    });
+
+    let delays: Vec<u128> = (1..=5)
+        .map(|attempt| policy.reconnect_delay(attempt, 0.0).as_millis())
+        .collect();
+    assert_eq!(delays, vec![100, 200, 400, 450, 450]);
+    assert_eq!(policy.reconnect_delay(3, -1.0).as_millis(), 300);
+    assert_eq!(policy.reconnect_delay(3, 1.0).as_millis(), 500);
+}
+
+#[tokio::test]
+async fn healthy_relay_is_preferred_over_suspect_direct_route() {
+    let pm = PeerManager::new();
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    pm.add_peer(
+        "127.0.0.1:42001".parse().unwrap(),
+        tx,
+        "relay-node".to_string(),
+    )
+    .await
+    .unwrap();
+    pm.set_peer_capabilities("relay-node", Some(vec!["relay".to_string()]))
+        .await;
+    pm.add_listen_addr("127.0.0.1:42002", "target-node").await;
+    pm.mark_route_failure("target-node", RouteKind::Tcp).await;
+    pm.mark_route_success("relay-node", RouteKind::Relay).await;
+
+    let outcome = connect_with_policy(
+        "target-node",
+        &make_policy("direct_then_relay"),
+        &pm,
+        &minimal_config(),
+    )
+    .await;
+
+    assert!(matches!(
+        outcome,
+        ConnectionOutcome::ViaRelay { relay_node_id } if relay_node_id == "relay-node"
+    ));
+}
+
 #[cfg(feature = "noise")]
 #[tokio::test]
 async fn punch_strategy_uses_fresh_observed_addr_with_rendezvous() {
@@ -121,6 +172,8 @@ async fn punch_strategy_uses_fresh_observed_addr_with_rendezvous() {
     pm.set_peer_capabilities("target-node", Some(vec!["punch".to_string()]))
         .await;
     pm.add_udp_observed_addr("target-node", "203.0.113.10:5001", Some("observer-1"), None)
+        .await;
+    pm.mark_route_unresponsive("target-node", RouteKind::Udp)
         .await;
 
     let policy = make_policy("direct_then_punch_then_relay");

@@ -318,7 +318,19 @@ impl DeliveryRuntime {
         options: &DeliveryOptions,
         relay_sequence: Option<u64>,
     ) -> Result<(), DeliveryOutcome> {
-        match self.select_route(&message.to, options).await? {
+        let route = self.select_route(&message.to, options).await?;
+        let health_route = match &route {
+            DeliveryRoute::Connected | DeliveryRoute::DirectTcp { .. } => {
+                (message.to.clone(), crate::network::RouteKind::Tcp)
+            }
+            DeliveryRoute::Udp | DeliveryRoute::Punch { .. } => {
+                (message.to.clone(), crate::network::RouteKind::Udp)
+            }
+            DeliveryRoute::Relay { relay_node_id } => {
+                (relay_node_id.clone(), crate::network::RouteKind::Relay)
+            }
+        };
+        let result = match route {
             DeliveryRoute::Connected => self
                 .peer_manager
                 .send_to_node_id(&message.to, message.as_json())
@@ -355,7 +367,17 @@ impl DeliveryRuntime {
                 self.dispatch_via_hole_punch(&relay_node_id, message, timeout)
                     .await
             }
+        };
+        if result.is_ok() {
+            self.peer_manager
+                .mark_route_success(&health_route.0, health_route.1)
+                .await;
+        } else {
+            self.peer_manager
+                .mark_route_failure(&health_route.0, health_route.1)
+                .await;
         }
+        result
     }
 
     async fn select_route(
@@ -386,11 +408,16 @@ impl DeliveryRuntime {
                 });
         }
 
-        if self.peer_manager.has_node_id(target_node_id).await {
-            return Ok(DeliveryRoute::Connected);
-        }
-
         if matches!(preferred_transport, Some(DeliveryTransportPreference::Tcp)) {
+            if self.peer_manager.has_node_id(target_node_id).await
+                && self
+                    .peer_manager
+                    .route_health(target_node_id, crate::network::RouteKind::Tcp)
+                    .await
+                    != crate::network::RouteHealth::Unresponsive
+            {
+                return Ok(DeliveryRoute::Connected);
+            }
             return self
                 .peer_manager
                 .tcp_listen_addr_for(target_node_id)
@@ -659,6 +686,42 @@ pub async fn process_incoming_message(
     local_node_id: &str,
     message: Message,
 ) -> IncomingMessageDisposition {
+    peer_manager
+        .record_peer_activity_on_preferred_route(&message.from)
+        .await;
+
+    if matches!(message.msg_type, MessageType::Heartbeat) {
+        match &message.payload {
+            Some(Payload::Text(kind)) if kind == "liveness_probe_v1" => {
+                let response = Message::new(
+                    local_node_id,
+                    &message.from,
+                    MessageType::Heartbeat,
+                    Some(Payload::Text("liveness_response_v1".to_string())),
+                    message.realm.clone(),
+                );
+                if peer_manager.has_node_id(&message.from).await {
+                    let _ = peer_manager
+                        .send_to_node_id(&message.from, response.as_json())
+                        .await;
+                } else if peer_manager
+                    .udp_session_id_for(&message.from)
+                    .await
+                    .is_some()
+                {
+                    let _ = peer_manager
+                        .send_udp_message_to_node(&message.from, response.as_json().as_bytes())
+                        .await;
+                }
+                return IncomingMessageDisposition::Consumed;
+            }
+            Some(Payload::Text(kind)) if kind == "liveness_response_v1" => {
+                return IncomingMessageDisposition::Consumed;
+            }
+            _ => {}
+        }
+    }
+
     if let MessageType::DeliveryAck { message_id, .. } = &message.msg_type {
         let message_id = MessageId::from(message_id.clone());
         peer_manager

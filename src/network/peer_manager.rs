@@ -3,14 +3,18 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
+use std::time::Instant;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::Mutex;
 
 use crate::config::{Config, DeliveryConfig};
+use crate::events::model::LogLevel;
+use crate::network::connection::{ConnectionPolicy, RouteHealth, RouteKind};
 use crate::network::delivery::{DeliveryClass, DeliveryOutcome, MessageId};
-use crate::network::message::Message;
-use crate::network::{Peer, PeerStore};
+use crate::network::events::emit_network_event;
+use crate::network::message::{Message, MessageType, Payload};
+use crate::network::{Peer, PeerSource, PeerStore};
 use crate::plugin_host::manager::PluginManager;
 use crate::realms::RealmInfo;
 
@@ -29,6 +33,33 @@ struct OrderedDeliveryBuffer {
     /// Last time this scope received an in-sequence or buffered message.
     /// Used by `prune_ordered_inbound` to evict stale scopes.
     last_activity: std::time::Instant,
+}
+
+#[derive(Clone, Debug)]
+struct RouteHealthRecord {
+    health: RouteHealth,
+    last_success: Option<Instant>,
+    last_failure: Option<Instant>,
+}
+
+impl Default for RouteHealthRecord {
+    fn default() -> Self {
+        Self {
+            health: RouteHealth::Unknown,
+            last_success: None,
+            last_failure: None,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ConnectionLifecycleRuntime {
+    policy: ConnectionPolicy,
+    config: Config,
+    local_node_id: String,
+    peer_store: PeerStore,
+    plugin_manager: Weak<PluginManager>,
+    allow_console: bool,
 }
 
 /// Which transport is currently preferred for reaching a given peer.
@@ -113,6 +144,12 @@ pub struct PeerManager {
     relay_next_sequence: Arc<Mutex<HashMap<(String, String), u64>>>,
     delivery_dedup_window_secs: Arc<AtomicU64>,
     delivery_ordered_buffer_limit: Arc<AtomicUsize>,
+    route_health: Arc<Mutex<HashMap<(String, RouteKind), RouteHealthRecord>>>,
+    last_peer_activity: Arc<Mutex<HashMap<String, Instant>>>,
+    lifecycle_generations: Arc<Mutex<HashMap<String, u64>>>,
+    next_lifecycle_generation: Arc<AtomicU64>,
+    reconnecting_peers: Arc<Mutex<HashSet<String>>>,
+    lifecycle_runtime: Arc<Mutex<Option<ConnectionLifecycleRuntime>>>,
     // ── UDP transport (ADR-0004) ──────────────────────────────────────────────────
     /// Active transport kind per peer (node_id → TransportKind).
     transport_kind: Arc<Mutex<HashMap<String, TransportKind>>>,
@@ -172,6 +209,12 @@ impl PeerManager {
             relay_next_sequence: Arc::new(Mutex::new(HashMap::new())),
             delivery_dedup_window_secs: Arc::new(AtomicU64::new(3600)),
             delivery_ordered_buffer_limit: Arc::new(AtomicUsize::new(1024)),
+            route_health: Arc::new(Mutex::new(HashMap::new())),
+            last_peer_activity: Arc::new(Mutex::new(HashMap::new())),
+            lifecycle_generations: Arc::new(Mutex::new(HashMap::new())),
+            next_lifecycle_generation: Arc::new(AtomicU64::new(1)),
+            reconnecting_peers: Arc::new(Mutex::new(HashSet::new())),
+            lifecycle_runtime: Arc::new(Mutex::new(None)),
             transport_kind: Arc::new(Mutex::new(HashMap::new())),
             udp_listen_addrs: Arc::new(Mutex::new(HashMap::new())),
             udp_session_ids: Arc::new(Mutex::new(HashMap::new())),
@@ -232,6 +275,36 @@ impl PeerManager {
         self.delivery_ordered_buffer_limit.load(Ordering::Relaxed)
     }
 
+    pub async fn configure_connection_lifecycle(
+        &self,
+        config: Config,
+        local_node_id: String,
+        plugin_manager: &Arc<PluginManager>,
+        peer_store: PeerStore,
+        allow_console: bool,
+    ) {
+        let runtime = ConnectionLifecycleRuntime {
+            policy: ConnectionPolicy::from_network_config(&config),
+            config,
+            local_node_id,
+            peer_store,
+            plugin_manager: Arc::downgrade(plugin_manager),
+            allow_console,
+        };
+        *self.lifecycle_runtime.lock().await = Some(runtime);
+
+        let peers: Vec<(String, SocketAddr)> = self
+            .node_ids
+            .lock()
+            .await
+            .iter()
+            .map(|(node_id, addr)| (node_id.clone(), *addr))
+            .collect();
+        for (node_id, addr) in peers {
+            self.start_liveness_monitor(node_id, Some(addr)).await;
+        }
+    }
+
     /// Returns a list of currently connected peer addresses
     pub async fn list_peers(&self) -> Vec<SocketAddr> {
         let peers = self.peers.lock().await;
@@ -280,6 +353,14 @@ impl PeerManager {
         }
         self.peers.lock().await.insert(addr, sender);
         self.node_ids.lock().await.insert(node_id.clone(), addr);
+        self.mark_route_success(&node_id, RouteKind::Tcp).await;
+        self.last_peer_activity
+            .lock()
+            .await
+            .insert(node_id.clone(), Instant::now());
+        if let Some(runtime) = self.lifecycle_runtime.lock().await.clone() {
+            runtime.peer_store.reset_reconnect(&addr).await;
+        }
         // Drain any queued store-and-forward frames for this node_id
         let queued = {
             let mut q = self.relay_queue.lock().await;
@@ -297,6 +378,7 @@ impl PeerManager {
                 }
             }
         }
+        self.start_liveness_monitor(node_id, Some(addr)).await;
         Ok(())
     }
 
@@ -312,8 +394,8 @@ impl PeerManager {
 
     /// Remove peer by address (cleanup node_id mapping) and return node_id if found
     pub async fn remove_peer(&self, addr: &SocketAddr) -> Option<String> {
-        let mut peers = self.peers.lock().await;
-        if peers.remove(addr).is_some() {
+        let removed = self.peers.lock().await.remove(addr).is_some();
+        if removed {
             let mut ids = self.node_ids.lock().await;
             let remove_key: Option<String> =
                 ids.iter()
@@ -321,28 +403,17 @@ impl PeerManager {
             if let Some(ref k) = remove_key {
                 ids.remove(k);
             }
-            // Also purge any listen_addr entries pointing to this node id
+            drop(ids);
             if let Some(ref dup_node_id) = remove_key {
-                let mut listen_map = self.listen_addrs.lock().await;
-                let to_remove: Vec<String> = listen_map
-                    .iter()
-                    .filter_map(|(la, nid)| {
-                        if nid == dup_node_id {
-                            Some(la.clone())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                for la in to_remove {
-                    listen_map.remove(&la);
+                if self.udp_session_id_for(dup_node_id).await.is_some() {
+                    self.transport_kind
+                        .lock()
+                        .await
+                        .insert(dup_node_id.clone(), TransportKind::Udp);
+                } else {
+                    self.lifecycle_generations.lock().await.remove(dup_node_id);
+                    self.transport_kind.lock().await.remove(dup_node_id);
                 }
-                // Purge UDP maps for this node_id (ADR-0004).
-                self.transport_kind.lock().await.remove(dup_node_id);
-                self.udp_listen_addrs.lock().await.remove(dup_node_id);
-                self.udp_session_ids.lock().await.remove(dup_node_id);
-                // Purge NAT traversal maps (ADR-0005).
-                self.udp_observed_addrs.lock().await.remove(dup_node_id);
                 self.pending_punches.lock().await.retain(|_, pending| {
                     pending.initiator_node_id != *dup_node_id
                         && pending.responder_node_id != *dup_node_id
@@ -355,6 +426,286 @@ impl PeerManager {
             return remove_key;
         }
         None
+    }
+
+    pub async fn handle_peer_disconnected(&self, addr: &SocketAddr) -> Option<String> {
+        let node_id = self.remove_peer(addr).await?;
+        self.mark_route_unresponsive(&node_id, RouteKind::Tcp).await;
+        let reconnect_addr = self
+            .tcp_listen_addr_for(&node_id)
+            .await
+            .and_then(|candidate| candidate.parse().ok())
+            .unwrap_or(*addr);
+        self.schedule_reconnect(node_id.clone(), reconnect_addr);
+        Some(node_id)
+    }
+
+    pub async fn route_health(&self, node_id: &str, kind: RouteKind) -> RouteHealth {
+        let health = self.route_health.lock().await;
+        let Some(record) = health.get(&(node_id.to_string(), kind)) else {
+            return RouteHealth::Unknown;
+        };
+        if record.health == RouteHealth::Unresponsive {
+            return RouteHealth::Unresponsive;
+        }
+        match (record.last_success, record.last_failure) {
+            (None, None) => RouteHealth::Unknown,
+            (Some(_), None) => RouteHealth::Healthy,
+            (None, Some(_)) => RouteHealth::Suspect,
+            (Some(success), Some(failure)) if success >= failure => RouteHealth::Healthy,
+            (Some(_), Some(_)) => RouteHealth::Suspect,
+        }
+    }
+
+    pub async fn mark_route_success(&self, node_id: &str, kind: RouteKind) {
+        let mut health = self.route_health.lock().await;
+        let record = health
+            .entry((node_id.to_string(), kind))
+            .or_insert_with(RouteHealthRecord::default);
+        record.health = RouteHealth::Healthy;
+        record.last_success = Some(Instant::now());
+    }
+
+    pub async fn mark_route_failure(&self, node_id: &str, kind: RouteKind) {
+        let mut health = self.route_health.lock().await;
+        let record = health
+            .entry((node_id.to_string(), kind))
+            .or_insert_with(RouteHealthRecord::default);
+        record.health = RouteHealth::Suspect;
+        record.last_failure = Some(Instant::now());
+    }
+
+    pub async fn mark_route_unresponsive(&self, node_id: &str, kind: RouteKind) {
+        let mut health = self.route_health.lock().await;
+        let record = health
+            .entry((node_id.to_string(), kind))
+            .or_insert_with(RouteHealthRecord::default);
+        record.health = RouteHealth::Unresponsive;
+        record.last_failure = Some(Instant::now());
+    }
+
+    pub async fn record_peer_activity(&self, node_id: &str, kind: RouteKind) {
+        self.last_peer_activity
+            .lock()
+            .await
+            .insert(node_id.to_string(), Instant::now());
+        self.mark_route_success(node_id, kind).await;
+    }
+
+    pub async fn record_peer_activity_on_preferred_route(&self, node_id: &str) {
+        let kind = match self.get_transport_kind(node_id).await {
+            Some(TransportKind::Udp) => RouteKind::Udp,
+            Some(TransportKind::Tcp) => RouteKind::Tcp,
+            None if self.has_node_id(node_id).await => RouteKind::Tcp,
+            None => return,
+        };
+        self.record_peer_activity(node_id, kind).await;
+    }
+
+    async fn start_liveness_monitor(&self, node_id: String, tcp_addr: Option<SocketAddr>) {
+        let Some(runtime) = self.lifecycle_runtime.lock().await.clone() else {
+            return;
+        };
+        let generation = self
+            .next_lifecycle_generation
+            .fetch_add(1, Ordering::Relaxed);
+        {
+            let mut generations = self.lifecycle_generations.lock().await;
+            if generations.contains_key(&node_id) {
+                return;
+            }
+            generations.insert(node_id.clone(), generation);
+        }
+
+        let peer_manager = self.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval_at(
+                tokio::time::Instant::now() + runtime.policy.heartbeat_interval,
+                runtime.policy.heartbeat_interval,
+            );
+            loop {
+                ticker.tick().await;
+                let is_current = peer_manager
+                    .lifecycle_generations
+                    .lock()
+                    .await
+                    .get(&node_id)
+                    .is_some_and(|current| *current == generation);
+                if !is_current {
+                    break;
+                }
+
+                let last_activity = peer_manager
+                    .last_peer_activity
+                    .lock()
+                    .await
+                    .get(&node_id)
+                    .copied();
+                if last_activity
+                    .is_none_or(|seen| seen.elapsed() >= runtime.policy.heartbeat_timeout)
+                {
+                    peer_manager
+                        .mark_peer_unresponsive(&node_id, tcp_addr)
+                        .await;
+                    break;
+                }
+
+                let heartbeat = Message::new(
+                    &runtime.local_node_id,
+                    &node_id,
+                    MessageType::Heartbeat,
+                    Some(Payload::Text("liveness_probe_v1".to_string())),
+                    runtime.config.realm.clone(),
+                );
+                let (kind, result) = if peer_manager.has_node_id(&node_id).await {
+                    (
+                        RouteKind::Tcp,
+                        peer_manager
+                            .send_to_node_id(&node_id, heartbeat.as_json())
+                            .await,
+                    )
+                } else if peer_manager.udp_session_id_for(&node_id).await.is_some() {
+                    (
+                        RouteKind::Udp,
+                        peer_manager
+                            .send_udp_message_to_node(&node_id, heartbeat.as_json().as_bytes())
+                            .await,
+                    )
+                } else {
+                    peer_manager
+                        .mark_peer_unresponsive(&node_id, tcp_addr)
+                        .await;
+                    break;
+                };
+                if result.is_err() {
+                    peer_manager.mark_route_failure(&node_id, kind).await;
+                }
+            }
+
+            let mut generations = peer_manager.lifecycle_generations.lock().await;
+            if generations
+                .get(&node_id)
+                .is_some_and(|current| *current == generation)
+            {
+                generations.remove(&node_id);
+            }
+        });
+    }
+
+    async fn mark_peer_unresponsive(&self, node_id: &str, tcp_addr: Option<SocketAddr>) {
+        self.mark_route_unresponsive(node_id, RouteKind::Tcp).await;
+        if self.udp_session_id_for(node_id).await.is_some() {
+            self.mark_route_unresponsive(node_id, RouteKind::Udp).await;
+        }
+        self.udp_session_ids.lock().await.remove(node_id);
+        self.transport_kind.lock().await.remove(node_id);
+        let active_tcp_addr = self.node_ids.lock().await.get(node_id).copied();
+        if let Some(addr) = active_tcp_addr {
+            self.remove_peer(&addr).await;
+        } else {
+            self.lifecycle_generations.lock().await.remove(node_id);
+        }
+
+        emit_network_event(
+            "peer_manager",
+            LogLevel::Warn,
+            "peer_unresponsive",
+            tcp_addr.map(|addr| addr.to_string()),
+            Some(format!("node_id={node_id}")),
+            self.lifecycle_runtime
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|runtime| runtime.allow_console),
+        );
+
+        let reconnect_addr = self
+            .tcp_listen_addr_for(node_id)
+            .await
+            .and_then(|candidate| candidate.parse().ok())
+            .or(tcp_addr);
+        if let Some(addr) = reconnect_addr {
+            self.schedule_reconnect(node_id.to_string(), addr);
+        }
+    }
+
+    fn schedule_reconnect(&self, node_id: String, addr: SocketAddr) {
+        let peer_manager = self.clone();
+        tokio::spawn(async move {
+            let Some(runtime) = peer_manager.lifecycle_runtime.lock().await.clone() else {
+                return;
+            };
+            {
+                let mut reconnecting = peer_manager.reconnecting_peers.lock().await;
+                if !reconnecting.insert(node_id.clone()) {
+                    return;
+                }
+            }
+            runtime.peer_store.insert(addr, PeerSource::Handshake).await;
+
+            loop {
+                if peer_manager.has_node_id(&node_id).await {
+                    break;
+                }
+                let Some(attempt) = runtime
+                    .peer_store
+                    .next_reconnect_attempt(&addr, runtime.policy.reconnect_max_attempts)
+                    .await
+                else {
+                    emit_network_event(
+                        "peer_manager",
+                        LogLevel::Warn,
+                        "reconnect_exhausted",
+                        Some(addr.to_string()),
+                        Some(format!("node_id={node_id}")),
+                        runtime.allow_console,
+                    );
+                    break;
+                };
+
+                tokio::time::sleep(runtime.policy.reconnect_delay_with_random_jitter(attempt))
+                    .await;
+                if peer_manager.has_node_id(&node_id).await {
+                    break;
+                }
+                let Some(plugin_manager) = runtime.plugin_manager.upgrade() else {
+                    break;
+                };
+                let peer = Peer::new(format!("reconnect-{node_id}"), addr.to_string());
+                let result = crate::network::transport::connect_to_peer(
+                    crate::network::transport::ConnectToPeerParams {
+                        peer: &peer,
+                        our_realm: runtime
+                            .config
+                            .realm
+                            .clone()
+                            .unwrap_or_else(RealmInfo::default),
+                        our_port: runtime.config.port,
+                        peer_manager: peer_manager.clone(),
+                        plugin_manager,
+                        allow_console: runtime.allow_console,
+                        config: runtime.config.clone(),
+                        local_node_id: runtime.local_node_id.clone(),
+                        peer_store: Some(runtime.peer_store.clone()),
+                    },
+                )
+                .await;
+
+                if result.is_err() || !peer_manager.has_node_id(&node_id).await {
+                    runtime.peer_store.mark_failure(&addr).await;
+                    peer_manager
+                        .mark_route_failure(&node_id, RouteKind::Tcp)
+                        .await;
+                    continue;
+                }
+                break;
+            }
+            peer_manager
+                .reconnecting_peers
+                .lock()
+                .await
+                .remove(&node_id);
+        });
     }
 
     pub async fn broadcast(&self, message: &str) {
@@ -1025,6 +1376,8 @@ impl PeerManager {
             .lock()
             .await
             .insert(node_id.to_string(), session_id);
+        self.record_peer_activity(node_id, RouteKind::Udp).await;
+        self.start_liveness_monitor(node_id.to_string(), None).await;
     }
 
     /// Retrieve the active Noise session ID for a peer.

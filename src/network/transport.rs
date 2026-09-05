@@ -506,7 +506,7 @@ pub async fn receive_and_dispatch<R: AsyncBufReadExt + Unpin>(
                     allow_console,
                 );
                 // Remove peer and capture node_id for lifecycle notifications
-                let removed_node_id = peer_manager.remove_peer(&addr).await;
+                let removed_node_id = peer_manager.handle_peer_disconnected(&addr).await;
                 use crate::events::{
                     dispatcher,
                     model::{LogEvent, LogLevel, SystemEvent},

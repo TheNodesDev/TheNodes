@@ -386,6 +386,13 @@ impl Default for NetworkPersistenceConfig {
 /// direct_tcp_timeout_ms = 3000
 /// direct_udp_timeout_ms = 1000
 /// punch_timeout_ms = 5000
+/// heartbeat_interval_ms = 30000
+/// heartbeat_timeout_ms = 90000
+/// reconnect_base_delay_ms = 1000
+/// reconnect_multiplier = 2.0
+/// reconnect_max_delay_ms = 60000
+/// reconnect_max_attempts = 8
+/// reconnect_jitter_ratio = 0.2
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 pub struct ConnectionPolicyConfig {
@@ -405,6 +412,20 @@ pub struct ConnectionPolicyConfig {
     pub direct_udp_timeout_ms: Option<u64>,
     /// Total time budget for relay-coordinated UDP hole punching (ms).  Phase 3.
     pub punch_timeout_ms: Option<u64>,
+    /// Interval between framework heartbeat probes for active peers (ms).
+    pub heartbeat_interval_ms: Option<u64>,
+    /// Maximum time without inbound peer activity before the route is unresponsive (ms).
+    pub heartbeat_timeout_ms: Option<u64>,
+    /// Delay before the first automatic reconnect attempt (ms).
+    pub reconnect_base_delay_ms: Option<u64>,
+    /// Exponential multiplier applied after each failed reconnect attempt.
+    pub reconnect_multiplier: Option<f64>,
+    /// Maximum delay between automatic reconnect attempts (ms).
+    pub reconnect_max_delay_ms: Option<u64>,
+    /// Maximum consecutive reconnect attempts before automatic retries stop.
+    pub reconnect_max_attempts: Option<u32>,
+    /// Symmetric jitter ratio applied to reconnect delays, in the range `0.0..=1.0`.
+    pub reconnect_jitter_ratio: Option<f64>,
 }
 
 impl Default for ConnectionPolicyConfig {
@@ -414,6 +435,13 @@ impl Default for ConnectionPolicyConfig {
             direct_tcp_timeout_ms: Some(3000),
             direct_udp_timeout_ms: Some(1000),
             punch_timeout_ms: Some(5000),
+            heartbeat_interval_ms: Some(30_000),
+            heartbeat_timeout_ms: Some(90_000),
+            reconnect_base_delay_ms: Some(1_000),
+            reconnect_multiplier: Some(2.0),
+            reconnect_max_delay_ms: Some(60_000),
+            reconnect_max_attempts: Some(8),
+            reconnect_jitter_ratio: Some(0.2),
         }
     }
 }

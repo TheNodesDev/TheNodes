@@ -1,6 +1,5 @@
 // src/network/peer_store.rs
-// Simple in-memory peer candidate store for discovery.
-// Future: persistence, scoring, backoff.
+// In-memory peer candidate and reconnect-attempt store.
 
 use crate::config::Config;
 use rand::seq::IteratorRandom;
@@ -37,6 +36,7 @@ pub struct PeerRecord {
 #[derive(Clone)]
 pub struct PeerStore {
     inner: Arc<RwLock<HashMap<SocketAddr, PeerRecord>>>,
+    reconnect_attempts: Arc<RwLock<HashMap<SocketAddr, u32>>>,
 }
 
 impl Default for PeerStore {
@@ -49,6 +49,7 @@ impl PeerStore {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(RwLock::new(HashMap::new())),
+            reconnect_attempts: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -84,6 +85,8 @@ impl PeerStore {
             rec.last_success_epoch = Some(Self::epoch());
             rec.failures = 0;
         }
+        drop(map);
+        self.reset_reconnect(addr).await;
     }
 
     /// Mark peer as successfully connected and update metadata from HELLO
@@ -117,13 +120,46 @@ impl PeerStore {
                 },
             );
         }
+        drop(map);
+        self.reset_reconnect(addr).await;
     }
 
     pub async fn mark_failure(&self, addr: &SocketAddr) {
         let mut map = self.inner.write().await;
         if let Some(rec) = map.get_mut(addr) {
-            rec.failures += 1;
+            rec.failures = rec.failures.saturating_add(1);
         }
+    }
+
+    /// Reserve the next reconnect attempt number, starting at one.
+    ///
+    /// Returns `None` when the configured consecutive-attempt budget is exhausted.
+    pub async fn next_reconnect_attempt(
+        &self,
+        addr: &SocketAddr,
+        max_attempts: u32,
+    ) -> Option<u32> {
+        let mut attempts = self.reconnect_attempts.write().await;
+        let current = attempts.get(addr).copied().unwrap_or(0);
+        if current >= max_attempts {
+            return None;
+        }
+        let next = current.saturating_add(1);
+        attempts.insert(*addr, next);
+        Some(next)
+    }
+
+    pub async fn reset_reconnect(&self, addr: &SocketAddr) {
+        self.reconnect_attempts.write().await.remove(addr);
+    }
+
+    pub async fn reconnect_attempts(&self, addr: &SocketAddr) -> u32 {
+        self.reconnect_attempts
+            .read()
+            .await
+            .get(addr)
+            .copied()
+            .unwrap_or(0)
     }
 
     pub async fn sample(&self, k: usize, exclude: &HashSet<SocketAddr>) -> Vec<SocketAddr> {

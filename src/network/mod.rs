@@ -17,7 +17,8 @@ pub mod udp_session;
 
 pub use bootstrap::connect_to_bootstrap_nodes;
 pub use connection::{
-    connect_with_policy, ConnectionOutcome, ConnectionPolicy, ConnectionStrategy,
+    connect_with_policy, ConnectionOutcome, ConnectionPolicy, ConnectionStrategy, RouteHealth,
+    RouteKind,
 };
 pub use delivery::{
     DeliveryClass, DeliveryFailureReason, DeliveryOptions, DeliveryOutcome,

@@ -6,6 +6,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+### Fixed
+- Replaced heuristic certificate-chain checks with cryptographic WebPKI path validation against configured CA trust anchors. Validation now enforces signatures, CA/path constraints, EKU, critical extensions, name constraints, and current-time validity for the complete path when `enforce_ca_chain = true`.
+- Implemented real X.509 `notBefore`/`notAfter` extraction. `reject_before_valid` and `reject_expired` now reject matching leaf certificates and fail closed when validity cannot be parsed.
+- TLS policy evaluation now uses `issuer_cert_dir` for CA trust anchors (falling back to `trusted_cert_dir` for compatibility), distinguishes server- and client-auth EKU, and verifies TLS handshake signatures even when certificate acceptance is deferred to TheNodes trust policy.
+- Self-signed chain overrides now require a cryptographically valid self-signature.
+
+### Security
+- CRL/OCSP processing remains unsupported. Configured CRL directories are not read and revocation status is not enforced.
+
 ## [0.3.0] - 2026-09-05
 
 ### Breaking

@@ -1,5 +1,6 @@
 use thenodes::security::trust::{
-    evaluate_peer_cert_chain, spki_fingerprint, EffectiveTrustPolicy, TrustDecisionOutcome,
+    evaluate_peer_cert_chain_for_usage, spki_fingerprint, CertificateUsage, EffectiveTrustPolicy,
+    TrustDecisionOutcome,
 };
 use tokio_rustls::rustls::pki_types::CertificateDer;
 
@@ -20,12 +21,14 @@ fn fingerprint_pin_match_accepts() {
         ..Default::default()
     };
     let policy = EffectiveTrustPolicy::from_config(&enc);
-    let decision = evaluate_peer_cert_chain(
+    let decision = evaluate_peer_cert_chain_for_usage(
         &policy,
+        None,
         None,
         None,
         &[CertificateDer::from(DUMMY_CERT.to_vec())],
         None,
+        CertificateUsage::Either,
     );
     assert_eq!(
         decision.outcome,
@@ -45,12 +48,14 @@ fn fingerprint_pin_mismatch_rejects() {
         ..Default::default()
     };
     let policy = EffectiveTrustPolicy::from_config(&enc);
-    let decision = evaluate_peer_cert_chain(
+    let decision = evaluate_peer_cert_chain_for_usage(
         &policy,
+        None,
         None,
         None,
         &[CertificateDer::from(DUMMY_CERT.to_vec())],
         None,
+        CertificateUsage::Either,
     );
     assert_eq!(
         decision.outcome,
@@ -70,12 +75,14 @@ fn subject_pin_mismatch_rejects() {
         ..Default::default()
     };
     let policy = EffectiveTrustPolicy::from_config(&enc);
-    let decision = evaluate_peer_cert_chain(
+    let decision = evaluate_peer_cert_chain_for_usage(
         &policy,
+        None,
         None,
         None,
         &[CertificateDer::from(DUMMY_CERT.to_vec())],
         None,
+        CertificateUsage::Either,
     );
     assert_eq!(
         decision.outcome,

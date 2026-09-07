@@ -401,14 +401,15 @@ TheNodes supports optional TLS. When disabled, traffic is plaintext (development
 - `tofu` – "Trust On First Use": accept a previously unseen fingerprint once, record it (if `observed_dir` is configured), and require the same fingerprint on subsequent connections. Handy for bootstrapping a trust store.
 - `hybrid` (placeholder) – currently identical to `open` but tagged in logs so future staged enforcement can be layered on without config churn.
 
-> The planned `ca` mode (full CA validation) is reserved for a future release.
+> A dedicated `ca` mode is reserved for a future release. Full CA path validation is already available explicitly through `enforce_ca_chain = true`.
 
 Phased trust policy work adds layered security features without breaking existing configurations.
 
 Phase 2 (current baseline) adds:
 - SPKI fingerprint (SHA-256) via ASN.1 parsing (fallback to DER hash only on parse failure).
-- Heuristic chain analysis (self-signed vs issuer-present) with explanatory `chain_reason`.
-- Flags: `enforce_ca_chain`, `reject_expired`, `reject_before_valid` (time parsing placeholder; currently reports `unparsed`).
+- Cryptographic WebPKI path validation through `enforce_ca_chain`, using `issuer_cert_dir` as the CA trust-anchor store and `trusted_cert_dir` as a compatibility fallback.
+- Real X.509 validity parsing and fail-closed enforcement through `reject_expired` and `reject_before_valid`.
+- TLS-role-aware EKU validation for outbound server certificates and inbound mTLS client certificates.
 - Expanded logging fields: `chain_valid`, `chain_reason`, `time_valid`, `time_reason`.
 
 Phase 3 (pinning core delivered) adds:
@@ -435,7 +436,7 @@ Operational notes:
 - Certificate rotations require updating pins first to avoid availability loss.
 - If any subject-based constraint (pins or realm binding) is active and the subject cannot be parsed, the connection is currently rejected (future soft-fail option planned).
 
-Roadmap (selected upcoming): full CA path validation, real time validity enforcement, `ca` / `hybrid` modes, CRL/OCSP integration, and hot reloadable pin sets.
+Roadmap (selected upcoming): explicit `ca` / `hybrid` modes, CRL/OCSP integration, and hot reloadable pin sets.
 
 See `SECURITY_TRUST_POLICY_PLAN.md` for detailed status.
 
@@ -451,7 +452,8 @@ mtls = true                # require and present client certs
   [encryption.paths]
   own_certificate  = "pki/own/cert.pem"
   own_private_key  = "pki/own/key.pem"
-  trusted_cert_dir = "pki/trusted/certs"   # used as root store for client cert verification
+  trusted_cert_dir = "pki/trusted/certs"   # leaf allowlist / compatibility root fallback
+  issuer_cert_dir  = "pki/issuers/certs"   # CA trust anchors for enforce_ca_chain
 
   [encryption.trust_policy]
   mode = "allowlist"       # open | observe | allowlist | tofu | hybrid (hybrid placeholder)
@@ -472,7 +474,7 @@ Operational tips:
 - Populate `trusted_cert_dir` before switching to `allowlist` + mTLS or connections will be rejected.
 - Missing client cert (on outbound) logs a warning and falls back to one-way TLS; inbound without a cert is rejected when mTLS is enabled.
 
-Future phases will add full CA / hybrid chain validation without changing the `mtls` flag semantics.
+The `enforce_ca_chain` flag performs full WebPKI path validation today. Future phases may add dedicated `ca` / `hybrid` modes without changing the `mtls` flag semantics. CRL/OCSP enforcement remains deferred.
 
 ### Logging / Events Configuration
 Add an optional `[logging]` section to control event sinks:

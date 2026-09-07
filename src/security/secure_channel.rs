@@ -76,45 +76,23 @@ impl SecureChannel for TlsSecureChannel {
             dispatcher,
             model::{BindingStatus, ConnectionRole, LogEvent, LogLevel, TrustDecisionEvent},
         };
-        use crate::security::trust::{evaluate_peer_cert_chain, EffectiveTrustPolicy};
+        use crate::security::trust::{
+            evaluate_peer_cert_chain_for_usage, CertificateUsage, EffectiveTrustPolicy,
+        };
         use rustls::pki_types::CertificateDer;
-        use rustls::{ClientConfig, RootCertStore};
+        use rustls::ClientConfig;
         use rustls_pemfile::certs;
         use tokio_rustls::TlsConnector;
 
-        // Use provided TCP stream for TLS client handshake.
-        // Build roots
-        let mut root_cert_store = RootCertStore::empty();
-        if let Some(enc_paths) = config.encryption.as_ref().and_then(|e| e.paths.as_ref()) {
-            if let Some(trusted_cert_dir) = &enc_paths.trusted_cert_dir {
-                if let Ok(entries) = std::fs::read_dir(trusted_cert_dir) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        if path.extension().map(|e| e == "pem").unwrap_or(false) {
-                            if let Ok(file) = std::fs::File::open(&path) {
-                                let mut reader = std::io::BufReader::new(file);
-                                if let Ok(certs) = certs(&mut reader) {
-                                    for cert in certs {
-                                        let _ = root_cert_store.add(CertificateDer::from(cert));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
         let enc_owned = config.encryption.clone().unwrap_or_default();
         let enc_ref = &enc_owned;
         let mtls = enc_ref.mtls.unwrap_or(false);
-        let accept_self_signed = enc_ref
-            .trust_policy
-            .as_ref()
-            .and_then(|tp| tp.accept_self_signed)
-            .or(enc_ref.accept_self_signed)
-            .unwrap_or(false);
-        let client_builder = ClientConfig::builder().with_root_certificates(root_cert_store);
-        let mut client_cfg = if mtls {
+        // TheNodes policy evaluates certificate acceptance immediately after
+        // the handshake. The custom verifier still verifies CertificateVerify.
+        let client_builder = ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(std::sync::Arc::new(DeferredServerCertVerifier));
+        let client_cfg = if mtls {
             // Client auth chain
             let mut cert_chain: Vec<CertificateDer<'static>> = Vec::new();
             let mut key_opt: Option<rustls::pki_types::PrivateKeyDer<'static>> = None;
@@ -162,11 +140,6 @@ impl SecureChannel for TlsSecureChannel {
         } else {
             client_builder.with_no_client_auth()
         };
-        if accept_self_signed {
-            client_cfg
-                .dangerous()
-                .set_certificate_verifier(std::sync::Arc::new(super_permissive_verifier()));
-        }
         let connector = TlsConnector::from(std::sync::Arc::new(client_cfg));
         let domain_str = peer_addr.ip().to_string();
         let domain = rustls::pki_types::ServerName::try_from(domain_str.clone())?;
@@ -182,13 +155,24 @@ impl SecureChannel for TlsSecureChannel {
             .iter()
             .map(|c| c.clone().into_owned())
             .collect();
-        let trusted_dir = enc_ref
+        let trusted_cert_dir = enc_ref
             .paths
             .as_ref()
-            .and_then(|p| p.trusted_cert_dir.as_deref());
+            .and_then(|paths| paths.trusted_cert_dir.as_deref());
+        let trust_anchor_dir = enc_ref
+            .paths
+            .as_ref()
+            .and_then(|paths| paths.issuer_cert_dir.as_deref().or(trusted_cert_dir));
         let observed_dir = policy.observed_dir.as_deref();
-        let decision =
-            evaluate_peer_cert_chain(&policy, trusted_dir, observed_dir, &chain, Some(realm));
+        let decision = evaluate_peer_cert_chain_for_usage(
+            &policy,
+            trusted_cert_dir,
+            trust_anchor_dir,
+            observed_dir,
+            &chain,
+            Some(realm),
+            CertificateUsage::ServerAuth,
+        );
 
         // Emit trust event (Info)
         let mut meta = dispatcher::meta("trust", LogLevel::Info);
@@ -252,7 +236,9 @@ impl SecureChannel for TlsSecureChannel {
             dispatcher,
             model::{BindingStatus, ConnectionRole, LogEvent, LogLevel, TrustDecisionEvent},
         };
-        use crate::security::trust::{evaluate_peer_cert_chain, EffectiveTrustPolicy};
+        use crate::security::trust::{
+            evaluate_peer_cert_chain_for_usage, CertificateUsage, EffectiveTrustPolicy,
+        };
         use rustls::pki_types::CertificateDer;
         use rustls::ServerConfig;
         use rustls_pemfile::{certs, pkcs8_private_keys, rsa_private_keys};
@@ -303,63 +289,12 @@ impl SecureChannel for TlsSecureChannel {
             None => unreachable!("checked non-none above"),
         };
         let mtls = enc_ref.mtls.unwrap_or(false);
-        let accept_self_signed = enc_ref
-            .trust_policy
-            .as_ref()
-            .and_then(|tp| tp.accept_self_signed)
-            .or(enc_ref.accept_self_signed)
-            .unwrap_or(false);
-
         let acceptor = if mtls {
-            if accept_self_signed {
-                let server_cfg = ServerConfig::builder()
-                    .with_client_cert_verifier(std::sync::Arc::new(PermissiveClientVerifier))
-                    .with_single_cert(certs_vec, key)
-                    .expect("invalid cert/key");
-                TlsAcceptor::from(std::sync::Arc::new(server_cfg))
-            } else {
-                use rustls::server::WebPkiClientVerifier;
-                use rustls::RootCertStore;
-                let mut client_roots = RootCertStore::empty();
-                if let Some(paths) = &enc_ref.paths {
-                    if let Some(trusted_dir) = &paths.trusted_cert_dir {
-                        if let Ok(entries) = std::fs::read_dir(trusted_dir) {
-                            for entry in entries.flatten() {
-                                let p = entry.path();
-                                if p.extension().and_then(|e| e.to_str()) == Some("pem") {
-                                    if let Ok(f) = std::fs::File::open(&p) {
-                                        let mut reader = std::io::BufReader::new(f);
-                                        if let Ok(certs) = rustls_pemfile::certs(&mut reader) {
-                                            for c in certs {
-                                                let _ = client_roots.add(
-                                                    rustls::pki_types::CertificateDer::from(c),
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                let client_roots = std::sync::Arc::new(client_roots);
-                match WebPkiClientVerifier::builder(client_roots).build() {
-                    Ok(verifier_arc) => {
-                        let server_cfg = ServerConfig::builder()
-                            .with_client_cert_verifier(verifier_arc)
-                            .with_single_cert(certs_vec, key)
-                            .expect("invalid cert/key");
-                        TlsAcceptor::from(std::sync::Arc::new(server_cfg))
-                    }
-                    Err(_e) => {
-                        let server_cfg = ServerConfig::builder()
-                            .with_no_client_auth()
-                            .with_single_cert(certs_vec, key)
-                            .expect("invalid cert/key");
-                        TlsAcceptor::from(std::sync::Arc::new(server_cfg))
-                    }
-                }
-            }
+            let server_cfg = ServerConfig::builder()
+                .with_client_cert_verifier(std::sync::Arc::new(DeferredClientCertVerifier))
+                .with_single_cert(certs_vec, key)
+                .expect("invalid cert/key");
+            TlsAcceptor::from(std::sync::Arc::new(server_cfg))
         } else {
             let server_cfg = ServerConfig::builder()
                 .with_no_client_auth()
@@ -378,15 +313,22 @@ impl SecureChannel for TlsSecureChannel {
             .unwrap_or_else(Vec::new);
 
         let policy = EffectiveTrustPolicy::from_config(enc_ref);
-        let decision = evaluate_peer_cert_chain(
+        let trusted_cert_dir = enc_ref
+            .paths
+            .as_ref()
+            .and_then(|paths| paths.trusted_cert_dir.as_deref());
+        let trust_anchor_dir = enc_ref
+            .paths
+            .as_ref()
+            .and_then(|paths| paths.issuer_cert_dir.as_deref().or(trusted_cert_dir));
+        let decision = evaluate_peer_cert_chain_for_usage(
             &policy,
-            enc_ref
-                .paths
-                .as_ref()
-                .and_then(|p| p.trusted_cert_dir.as_deref()),
+            trusted_cert_dir,
+            trust_anchor_dir,
             policy.observed_dir.as_deref(),
             &peer_chain_owned,
             Some(realm),
+            CertificateUsage::ClientAuth,
         );
 
         let mut meta = dispatcher::meta("trust", LogLevel::Info);
@@ -959,14 +901,9 @@ impl tokio::io::AsyncWrite for NoiseWriter {
     }
 }
 
-// Helper: permissive verifier instance for self-signed acceptance
-fn super_permissive_verifier() -> PermissiveVerifier {
-    PermissiveVerifier
-}
-
 #[derive(Debug)]
-struct PermissiveVerifier;
-impl rustls::client::danger::ServerCertVerifier for PermissiveVerifier {
+struct DeferredServerCertVerifier;
+impl rustls::client::danger::ServerCertVerifier for DeferredServerCertVerifier {
     fn verify_server_cert(
         &self,
         _end_entity: &rustls::pki_types::CertificateDer<'_>,
@@ -979,32 +916,32 @@ impl rustls::client::danger::ServerCertVerifier for PermissiveVerifier {
     }
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        let algorithms = rustls::crypto::ring::default_provider().signature_verification_algorithms;
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &algorithms)
     }
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        let algorithms = rustls::crypto::ring::default_provider().signature_verification_algorithms;
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &algorithms)
     }
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        vec![
-            rustls::SignatureScheme::ED25519,
-            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-            rustls::SignatureScheme::RSA_PSS_SHA256,
-        ]
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
 #[derive(Debug)]
-struct PermissiveClientVerifier;
-impl rustls::server::danger::ClientCertVerifier for PermissiveClientVerifier {
+struct DeferredClientCertVerifier;
+impl rustls::server::danger::ClientCertVerifier for DeferredClientCertVerifier {
     fn offer_client_auth(&self) -> bool {
         true
     }
@@ -1024,25 +961,25 @@ impl rustls::server::danger::ClientCertVerifier for PermissiveClientVerifier {
     }
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        let algorithms = rustls::crypto::ring::default_provider().signature_verification_algorithms;
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &algorithms)
     }
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        let algorithms = rustls::crypto::ring::default_provider().signature_verification_algorithms;
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &algorithms)
     }
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        vec![
-            rustls::SignatureScheme::ED25519,
-            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-            rustls::SignatureScheme::RSA_PSS_SHA256,
-        ]
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }

@@ -15,15 +15,15 @@ Operational helpers:
   - `trust trusted list` — list trusted certificate filenames
   - `trust promote <fingerprint>` — promote an observed fingerprint into trusted
 
-## Current status (2025‑10‑28)
+## Current status (2026-09-07)
 
 - Phase 1: COMPLETE (config moved under `[encryption.trust_policy]`, modes open/allowlist/observe/tofu end‑to‑end, observed persistence, fingerprinting, prompt commands).
 - mTLS flag: AVAILABLE (`[encryption].mtls = true|false`).
-- Phase 2: PARTIAL (chain/time scaffolding present; optional chain enforcement and self‑signed override wired; time windows parsed permissively when flags are set; full path validation deferred).
+- Phase 2: CORE COMPLETE (cryptographic WebPKI path validation, role-aware EKU checks, strict validity-window enforcement, and verified self-signed override delivered; dedicated `ca` / `hybrid` modes remain deferred).
 - Phase 3: PARTIAL/CORE DELIVERED (fingerprint/subject pinning and realm binding; promotion helper; prompt‑level trust manage commands; background reconnect after promotion).
 - Audit logging: DELIVERED (structured JSON lines sink with rotation; see `logging` config). Metrics counters still TBD.
 
-What remains: full WebPKI chain building, strict time validity enforcement, hybrid/CA modes, soft‑fail toggles, live reload of pins, optional metrics.
+What remains: hybrid/CA modes, CRL/OCSP enforcement, soft-fail toggles, live reload of pins, and optional metrics.
 
 ## 1. Objectives
 - Support multiple network trust postures: open, allowlist, observe, TOFU, CA, hybrid.
@@ -78,8 +78,8 @@ Behavioral notes:
   - Inbound: Server does not request a client certificate; peer identity is unauthenticated at TLS layer.
 - When `mtls = true`:
   - Outbound: Client loads `own_certificate` + `own_private_key` and sends its certificate chain.
-  - Inbound: Server constructs a `WebPkiClientVerifier` root store from `trusted_cert_dir` and requires a client certificate during handshake.
-  - After handshake, the presented peer certificate chain (if any) is passed to `evaluate_peer_cert_chain` just like on outbound side.
+  - Inbound: Server requires a client certificate and cryptographically verifies the TLS `CertificateVerify` signature.
+  - Immediately after the handshake, the presented peer certificate chain is passed to the role-aware TheNodes policy evaluator. `enforce_ca_chain` validates client-auth EKU and the WebPKI path against `issuer_cert_dir` (`trusted_cert_dir` fallback).
 
 Interaction with trust modes:
 - open: Still accepts any presented certificate; with mTLS enabled, the client must present a syntactically valid cert but policy will not reject based on trust content.
@@ -88,11 +88,11 @@ Interaction with trust modes:
 - tofu: With mTLS enabled, first-seen client certs may be stored (if `store_new_certs = observed`) and subsequent changes will be detectable in future enhancements. Without mTLS, TOFU only applies to server certificates.
 
 Operational guidance:
-- Enable `mtls` only after populating `trusted_cert_dir` with the certificates (or issuer roots for future CA modes) of peers you expect, otherwise allowlist mode will reject all clients.
+- Populate `trusted_cert_dir` before using allowlist mode. When `enforce_ca_chain=true`, also populate `issuer_cert_dir` with root CA trust anchors; if that path is absent, `trusted_cert_dir` is used as a compatibility fallback.
 - For early deployments using `tofu`, it is safe to enable `mtls` to begin accumulating an observed catalog of peer certs for potential later promotion.
 - If `mtls` is enabled but the local node lacks its own cert/key pair, the outbound side logs a warning and downgrades to one-way TLS; the inbound side will fail to start TLS without a valid pair.
 
-Future phases (CA / hybrid) will extend the verifier construction to use issuer/CRL directories; no additional config flag is expected—`mtls` remains the on/off switch for mutual presentation while trust policy governs acceptance semantics.
+Future named CA / hybrid modes will compose the existing verifier with clearer policy presets. CRL/OCSP loading remains deferred; `mtls` remains the on/off switch for mutual presentation while trust policy governs acceptance semantics.
 
 ### Phase 1 (Implemented)
 - New config structs: `TrustPolicyConfig`, limited fields: `mode`, `accept_self_signed`, `store_new_certs`, `observed_dir`.
@@ -110,19 +110,20 @@ Future phases (CA / hybrid) will extend the verifier construction to use issuer/
 ### Phase 2 (Current implementation status)
 Implemented:
 - Real SPKI fingerprint (x509-parser) with fallback hashing
-- Chain validation scaffold (basic issuer/self-signed heuristics) via `validate_chain_simple`
-- Enforcement flags integrated: `enforce_ca_chain`, `reject_expired`, `reject_before_valid` (time parsing currently placeholder: validity windows not enforced yet unless parsing is later upgraded)
+- Cryptographic WebPKI path construction and signature validation against CA trust anchors in `issuer_cert_dir` (`trusted_cert_dir` is the compatibility fallback)
+- Complete-path validation of CA/basic constraints, path length, EKU, critical extensions, name constraints, and current-time validity when `enforce_ca_chain=true`
+- Real `notBefore` / `notAfter` parsing with fail-closed leaf enforcement through `reject_before_valid` and `reject_expired`
+- Server-auth versus client-auth EKU selection based on the TLS connection role
 - Extended logging: includes `chain_valid`, `chain_reason`, `time_valid`, `time_reason`
-- Self-signed override when `accept_self_signed=true` even if `enforce_ca_chain=true`
+- Self-signed override when `accept_self_signed=true`, with cryptographic verification of the self-signature
 
 Deferred / Not yet fully implemented:
-- True cryptographic chain building + signature/path validation (future webpki integration)
-- Actual notBefore/notAfter parsing & rejection (placeholder returns `unparsed`) 
 - New modes `ca` and `hybrid` (reserved; selecting them should currently fall back or be rejected)
 - `allow_unlisted` behavior for hybrid
 - Warn vs hard-reject toggles (currently only hard reject where applicable)
+- CRL / OCSP loading and enforcement
 
-Rationale for partial implementation: Provide immediate introspection (reasons + flags) and stable SPKI identity while keeping strict PKI roadmap incremental.
+`enforce_ca_chain` is the current explicit switch for strict CA validation. A named `ca` mode can later make that posture easier to configure without changing the validation engine.
 
 ### Phase 3 (Pinning & Promotion)
 Status: PARTIALLY IMPLEMENTED (core delivered)
@@ -134,10 +135,10 @@ Delivered in code:
   - `pin_fp_algo = "sha256"` (currently only `sha256` accepted; future algorithms may include `sha512`).
   - `realm_subject_binding = false` (when true, the active realm name must appear as a substring inside the certificate subject; enforced before mode logic).
 2. Enforcement ordering (hard reject at first unmet constraint):
-  1. Fingerprint pin set (if non-empty) – peer fingerprint MUST be present.
-  2. Subject pin set – peer subject MUST match an entry (exact or substring rule).
-  3. Realm binding (if enabled) – realm name substring check against subject.
-  4. Chain / time heuristic flags (`enforce_ca_chain`, `reject_expired`, `reject_before_valid`).
+  1. Cryptographic chain and time flags (`enforce_ca_chain`, `reject_expired`, `reject_before_valid`).
+  2. Fingerprint pin set (if non-empty) – peer fingerprint MUST be present.
+  3. Subject pin set – peer subject MUST match an entry (exact or substring rule).
+  4. Realm binding (if enabled) – realm name substring check against subject.
   5. Mode-specific evaluation (`open | allowlist | observe | tofu`).
 3. Promotion helper: `promote_observed_to_trusted(observed_dir, trusted_dir, fingerprint)` copies `<observed_dir>/<fp>.pem` to trusted store (idempotent; returns `Ok(true)` if newly promoted, `Ok(false)` otherwise).
 4. Tests: `tests/pins.rs` covers positive and negative paths for fingerprint and subject pin matching.
@@ -159,8 +160,6 @@ Limitations / Deferred items:
 - Metrics counters for pin violations and trust outcomes are not emitted yet.
 
 Planned near-term enhancements (still part of Phase 3 completion definition):
-- Validity (notBefore/notAfter) real parsing & enforcement (brings `reject_expired` / `reject_before_valid` to life).
-- WebPKI-based full chain path construction under `enforce_ca_chain`.
 - Optional soft-fail toggle for unparsable subjects.
 - Live reload (SIGHUP or file watch) for pin sets.
 - CLI/Prompt: list observed, promote by fingerprint, generate pin template (prompt commands already available; CLI packaging TBD).
@@ -236,4 +235,4 @@ Structured audit log:
 
 ---
 
-Status summary: Phase 1 complete; mTLS flag available; Phase 2 scaffolding active with optional enforcement; Phase 3 core pinning/promotion delivered with prompt UX and background reconnects; audit logging available. Remaining work is focused on full PKI validation, live reloads, and richer CLI/metrics.
+Status summary: Phase 1 complete; mTLS available; Phase 2 core chain/time enforcement complete; Phase 3 core pinning/promotion delivered with prompt UX and background reconnects; audit logging available. Remaining work is focused on named CA/hybrid modes, revocation handling, live reloads, and richer CLI/metrics.

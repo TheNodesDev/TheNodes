@@ -62,8 +62,8 @@ pki/
 │   ├── certs/          # Trusted certs
 │   └── crl/            # Certificate revocation lists (optional)
 ├── rejected/           # Automatically stores rejected certs (if enabled)
-└── issuers/            # Intermediate CA certs and CRLs
-    ├── certs/          # Intermediate certs
+└── issuers/            # CA trust anchors and future CRLs
+    ├── certs/          # Root CA trust anchors
     └── crl/            # Intermediate CRLs
 ```
 
@@ -100,8 +100,10 @@ When TLS is enabled, each incoming peer certificate is evaluated according to th
 | `tofu` (Trust On First Use) | Accept the first time a fingerprint is seen, record it, and require the same fingerprint on subsequent connections. | Gradual rollout where you harvest fingerprints during an onboarding phase. | Stores the first-seen cert so future rotations can be reviewed. |
 | `hybrid` (placeholder) | Currently behaves like `open` but emits metadata allowing future staged enforcement. | Migration experiments before full hybrid enforcement ships. | Stores newly seen certs, same as `open`. |
 
-> v0.3.0 limitation: chain analysis is heuristic, not cryptographic CA path validation. Certificate validity-window extraction is still a placeholder, so `reject_expired` and `reject_before_valid` do not currently enforce certificate dates. Do not rely on these flags as production certificate validation. CRL/OCSP enforcement remains future work.
->
+When `enforce_ca_chain = true`, TheNodes performs cryptographic WebPKI path validation for the peer's TLS role. Trust anchors are loaded from `issuer_cert_dir`; `trusted_cert_dir` is used as a compatibility fallback when no issuer directory is configured. The peer supplies intermediate certificates during the TLS handshake. Complete-path validation includes certificate signatures, CA/path constraints, EKU, critical extensions, name constraints, and current-time validity.
+
+`reject_expired` and `reject_before_valid` independently enforce the leaf certificate's parsed `notAfter` and `notBefore` values even when CA-chain enforcement is disabled. If either applicable check is enabled and the validity window cannot be parsed, the connection is rejected. CRL/OCSP enforcement remains future work: the configured CRL directories are not currently read.
+
 > Selecting `backend = "noise"` without the compiled `noise` feature fails secure-channel creation and rejects the connection; it never falls back to plaintext.
 
 If you enable `store_new_certs = "observed"`, ensure the `observed_dir` path is configured in

@@ -91,6 +91,7 @@ pub async fn spawn_udp_listener(
     peer_manager: PeerManager,
     plugin_manager: Arc<PluginManager>,
     local_node_id: String,
+    config: crate::config::Config,
     static_private: Vec<u8>,
     nat_state: Option<Arc<crate::network::nat_traversal::NatState>>,
 ) -> std::io::Result<(Arc<UdpSocket>, UdpSessions)> {
@@ -107,6 +108,7 @@ pub async fn spawn_udp_listener(
     let pm_recv = peer_manager.clone();
     let plugin_manager_recv = plugin_manager.clone();
     let node_id_recv = local_node_id.clone();
+    let config_recv = config;
     let key_recv = static_private.clone();
     let nat_recv = nat_state;
 
@@ -117,6 +119,7 @@ pub async fn spawn_udp_listener(
             pm_recv,
             plugin_manager_recv,
             node_id_recv,
+            config_recv,
             key_recv,
             nat_recv,
         )
@@ -128,12 +131,14 @@ pub async fn spawn_udp_listener(
 
 // ─── receive loop ─────────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 async fn run_recv_loop(
     socket: Arc<UdpSocket>,
     sessions: UdpSessions,
     peer_manager: PeerManager,
     plugin_manager: Arc<PluginManager>,
     local_node_id: String,
+    config: crate::config::Config,
     static_private: Vec<u8>,
     nat_state: Option<Arc<crate::network::nat_traversal::NatState>>,
 ) {
@@ -178,6 +183,7 @@ async fn run_recv_loop(
                 &sessions,
                 &peer_manager,
                 &local_node_id,
+                &config,
                 &static_private,
                 &mut rate_limits,
                 nat_state.as_deref(),
@@ -207,6 +213,7 @@ async fn handle_tncf(
     sessions: &UdpSessions,
     peer_manager: &PeerManager,
     local_node_id: &str,
+    config: &crate::config::Config,
     static_private: &[u8],
     rate_limits: &mut HashMap<IpAddr, IpRateEntry>,
     nat_state: Option<&crate::network::nat_traversal::NatState>,
@@ -330,35 +337,82 @@ async fn handle_tncf(
             }
             let noise_msg2 = &body[SESSION_ID_LEN..];
 
-            let mut map = sessions.lock().await;
-            if let Some(session) = map.get_mut(&session_id) {
+            // Advance the handshake while holding the sessions lock (required to
+            // mutate the session), but capture only small owned facts about a
+            // newly-established session and release the lock immediately
+            // afterwards. `finalize_session` may perform blocking file I/O
+            // (ADR-0008 Noise trust modes) and must never run while this lock is
+            // held — see the comment on `finalize_session` for why.
+            enum Advance {
+                SendMsg3 {
+                    msg3_bytes: Vec<u8>,
+                    established: Option<EstablishedSessionInfo>,
+                },
+                NoResponse,
+                Failed(String),
+            }
+
+            let advance = {
+                let mut map = sessions.lock().await;
+                let Some(session) = map.get_mut(&session_id) else {
+                    return;
+                };
                 match session.advance_handshake(noise_msg2, Some(local_node_id)) {
                     Ok(Some(msg3_bytes)) => {
-                        // Build TNCF HANDSHAKE_MSG3: [SESSION_ID][NOISE_MSG3]
-                        let mut tncf_body = Vec::with_capacity(SESSION_ID_LEN + msg3_bytes.len());
-                        tncf_body.extend_from_slice(&session_id);
-                        tncf_body.extend_from_slice(&msg3_bytes);
-                        let frame = build_tncf_frame(tncf_type::HANDSHAKE_MSG3, &tncf_body);
-                        let _ = socket.send_to(&frame, src).await;
-
-                        if session.is_established() {
-                            finalize_session(session, peer_manager).await;
+                        let established = session
+                            .is_established()
+                            .then(|| EstablishedSessionInfo::capture(session));
+                        Advance::SendMsg3 {
+                            msg3_bytes,
+                            established,
                         }
                     }
-                    Ok(None) => {
-                        // Should not happen for an initiator receiving msg2.
-                    }
+                    Ok(None) => Advance::NoResponse,
                     Err(e) => {
-                        crate::network::events::emit_network_event(
-                            "udp_listener",
-                            crate::events::model::LogLevel::Warn,
-                            "udp_hs_advance_failed",
-                            Some(src.to_string()),
-                            Some(e.to_string()),
-                            false,
-                        );
                         map.remove(&session_id);
+                        Advance::Failed(e.to_string())
                     }
+                }
+            };
+
+            match advance {
+                Advance::SendMsg3 {
+                    msg3_bytes,
+                    established,
+                } => {
+                    // Build TNCF HANDSHAKE_MSG3: [SESSION_ID][NOISE_MSG3]
+                    let mut tncf_body = Vec::with_capacity(SESSION_ID_LEN + msg3_bytes.len());
+                    tncf_body.extend_from_slice(&session_id);
+                    tncf_body.extend_from_slice(&msg3_bytes);
+                    let frame = build_tncf_frame(tncf_type::HANDSHAKE_MSG3, &tncf_body);
+                    let _ = socket.send_to(&frame, src).await;
+
+                    if let Some(info) = established {
+                        let accepted = finalize_session(
+                            session_id,
+                            info,
+                            peer_manager,
+                            config,
+                            crate::events::model::ConnectionRole::Outbound,
+                        )
+                        .await;
+                        if !accepted {
+                            sessions.lock().await.remove(&session_id);
+                        }
+                    }
+                }
+                Advance::NoResponse => {
+                    // Should not happen for an initiator receiving msg2.
+                }
+                Advance::Failed(e) => {
+                    crate::network::events::emit_network_event(
+                        "udp_listener",
+                        crate::events::model::LogLevel::Warn,
+                        "udp_hs_advance_failed",
+                        Some(src.to_string()),
+                        Some(e),
+                        false,
+                    );
                 }
             }
         }
@@ -374,28 +428,64 @@ async fn handle_tncf(
             }
             let noise_msg3 = &body[SESSION_ID_LEN..];
 
-            let mut map = sessions.lock().await;
-            if let Some(session) = map.get_mut(&session_id) {
+            // See the matching comment in the HANDSHAKE_MSG2 arm: capture owned
+            // facts and release the sessions lock before calling
+            // `finalize_session`, which may perform blocking file I/O.
+            enum Advance {
+                Established(EstablishedSessionInfo),
+                NotYetEstablished,
+                Unexpected,
+                Failed(String),
+            }
+
+            let advance = {
+                let mut map = sessions.lock().await;
+                let Some(session) = map.get_mut(&session_id) else {
+                    return;
+                };
                 match session.advance_handshake(noise_msg3, None) {
                     Ok(None) => {
                         if session.is_established() {
-                            finalize_session(session, peer_manager).await;
+                            Advance::Established(EstablishedSessionInfo::capture(session))
+                        } else {
+                            Advance::NotYetEstablished
                         }
                     }
-                    Ok(Some(_)) => {
-                        // Unexpected response in msg3 path.
-                    }
+                    Ok(Some(_)) => Advance::Unexpected,
                     Err(e) => {
-                        crate::network::events::emit_network_event(
-                            "udp_listener",
-                            crate::events::model::LogLevel::Warn,
-                            "udp_hs_msg3_failed",
-                            Some(src.to_string()),
-                            Some(e.to_string()),
-                            false,
-                        );
                         map.remove(&session_id);
+                        Advance::Failed(e.to_string())
                     }
+                }
+            };
+
+            match advance {
+                Advance::Established(info) => {
+                    let accepted = finalize_session(
+                        session_id,
+                        info,
+                        peer_manager,
+                        config,
+                        crate::events::model::ConnectionRole::Inbound,
+                    )
+                    .await;
+                    if !accepted {
+                        sessions.lock().await.remove(&session_id);
+                    }
+                }
+                Advance::NotYetEstablished => {}
+                Advance::Unexpected => {
+                    // Unexpected response in msg3 path.
+                }
+                Advance::Failed(e) => {
+                    crate::network::events::emit_network_event(
+                        "udp_listener",
+                        crate::events::model::LogLevel::Warn,
+                        "udp_hs_msg3_failed",
+                        Some(src.to_string()),
+                        Some(e),
+                        false,
+                    );
                 }
             }
         }
@@ -534,27 +624,114 @@ async fn handle_session_frame(
 
 // ─── Handshake completion callback ────────────────────────────────────────────
 
-async fn finalize_session(session: &NoiseUdpSession, peer_manager: &PeerManager) {
-    if let Some(node_id) = &session.node_id {
-        peer_manager
-            .set_transport_kind(node_id, TransportKind::Udp)
-            .await;
-        peer_manager
-            .set_udp_session_id(node_id, session.session_id)
-            .await;
-        crate::network::events::emit_network_event(
-            "udp_listener",
-            crate::events::model::LogLevel::Info,
-            "udp_session_established",
-            Some(session.peer_addr.to_string()),
-            Some(format!(
-                "node_id={} session={}",
-                node_id,
-                hex::encode(session.session_id)
-            )),
-            false,
-        );
+/// Owned facts about a just-established session, captured while the session-map
+/// lock is briefly held so the lock can be dropped before any further work runs.
+struct EstablishedSessionInfo {
+    node_id: Option<String>,
+    fingerprint: Option<[u8; 32]>,
+    peer_addr: SocketAddr,
+}
+
+impl EstablishedSessionInfo {
+    fn capture(session: &NoiseUdpSession) -> Self {
+        Self {
+            node_id: session.node_id.clone(),
+            fingerprint: session.remote_static_fingerprint(),
+            peer_addr: session.peer_addr,
+        }
     }
+}
+
+/// Evaluate Noise trust for a newly established session and, if accepted,
+/// register it with the peer manager.
+///
+/// Callers MUST NOT hold the `UdpSessions` lock while calling this function.
+/// Trust evaluation (`evaluate_noise_fingerprint`) may perform blocking file I/O
+/// for TOFU, directory-based allowlists, or observed-artifact storage (ADR-0008).
+/// Running that I/O — even via `spawn_blocking` — while the sessions mutex is held
+/// would stall every other UDP session, `send_udp`, and the session reaper on this
+/// node until the disk operation completes. This function accepts owned data
+/// instead of a session reference specifically so it cannot be called while
+/// borrowing the session map.
+async fn finalize_session(
+    session_id: [u8; SESSION_ID_LEN],
+    info: EstablishedSessionInfo,
+    peer_manager: &PeerManager,
+    config: &crate::config::Config,
+    role: crate::events::model::ConnectionRole,
+) -> bool {
+    let EstablishedSessionInfo {
+        node_id,
+        fingerprint,
+        peer_addr,
+    } = info;
+    let (Some(node_id), Some(fingerprint)) = (node_id, fingerprint) else {
+        return false;
+    };
+    let fingerprint = hex::encode(fingerprint);
+    let identity = format!("node:{node_id}");
+    let realm = config.realm.clone().unwrap_or_default();
+    let config_for_eval = config.clone();
+    let node_id_for_eval = node_id.clone();
+    let eval_result = tokio::task::spawn_blocking(move || {
+        crate::security::secure_channel::evaluate_noise_fingerprint(
+            &config_for_eval,
+            role,
+            peer_addr,
+            &realm,
+            false,
+            &identity,
+            &fingerprint,
+            None,
+        )
+    })
+    .await;
+
+    match eval_result {
+        Ok(Ok(_decision)) => {}
+        Ok(Err(err)) => {
+            crate::network::events::emit_network_event(
+                "udp_listener",
+                crate::events::model::LogLevel::Warn,
+                "udp_session_trust_rejected",
+                Some(peer_addr.to_string()),
+                Some(format!("node_id={node_id_for_eval} error={err}")),
+                false,
+            );
+            return false;
+        }
+        Err(join_err) => {
+            crate::network::events::emit_network_event(
+                "udp_listener",
+                crate::events::model::LogLevel::Warn,
+                "udp_session_trust_eval_panicked",
+                Some(peer_addr.to_string()),
+                Some(format!("node_id={node_id_for_eval} error={join_err}")),
+                false,
+            );
+            return false;
+        }
+    }
+
+    peer_manager
+        .set_transport_kind(&node_id_for_eval, TransportKind::Udp)
+        .await;
+    peer_manager
+        .set_udp_session_id(&node_id_for_eval, session_id)
+        .await;
+    crate::network::events::emit_network_event(
+        "udp_listener",
+        crate::events::model::LogLevel::Info,
+        "udp_session_established",
+        Some(peer_addr.to_string()),
+        Some(format!(
+            "node_id={} session={}",
+            node_id_for_eval,
+            hex::encode(session_id)
+        )),
+        false,
+    );
+    true
 }
 
 // ─── Outbound: initiate a UDP Noise session ────────────────────────────────────
@@ -688,9 +865,15 @@ async fn reap_sessions(sessions: &UdpSessions) {
 
 /// Resolve the Noise static keypair from the filesystem, generating it if absent.
 ///
-/// Looks for `pki/noise/static.key` relative to the process working directory.
-pub fn load_static_key() -> std::io::Result<(Vec<u8>, Vec<u8>)> {
-    let key_path = std::path::Path::new("pki/noise/static.key");
+/// Uses `encryption.noise.static_key_path`, defaulting to `pki/noise/static.key`.
+pub fn load_static_key(config: &crate::config::Config) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
+    let key_path = config
+        .encryption
+        .as_ref()
+        .and_then(|encryption| encryption.noise.as_ref())
+        .and_then(|noise| noise.static_key_path.as_deref())
+        .unwrap_or("pki/noise/static.key");
+    let key_path = std::path::Path::new(key_path);
     load_or_generate_static_keypair(key_path)
 }
 
@@ -704,6 +887,7 @@ mod tests {
     use crate::network::peer_store::PeerStore;
     use crate::plugin_host::{Plugin, PluginContext, PluginManager, PluginRegistrar};
     use async_trait::async_trait;
+    use std::path::Path;
 
     fn generate_noise_private_key() -> Vec<u8> {
         let params: snow::params::NoiseParams =
@@ -749,6 +933,218 @@ mod tests {
         (local, remote)
     }
 
+    fn noise_allowlist_config(fingerprint: &str) -> crate::config::Config {
+        crate::config::Config {
+            encryption: Some(crate::config::EncryptionConfig {
+                noise: Some(crate::config::EncryptionNoiseConfig {
+                    trust_policy: Some(crate::config::NoiseTrustPolicyConfig {
+                        mode: Some("allowlist".to_string()),
+                        allowlist_fingerprints: Some(vec![fingerprint.to_string()]),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn udp_session_applies_noise_allowlist_before_registration() {
+        let local_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let remote_addr: SocketAddr = "127.0.0.1:2".parse().unwrap();
+        let remote_node_id = "remote-peer";
+        let (session, _) = establish_pair(local_addr, remote_addr, remote_node_id, "local-node");
+        let fingerprint = hex::encode(
+            session
+                .remote_static_fingerprint()
+                .expect("established session fingerprint"),
+        );
+        let peer_manager = PeerManager::new();
+
+        assert!(
+            finalize_session(
+                session.session_id,
+                EstablishedSessionInfo::capture(&session),
+                &peer_manager,
+                &noise_allowlist_config(&fingerprint),
+                crate::events::model::ConnectionRole::Outbound,
+            )
+            .await
+        );
+        assert_eq!(
+            peer_manager.udp_session_id_for(remote_node_id).await,
+            Some(session.session_id)
+        );
+
+        let rejected_manager = PeerManager::new();
+        assert!(
+            !finalize_session(
+                session.session_id,
+                EstablishedSessionInfo::capture(&session),
+                &rejected_manager,
+                &noise_allowlist_config(
+                    "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                ),
+                crate::events::model::ConnectionRole::Outbound,
+            )
+            .await
+        );
+        assert_eq!(
+            rejected_manager.udp_session_id_for(remote_node_id).await,
+            None
+        );
+    }
+
+    fn noise_tofu_config(observed_dir: &Path) -> crate::config::Config {
+        crate::config::Config {
+            encryption: Some(crate::config::EncryptionConfig {
+                noise: Some(crate::config::EncryptionNoiseConfig {
+                    trust_policy: Some(crate::config::NoiseTrustPolicyConfig {
+                        mode: Some("tofu".to_string()),
+                        store_new: Some("observed".to_string()),
+                        paths: Some(crate::config::TrustPolicyPathsConfig {
+                            observed_dir: Some(observed_dir.to_string_lossy().into_owned()),
+                            allowlist_dir: None,
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Regression test for the disk-I/O-under-lock hazard: TOFU trust evaluation
+    /// reads/writes an on-disk observed-binding file (`evaluate_noise_fingerprint`
+    /// → `load_observed_fingerprint_binding`/`store_observed_fingerprint_binding`),
+    /// which is exactly the blocking path that must never run while the
+    /// `UdpSessions` lock is held. `finalize_session` takes owned data instead of a
+    /// session reference precisely so it cannot be called under that lock.
+    #[tokio::test]
+    async fn udp_session_finalize_applies_noise_tofu_with_directory_backed_binding() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = noise_tofu_config(temp.path());
+
+        let local_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let remote_addr: SocketAddr = "127.0.0.1:2".parse().unwrap();
+        let remote_node_id = "remote-peer";
+
+        // First handshake: TOFU has no prior binding, so it must be accepted and
+        // the binding persisted to disk.
+        let (session_a, _) = establish_pair(local_addr, remote_addr, remote_node_id, "local-node");
+        let peer_manager = PeerManager::new();
+        assert!(
+            finalize_session(
+                session_a.session_id,
+                EstablishedSessionInfo::capture(&session_a),
+                &peer_manager,
+                &config,
+                crate::events::model::ConnectionRole::Outbound,
+            )
+            .await
+        );
+        assert_eq!(
+            peer_manager.udp_session_id_for(remote_node_id).await,
+            Some(session_a.session_id)
+        );
+
+        // Second handshake from a different remote static key (impersonation
+        // attempt) under the same identity must be rejected because it no longer
+        // matches the persisted binding.
+        let (session_b, _) = establish_pair(local_addr, remote_addr, remote_node_id, "local-node");
+        let rejected_manager = PeerManager::new();
+        assert!(
+            !finalize_session(
+                session_b.session_id,
+                EstablishedSessionInfo::capture(&session_b),
+                &rejected_manager,
+                &config,
+                crate::events::model::ConnectionRole::Outbound,
+            )
+            .await
+        );
+        assert_eq!(
+            rejected_manager.udp_session_id_for(remote_node_id).await,
+            None
+        );
+    }
+
+    /// Regression test for directory-backed Noise allowlists, another
+    /// `finalize_session` path that performs blocking directory/file reads.
+    #[tokio::test]
+    async fn udp_session_finalize_applies_directory_backed_noise_allowlist() {
+        let temp = tempfile::tempdir().unwrap();
+        let local_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let remote_addr: SocketAddr = "127.0.0.1:2".parse().unwrap();
+        let remote_node_id = "remote-peer";
+        let (session, _) = establish_pair(local_addr, remote_addr, remote_node_id, "local-node");
+        let fingerprint = hex::encode(
+            session
+                .remote_static_fingerprint()
+                .expect("established session fingerprint"),
+        );
+        std::fs::write(temp.path().join(format!("{fingerprint}.noise")), b"").unwrap();
+
+        let config = crate::config::Config {
+            encryption: Some(crate::config::EncryptionConfig {
+                noise: Some(crate::config::EncryptionNoiseConfig {
+                    trust_policy: Some(crate::config::NoiseTrustPolicyConfig {
+                        mode: Some("allowlist".to_string()),
+                        paths: Some(crate::config::TrustPolicyPathsConfig {
+                            observed_dir: None,
+                            allowlist_dir: Some(temp.path().to_string_lossy().into_owned()),
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let peer_manager = PeerManager::new();
+        assert!(
+            finalize_session(
+                session.session_id,
+                EstablishedSessionInfo::capture(&session),
+                &peer_manager,
+                &config,
+                crate::events::model::ConnectionRole::Outbound,
+            )
+            .await
+        );
+        assert_eq!(
+            peer_manager.udp_session_id_for(remote_node_id).await,
+            Some(session.session_id)
+        );
+    }
+
+    #[test]
+    fn udp_static_key_uses_configured_noise_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let key_path = temp.path().join("identity").join("noise.key");
+        let config = crate::config::Config {
+            encryption: Some(crate::config::EncryptionConfig {
+                noise: Some(crate::config::EncryptionNoiseConfig {
+                    static_key_path: Some(key_path.to_string_lossy().into_owned()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let first = load_static_key(&config).expect("configured key should be generated");
+        let second = load_static_key(&config).expect("configured key should be reloaded");
+        assert_eq!(first, second);
+        assert!(key_path.exists());
+    }
+
     /// Plugin that answers every message by replying to `target_node_id` over UDP,
     /// re-entering `send_udp` on the same `sessions` map used by `handle_session_frame`.
     struct ReplyingPlugin {
@@ -757,6 +1153,10 @@ mod tests {
 
     #[async_trait]
     impl Plugin for ReplyingPlugin {
+        fn plugin_id(&self) -> &'static str {
+            "replying-plugin"
+        }
+
         async fn on_message(&self, _message: &Message, ctx: &PluginContext) {
             let _ = ctx
                 .peer_manager

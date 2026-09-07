@@ -60,6 +60,17 @@ hash = "BLAKE2s"
 # Optional: path to static private key for identity/pinning
 # static_key_path = "pki/own/noise_static.key"
 
+# Noise static-key trust policy. Fingerprints are lowercase SHA-256 hex.
+[encryption.noise.trust_policy]
+mode = "open"                       # open | allowlist | tofu | observe
+store_new = "none"                  # none | observed
+allowlist_fingerprints = []
+pin_fingerprints = []
+
+[encryption.noise.trust_policy.paths]
+allowlist_dir = "pki/noise/trusted"
+observed_dir = "pki/noise/observed"
+
 # Trust policy when TLS is enabled
 [encryption.trust_policy]
 mode = "open"                    # open | allowlist | tofu | observe | hybrid (future)
@@ -110,3 +121,8 @@ enabled = false                   # Enable this node to act as a relay
 store_forward = false             # Allow bounded buffering for temporarily absent peers
 # queue_max_per_target = 1024     # Optional override per-target cap
 # queue_max_global = 8192         # Optional override global cap across targets
+
+# Optional UPnP-IGD TCP port mapping (requires the `upnp` Cargo feature).
+[network.nat]
+enabled = false
+lease_duration_secs = 3600

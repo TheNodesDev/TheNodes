@@ -55,6 +55,7 @@ async fn mtls_open_mode_basic_handshake() {
                 realm_subject_binding: Some(false),
                 paths: Some(TrustPolicyPathsConfig {
                     observed_dir: Some("pki/observed/certs".to_string()),
+                    allowlist_dir: None,
                 }),
             }),
         }),

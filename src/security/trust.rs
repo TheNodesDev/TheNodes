@@ -9,6 +9,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::BufReader as StdBufReader;
 use std::io::Cursor;
+use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -68,6 +69,7 @@ pub struct EffectiveTrustPolicy {
     pub reject_expired: bool,
     pub reject_before_valid: bool,
     pub enforce_ca_chain: bool,
+    pub allowlist_fingerprints: Vec<String>,
     pub pin_subjects: Vec<String>,
     pub pin_fingerprints: Vec<String>,
     pub pin_fp_algo: String,
@@ -75,6 +77,17 @@ pub struct EffectiveTrustPolicy {
 }
 
 impl EffectiveTrustPolicy {
+    pub(crate) fn pinned_fingerprint_match(&self, fingerprint: Option<&str>) -> Option<bool> {
+        if self.pin_fingerprints.is_empty() {
+            return None;
+        }
+        Some(fingerprint.is_some_and(|fingerprint| {
+            self.pin_fingerprints
+                .iter()
+                .any(|pinned| fingerprints_equal(pinned, fingerprint))
+        }))
+    }
+
     pub fn from_config(cfg: &crate::config::EncryptionConfig) -> Self {
         // Pull nested trust_policy, fall back to defaults if absent
         if let Some(tp) = &cfg.trust_policy {
@@ -94,7 +107,7 @@ impl EffectiveTrustPolicy {
             let reject_before_valid = tp.reject_before_valid.unwrap_or(false);
             let enforce_ca_chain = tp.enforce_ca_chain.unwrap_or(false);
             let pin_subjects = tp.pin_subjects.clone().unwrap_or_default();
-            let pin_fingerprints = tp.pin_fingerprints.clone().unwrap_or_default();
+            let pin_fingerprints = normalize_fingerprint_list(tp.pin_fingerprints.clone());
             let pin_fp_algo = tp.pin_fp_algo.clone().unwrap_or_else(|| "sha256".into());
             let realm_subject_binding = tp.realm_subject_binding.unwrap_or(false);
             Self {
@@ -105,28 +118,96 @@ impl EffectiveTrustPolicy {
                 reject_expired,
                 reject_before_valid,
                 enforce_ca_chain,
+                allowlist_fingerprints: vec![],
                 pin_subjects,
                 pin_fingerprints,
                 pin_fp_algo,
                 realm_subject_binding,
             }
         } else {
-            // Default open / no store
-            Self {
-                mode: TrustMode::Open,
-                accept_self_signed: false,
-                store_new: StoreNew::None,
-                observed_dir: None,
-                reject_expired: false,
-                reject_before_valid: false,
-                enforce_ca_chain: false,
-                pin_subjects: vec![],
-                pin_fingerprints: vec![],
-                pin_fp_algo: "sha256".into(),
-                realm_subject_binding: false,
-            }
+            Self::open_defaults()
         }
     }
+
+    pub fn from_noise_config(cfg: Option<&crate::config::EncryptionNoiseConfig>) -> Self {
+        let Some(cfg) = cfg else {
+            return Self::open_defaults();
+        };
+        let Some(tp) = &cfg.trust_policy else {
+            return Self::open_defaults();
+        };
+        Self {
+            mode: tp
+                .mode
+                .as_deref()
+                .and_then(|mode| TrustMode::from_str(mode).ok())
+                .unwrap_or(TrustMode::Open),
+            accept_self_signed: false,
+            store_new: tp
+                .store_new
+                .as_deref()
+                .and_then(|mode| StoreNew::from_str(mode).ok())
+                .unwrap_or(StoreNew::None),
+            observed_dir: tp
+                .paths
+                .as_ref()
+                .and_then(|paths| paths.observed_dir.clone()),
+            reject_expired: false,
+            reject_before_valid: false,
+            enforce_ca_chain: false,
+            allowlist_fingerprints: normalize_fingerprint_list(tp.allowlist_fingerprints.clone()),
+            pin_subjects: vec![],
+            pin_fingerprints: normalize_fingerprint_list(tp.pin_fingerprints.clone()),
+            pin_fp_algo: "sha256".into(),
+            realm_subject_binding: false,
+        }
+    }
+
+    fn open_defaults() -> Self {
+        Self {
+            mode: TrustMode::Open,
+            accept_self_signed: false,
+            store_new: StoreNew::None,
+            observed_dir: None,
+            reject_expired: false,
+            reject_before_valid: false,
+            enforce_ca_chain: false,
+            allowlist_fingerprints: vec![],
+            pin_subjects: vec![],
+            pin_fingerprints: vec![],
+            pin_fp_algo: "sha256".into(),
+            realm_subject_binding: false,
+        }
+    }
+}
+
+fn normalize_fingerprint_list(values: Option<Vec<String>>) -> Vec<String> {
+    values
+        .unwrap_or_default()
+        .into_iter()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+/// Compare two fingerprint strings in constant time (with respect to their
+/// contents; the length check below is not constant-time, but fingerprint
+/// lengths are fixed-size hex digests and not secret).
+///
+/// Fingerprints are public SHA-256 digests derived from a peer's certificate or
+/// Noise static key, not secrets, so a variable-time comparison would not leak
+/// anything an attacker cannot already observe. This comparison is still
+/// constant-time as defense in depth and to avoid setting a precedent of
+/// short-circuiting comparisons in trust-decision code.
+fn fingerprints_equal(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
 }
 
 /// Outcome of a trust evaluation
@@ -189,6 +270,283 @@ impl TrustDecision {
             time_reason,
         }
     }
+
+    fn with_stored(mut self, stored: bool) -> Self {
+        self.stored = stored;
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ObservedArtifact<'a> {
+    pub extension: &'static str,
+    pub bytes: &'a [u8],
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FingerprintTrustInput<'a> {
+    pub fingerprint: Option<&'a str>,
+    pub additional_allowlisted_fingerprints: Option<&'a HashSet<String>>,
+    pub allowlist_error: Option<&'static str>,
+    pub identity: Option<&'a str>,
+    pub observed_artifact: Option<ObservedArtifact<'a>>,
+}
+
+pub fn evaluate_fingerprint_trust(
+    policy: &EffectiveTrustPolicy,
+    input: FingerprintTrustInput<'_>,
+) -> TrustDecision {
+    let fingerprint = input.fingerprint.map(str::to_owned);
+
+    if policy.pinned_fingerprint_match(input.fingerprint).is_some() {
+        let Some(fp) = input.fingerprint else {
+            return TrustDecision::reject("fp-missing", None, None, None, None, None);
+        };
+        if policy.pinned_fingerprint_match(Some(fp)) == Some(false) {
+            return TrustDecision::reject("fp-pin-mismatch", fingerprint, None, None, None, None);
+        }
+    }
+
+    let allowlist_contains = input.fingerprint.is_some_and(|fp| {
+        policy
+            .allowlist_fingerprints
+            .iter()
+            .any(|allowed| fingerprints_equal(allowed, fp))
+            || input
+                .additional_allowlisted_fingerprints
+                .is_some_and(|allowed| allowed.contains(fp))
+    });
+    let allowlist_available = !policy.allowlist_fingerprints.is_empty()
+        || input.additional_allowlisted_fingerprints.is_some();
+
+    match policy.mode {
+        TrustMode::Open => {
+            let stored_artifact = maybe_store_observed_artifact(policy, &input, false);
+            let stored_identity = maybe_record_observed_identity_if_requested(
+                policy,
+                input.identity,
+                input.fingerprint,
+                true,
+            );
+            let stored = stored_artifact || stored_identity;
+            TrustDecision::accept("open-policy", fingerprint, stored, None, None, None, None)
+        }
+        TrustMode::Allowlist => {
+            let Some(fp) = input.fingerprint else {
+                return TrustDecision::reject("fingerprint-missing", None, None, None, None, None);
+            };
+            if allowlist_contains {
+                TrustDecision::accept(
+                    "present-in-allowlist",
+                    Some(fp.to_string()),
+                    false,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            } else {
+                let stored_artifact = maybe_store_observed_artifact(policy, &input, false);
+                let stored_identity = maybe_record_observed_identity_if_requested(
+                    policy,
+                    input.identity,
+                    Some(fp),
+                    true,
+                );
+                let stored = stored_artifact || stored_identity;
+                let reason = if allowlist_available {
+                    "not-in-allowlist"
+                } else {
+                    input.allowlist_error.unwrap_or("no-allowlist")
+                };
+                TrustDecision::reject(reason, Some(fp.to_string()), None, None, None, None)
+                    .with_stored(stored)
+            }
+        }
+        TrustMode::Tofu => {
+            let Some(fp) = input.fingerprint else {
+                return TrustDecision::reject("fingerprint-missing", None, None, None, None, None);
+            };
+            let (Some(dir), Some(identity)) = (policy.observed_dir.as_deref(), input.identity)
+            else {
+                return TrustDecision::reject(
+                    "tofu-storage-unavailable",
+                    Some(fp.to_string()),
+                    None,
+                    None,
+                    None,
+                    None,
+                );
+            };
+            match load_observed_fingerprint_binding(dir, identity) {
+                Ok(Some(remembered)) => {
+                    if fingerprints_equal(&remembered, fp) {
+                        return TrustDecision::accept(
+                            "seen-before",
+                            Some(fp.to_string()),
+                            false,
+                            None,
+                            None,
+                            None,
+                            None,
+                        );
+                    }
+                    return TrustDecision::reject(
+                        "tofu-mismatch",
+                        Some(fp.to_string()),
+                        None,
+                        None,
+                        None,
+                        None,
+                    );
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    return TrustDecision::reject(
+                        "tofu-storage-unreadable",
+                        Some(fp.to_string()),
+                        None,
+                        None,
+                        None,
+                        None,
+                    );
+                }
+            }
+            if allowlist_contains {
+                return TrustDecision::accept(
+                    "seen-before",
+                    Some(fp.to_string()),
+                    false,
+                    None,
+                    None,
+                    None,
+                    None,
+                );
+            }
+            let stored_artifact = maybe_store_observed_artifact(policy, &input, false);
+            match create_observed_fingerprint_binding(dir, identity, fp) {
+                Ok(()) => TrustDecision::accept(
+                    "new-tofu",
+                    Some(fp.to_string()),
+                    true,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    match load_observed_fingerprint_binding(dir, identity) {
+                        Ok(Some(remembered)) if fingerprints_equal(&remembered, fp) => {
+                            TrustDecision::accept(
+                                "seen-before",
+                                Some(fp.to_string()),
+                                stored_artifact,
+                                None,
+                                None,
+                                None,
+                                None,
+                            )
+                        }
+                        Ok(Some(_)) => TrustDecision::reject(
+                            "tofu-mismatch",
+                            Some(fp.to_string()),
+                            None,
+                            None,
+                            None,
+                            None,
+                        ),
+                        _ => TrustDecision::reject(
+                            "tofu-storage-unreadable",
+                            Some(fp.to_string()),
+                            None,
+                            None,
+                            None,
+                            None,
+                        ),
+                    }
+                }
+                Err(_) => TrustDecision::reject(
+                    "tofu-storage-unwritable",
+                    Some(fp.to_string()),
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+            }
+        }
+        TrustMode::Observe => {
+            let stored_artifact = maybe_store_observed_artifact(policy, &input, true);
+            let stored_identity =
+                maybe_record_observed_identity(policy, input.identity, input.fingerprint, true);
+            let stored = stored_artifact || stored_identity;
+            TrustDecision::reject("observe-only", fingerprint, None, None, None, None)
+                .with_stored(stored)
+        }
+        TrustMode::HybridPlaceholder => {
+            let stored_artifact = maybe_store_observed_artifact(policy, &input, false);
+            let stored_identity = maybe_record_observed_identity_if_requested(
+                policy,
+                input.identity,
+                input.fingerprint,
+                true,
+            );
+            let stored = stored_artifact || stored_identity;
+            TrustDecision::accept(
+                "hybrid-placeholder-open",
+                fingerprint,
+                stored,
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+    }
+}
+
+fn maybe_store_observed_artifact(
+    policy: &EffectiveTrustPolicy,
+    input: &FingerprintTrustInput<'_>,
+    force: bool,
+) -> bool {
+    if !force && policy.store_new != StoreNew::Observed {
+        return false;
+    }
+    let (Some(dir), Some(fp), Some(artifact)) = (
+        policy.observed_dir.as_deref(),
+        input.fingerprint,
+        input.observed_artifact,
+    ) else {
+        return false;
+    };
+    store_observed_artifact(dir, fp, artifact.extension, artifact.bytes).is_ok()
+}
+
+fn maybe_record_observed_identity(
+    policy: &EffectiveTrustPolicy,
+    identity: Option<&str>,
+    fingerprint: Option<&str>,
+    overwrite: bool,
+) -> bool {
+    let (Some(dir), Some(identity), Some(fingerprint)) =
+        (policy.observed_dir.as_deref(), identity, fingerprint)
+    else {
+        return false;
+    };
+    store_observed_fingerprint_binding(dir, identity, fingerprint, overwrite).is_ok()
+}
+
+fn maybe_record_observed_identity_if_requested(
+    policy: &EffectiveTrustPolicy,
+    identity: Option<&str>,
+    fingerprint: Option<&str>,
+    overwrite: bool,
+) -> bool {
+    if policy.store_new != StoreNew::Observed {
+        return false;
+    }
+    maybe_record_observed_identity(policy, identity, fingerprint, overwrite)
 }
 
 /// Evaluate a peer certificate chain for its concrete TLS role.
@@ -340,30 +698,6 @@ fn evaluate_peer_cert_chain_at(
         }
     }
 
-    // Phase 3: pin enforcement (subject & fingerprint) before mode logic
-    if !policy.pin_fingerprints.is_empty() {
-        if let Some(ref fp) = leaf_fp {
-            if !policy.pin_fingerprints.iter().any(|p| p == fp) {
-                return TrustDecision::reject(
-                    "fp-pin-mismatch",
-                    leaf_fp,
-                    chain_valid,
-                    time_valid,
-                    chain_reason,
-                    time_reason,
-                );
-            }
-        } else {
-            return TrustDecision::reject(
-                "fp-missing",
-                None,
-                chain_valid,
-                time_valid,
-                chain_reason,
-                time_reason,
-            );
-        }
-    }
     if !policy.pin_subjects.is_empty() {
         match &leaf_subject {
             Some(subj) => {
@@ -417,229 +751,49 @@ fn evaluate_peer_cert_chain_at(
             }
         }
     }
-    let fp_ref = leaf_fp.clone();
-    match policy.mode {
-        TrustMode::Open => {
-            // Optionally store (Observed) only if we have a leaf and policy asks for it
-            let mut stored = false;
-            if policy.store_new == StoreNew::Observed {
-                if let (Some(dir), Some(fp), Some(first)) =
-                    (observed_dir, leaf_fp.as_ref(), peer_chain.first())
-                {
-                    // Write simple PEM if not already
-                    let pem_body = base64::engine::general_purpose::STANDARD.encode(first.as_ref());
-                    let pem = format!(
-                        "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
-                        pem_body
-                    );
-                    if store_observed_cert(dir, fp, pem.as_bytes()).is_ok() {
-                        stored = true;
-                    }
-                }
-            }
-            TrustDecision::accept(
-                "open-policy",
-                fp_ref,
-                stored,
-                chain_valid,
-                time_valid,
-                chain_reason,
-                time_reason,
-            )
-        }
-        TrustMode::Allowlist => {
-            if let Some(dir) = trusted_cert_dir {
-                if let Some(fp) = leaf_fp.as_ref() {
-                    if let Ok(set) = load_trusted_fingerprints(dir) {
-                        if set.contains(fp) {
-                            TrustDecision::accept(
-                                "present-in-trusted",
-                                fp_ref,
-                                false,
-                                chain_valid,
-                                time_valid,
-                                chain_reason,
-                                time_reason,
-                            )
-                        } else {
-                            if policy.store_new == StoreNew::Observed {
-                                if let (Some(obs_dir), Some(first)) =
-                                    (observed_dir, peer_chain.first())
-                                {
-                                    let pem_body = base64::engine::general_purpose::STANDARD
-                                        .encode(first.as_ref());
-                                    let pem = format!(
-                                        "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
-                                        pem_body
-                                    );
-                                    let _ = store_observed_cert(obs_dir, fp, pem.as_bytes());
-                                }
-                            }
-                            TrustDecision::reject(
-                                "not-in-trusted",
-                                fp_ref,
-                                chain_valid,
-                                time_valid,
-                                chain_reason,
-                                time_reason,
-                            )
-                        }
-                    } else {
-                        if policy.store_new == StoreNew::Observed {
-                            if let (Some(obs_dir), Some(first)) = (observed_dir, peer_chain.first())
-                            {
-                                if let Some(fp_inner) = fp_ref.as_ref() {
-                                    let pem_body = base64::engine::general_purpose::STANDARD
-                                        .encode(first.as_ref());
-                                    let pem = format!(
-                                        "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
-                                        pem_body
-                                    );
-                                    let _ = store_observed_cert(obs_dir, fp_inner, pem.as_bytes());
-                                }
-                            }
-                        }
-                        TrustDecision::reject(
-                            "trusted-dir-unreadable",
-                            fp_ref,
-                            chain_valid,
-                            time_valid,
-                            chain_reason,
-                            time_reason,
-                        )
-                    }
-                } else {
-                    TrustDecision::reject(
-                        "no-leaf-cert",
-                        None,
-                        chain_valid,
-                        time_valid,
-                        chain_reason,
-                        time_reason,
-                    )
-                }
-            } else {
-                TrustDecision::reject(
-                    "no-trusted-dir",
-                    fp_ref,
-                    chain_valid,
-                    time_valid,
-                    chain_reason,
-                    time_reason,
-                )
-            }
-        }
-        TrustMode::Tofu => {
-            if let Some(fp) = leaf_fp.as_ref() {
-                let mut seen = false;
-                if let Some(dir) = trusted_cert_dir {
-                    if let Ok(set) = load_trusted_fingerprints(dir) {
-                        if set.contains(fp) {
-                            seen = true;
-                        }
-                    }
-                }
-                if seen {
-                    return TrustDecision::accept(
-                        "seen-before",
-                        fp_ref,
-                        false,
-                        chain_valid,
-                        time_valid,
-                        chain_reason,
-                        time_reason,
-                    );
-                } else {
-                    // New key; optionally store observed
-                    let mut stored = false;
-                    if policy.store_new == StoreNew::Observed {
-                        if let (Some(dir), Some(first)) = (observed_dir, peer_chain.first()) {
-                            let pem_body =
-                                base64::engine::general_purpose::STANDARD.encode(first.as_ref());
-                            let pem = format!(
-                                "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
-                                pem_body
-                            );
-                            if store_observed_cert(dir, fp, pem.as_bytes()).is_ok() {
-                                stored = true;
-                            }
-                        }
-                    }
-                    return TrustDecision::accept(
-                        "new-tofu",
-                        fp_ref,
-                        stored,
-                        chain_valid,
-                        time_valid,
-                        chain_reason,
-                        time_reason,
-                    );
-                }
-            }
-            TrustDecision::reject(
-                "no-leaf-cert",
-                None,
-                chain_valid,
-                time_valid,
-                chain_reason,
-                time_reason,
-            )
-        }
-        TrustMode::HybridPlaceholder => {
-            // For now treat as open but note placeholder status
-            let mut stored = false;
-            if policy.store_new == StoreNew::Observed {
-                if let (Some(dir), Some(fp), Some(first)) = (
-                    observed_dir,
-                    peer_chain.first().and_then(spki_fingerprint).as_ref(),
-                    peer_chain.first(),
-                ) {
-                    let pem_body = base64::engine::general_purpose::STANDARD.encode(first.as_ref());
-                    let pem = format!(
-                        "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
-                        pem_body
-                    );
-                    if store_observed_cert(dir, fp, pem.as_bytes()).is_ok() {
-                        stored = true;
-                    }
-                }
-            }
-            TrustDecision::accept(
-                "hybrid-placeholder-open",
-                leaf_fp,
-                stored,
-                chain_valid,
-                time_valid,
-                chain_reason,
-                time_reason,
-            )
-        }
-        TrustMode::Observe => {
-            let mut stored = false;
-            if let (Some(dir), Some(fp), Some(first)) =
-                (observed_dir, leaf_fp.as_ref(), peer_chain.first())
-            {
-                let pem_body = base64::engine::general_purpose::STANDARD.encode(first.as_ref());
-                let pem = format!(
-                    "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
-                    pem_body
-                );
-                if store_observed_cert(dir, fp, pem.as_bytes()).is_ok() {
-                    stored = true;
-                }
-            }
-            TrustDecision {
-                outcome: TrustDecisionOutcome::Reject,
-                reason: "observe-only",
-                fingerprint: leaf_fp,
-                stored,
-                chain_valid,
-                time_valid,
-                chain_reason,
-                time_reason,
-            }
-        }
-    }
+    let trusted_fingerprints = trusted_cert_dir.map(load_trusted_fingerprints).transpose();
+    let allowlist_error = match (policy.mode, trusted_cert_dir, &trusted_fingerprints) {
+        (TrustMode::Allowlist, None, _) => Some("no-trusted-dir"),
+        (TrustMode::Allowlist, Some(_), Err(_)) => Some("trusted-dir-unreadable"),
+        _ => None,
+    };
+    let observed_pem = peer_chain.first().map(encode_certificate_pem);
+    let observed_artifact = observed_pem.as_deref().map(|pem| ObservedArtifact {
+        extension: "pem",
+        bytes: pem.as_bytes(),
+    });
+    let mut decision = evaluate_fingerprint_trust(
+        policy,
+        FingerprintTrustInput {
+            fingerprint: leaf_fp.as_deref(),
+            additional_allowlisted_fingerprints: trusted_fingerprints
+                .as_ref()
+                .ok()
+                .and_then(|set| set.as_ref()),
+            allowlist_error,
+            identity: observed_dir.and(leaf_subject.as_deref()),
+            observed_artifact,
+        },
+    );
+    decision.chain_valid = chain_valid;
+    decision.time_valid = time_valid;
+    decision.chain_reason = chain_reason;
+    decision.time_reason = time_reason;
+    decision
+}
+
+pub fn sha256_fingerprint_hex(bytes: &[u8]) -> String {
+    let mut h = Sha256::new();
+    h.update(bytes);
+    encode_string(&h.finalize())
+}
+
+fn encode_certificate_pem(cert: &CertificateDer<'_>) -> String {
+    let pem_body = base64::engine::general_purpose::STANDARD.encode(cert.as_ref());
+    format!(
+        "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
+        pem_body
+    )
 }
 
 /// Extract SHA-256 fingerprint of certificate SubjectPublicKeyInfo (SPKI)
@@ -647,17 +801,12 @@ pub fn spki_fingerprint(cert: &CertificateDer<'_>) -> Option<String> {
     let der = cert.as_ref();
     // First try proper parse using x509-parser for SPKI
     match x509_parser::parse_x509_certificate(der) {
-        Ok((_, parsed)) => {
-            let spki = parsed.tbs_certificate.subject_pki.raw;
-            let mut h = Sha256::new();
-            h.update(spki);
-            Some(encode_string(&h.finalize()))
-        }
+        Ok((_, parsed)) => Some(sha256_fingerprint_hex(
+            parsed.tbs_certificate.subject_pki.raw,
+        )),
         Err(_) => {
             // Fallback: hash full DER so we still have a stable identifier
-            let mut h = Sha256::new();
-            h.update(der);
-            Some(encode_string(&h.finalize()))
+            Some(sha256_fingerprint_hex(der))
         }
     }
 }
@@ -714,19 +863,146 @@ pub fn load_trusted_fingerprints(dir: &str) -> std::io::Result<HashSet<String>> 
     Ok(set)
 }
 
+/// Load approved Noise SHA-256 fingerprints from observed-style artifacts.
+pub fn load_noise_fingerprints(dir: &str) -> std::io::Result<HashSet<String>> {
+    let mut set = HashSet::new();
+    let path = PathBuf::from(dir);
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if let Some(stem) = path.file_stem().and_then(|value| value.to_str()) {
+            let normalized = stem.trim().to_ascii_lowercase();
+            if is_sha256_hex(&normalized) {
+                set.insert(normalized);
+                continue;
+            }
+        }
+        let contents = std::fs::read_to_string(&path)?;
+        for line in contents.lines() {
+            let candidate = line
+                .strip_prefix("fingerprint_sha256=")
+                .unwrap_or(line)
+                .trim()
+                .to_ascii_lowercase();
+            if is_sha256_hex(&candidate) {
+                set.insert(candidate);
+                break;
+            }
+        }
+    }
+    Ok(set)
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 /// Ensure observed directory exists
 pub fn ensure_observed_dir(dir: &str) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)
 }
 
-/// Store a newly observed certificate in PEM form using its fingerprint as filename
-pub fn store_observed_cert(dir: &str, fingerprint: &str, pem_bytes: &[u8]) -> std::io::Result<()> {
+fn observed_binding_path(dir: &str, identity: &str) -> PathBuf {
+    PathBuf::from(dir).join("bindings").join(format!(
+        "{}.txt",
+        sha256_fingerprint_hex(identity.as_bytes())
+    ))
+}
+
+pub fn load_observed_fingerprint_binding(
+    dir: &str,
+    identity: &str,
+) -> std::io::Result<Option<String>> {
+    let path = observed_binding_path(dir, identity);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content = fs::read_to_string(path)?;
+    for line in content.lines() {
+        if let Some(value) = line.strip_prefix("fingerprint=") {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Ok(Some(value.to_ascii_lowercase()));
+            }
+        }
+    }
+    let value = content.trim();
+    if value.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(value.to_ascii_lowercase()))
+    }
+}
+
+pub fn store_observed_fingerprint_binding(
+    dir: &str,
+    identity: &str,
+    fingerprint: &str,
+    overwrite: bool,
+) -> std::io::Result<()> {
+    let path = observed_binding_path(dir, identity);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let content = format!(
+        "fingerprint={}\nidentity={}\n",
+        fingerprint.to_ascii_lowercase(),
+        identity
+    );
+    if overwrite {
+        return std::fs::write(path, content);
+    }
+    match create_observed_fingerprint_binding(dir, identity, fingerprint) {
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        result => result,
+    }
+}
+
+fn create_observed_fingerprint_binding(
+    dir: &str,
+    identity: &str,
+    fingerprint: &str,
+) -> std::io::Result<()> {
+    let path = observed_binding_path(dir, identity);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let content = format!(
+        "fingerprint={}\nidentity={}\n",
+        fingerprint.to_ascii_lowercase(),
+        identity
+    );
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(content.as_bytes())
+}
+
+pub fn store_observed_artifact(
+    dir: &str,
+    fingerprint: &str,
+    extension: &str,
+    bytes: &[u8],
+) -> std::io::Result<()> {
     ensure_observed_dir(dir)?;
-    let path = PathBuf::from(dir).join(format!("{}.pem", fingerprint));
+    let path = PathBuf::from(dir).join(format!(
+        "{}.{}",
+        fingerprint,
+        extension.trim_start_matches('.')
+    ));
     if path.exists() {
         return Ok(());
     }
-    std::fs::write(path, pem_bytes)
+    std::fs::write(path, bytes)
+}
+
+/// Store a newly observed certificate in PEM form using its fingerprint as filename
+pub fn store_observed_cert(dir: &str, fingerprint: &str, pem_bytes: &[u8]) -> std::io::Result<()> {
+    store_observed_artifact(dir, fingerprint, "pem", pem_bytes)
 }
 
 /// Promote a certificate from observed_dir to trusted_cert_dir by copying the PEM file.
@@ -762,6 +1038,33 @@ pub fn promote_observed_to_trusted(
         let _ = dispatcher.tx.try_send(LogEvent::Promotion(evt));
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EffectiveTrustPolicy, StoreNew, TrustMode};
+
+    #[test]
+    fn reports_fingerprint_pin_match_independently_of_policy_outcome() {
+        let policy = EffectiveTrustPolicy {
+            mode: TrustMode::Observe,
+            accept_self_signed: false,
+            store_new: StoreNew::None,
+            observed_dir: None,
+            reject_expired: false,
+            reject_before_valid: false,
+            enforce_ca_chain: false,
+            allowlist_fingerprints: Vec::new(),
+            pin_subjects: Vec::new(),
+            pin_fingerprints: vec!["abc123".to_string()],
+            pin_fp_algo: "sha256".to_string(),
+            realm_subject_binding: false,
+        };
+
+        assert_eq!(policy.pinned_fingerprint_match(Some("abc123")), Some(true));
+        assert_eq!(policy.pinned_fingerprint_match(Some("def456")), Some(false));
+        assert_eq!(policy.pinned_fingerprint_match(None), Some(false));
+    }
 }
 
 #[derive(Debug, Default)]

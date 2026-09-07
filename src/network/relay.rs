@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::events::dispatcher;
 use crate::events::model::{LogEvent, LogLevel, SystemEvent};
-use crate::network::message::{Message, MessageType, Reason};
+use crate::network::message::{encode_relay_opaque_payload, Message, MessageType, Reason};
 use crate::network::peer_manager::PeerManager;
 use crate::realms::RealmInfo;
 
@@ -214,7 +214,7 @@ pub struct RelayForwardBuilder {
     from: String,
     to: String,
     sequence: Option<u64>,
-    payload: Option<crate::network::message::Payload>,
+    opaque_payload_b64: String,
 }
 
 impl RelayForwardBuilder {
@@ -223,7 +223,7 @@ impl RelayForwardBuilder {
             from: from.into(),
             to: to.into(),
             sequence: None,
-            payload: None,
+            opaque_payload_b64: String::new(),
         }
     }
     pub fn sequence(mut self, seq: u64) -> Self {
@@ -231,15 +231,15 @@ impl RelayForwardBuilder {
         self
     }
     pub fn payload_text(mut self, text: impl Into<String>) -> Self {
-        self.payload = Some(crate::network::message::Payload::Text(text.into()));
+        self.opaque_payload_b64 = encode_relay_opaque_payload(text.into());
         self
     }
     pub fn payload_json(mut self, json: serde_json::Value) -> Self {
-        self.payload = Some(crate::network::message::Payload::Json(json));
+        self.opaque_payload_b64 = encode_relay_opaque_payload(json.to_string());
         self
     }
     pub fn payload_binary(mut self, bytes: Vec<u8>) -> Self {
-        self.payload = Some(crate::network::message::Payload::Binary(bytes));
+        self.opaque_payload_b64 = encode_relay_opaque_payload(bytes);
         self
     }
     pub async fn send(
@@ -255,8 +255,9 @@ impl RelayForwardBuilder {
                 to: self.to.clone(),
                 from: self.from.clone(),
                 sequence: self.sequence,
+                opaque_payload_b64: self.opaque_payload_b64,
             },
-            self.payload,
+            None,
             realm,
         );
         let _ = peer_manager.send_to_addr(addr, msg.as_json()).await;
@@ -275,7 +276,13 @@ pub async fn handle_forward(
     if !relay_enabled {
         return;
     }
-    if let MessageType::RelayForward { to, from, sequence } = &msg.msg_type {
+    if let MessageType::RelayForward {
+        to,
+        from,
+        sequence,
+        opaque_payload_b64,
+    } = &msg.msg_type
+    {
         // Dedup/order enforcement: drop if sequence <= last seen
         if let Some(seq) = *sequence {
             if let Some(last) = peer_manager.last_sequence(from, to).await {
@@ -299,6 +306,7 @@ pub async fn handle_forward(
                     let realm_clone = msg.realm.clone();
                     let to_clone = to.clone();
                     let from_clone = msg.from.clone();
+                    let opaque_payload_b64_clone = opaque_payload_b64.clone();
                     // Optional: disable background retry via env for deterministic tests
                     if std::env::var("THENODES_DISABLE_RETRY").is_err() {
                         tokio::spawn(async move {
@@ -312,6 +320,7 @@ pub async fn handle_forward(
                                         to: to_clone.clone(),
                                         from: from_clone.clone(),
                                         sequence: Some(seq),
+                                        opaque_payload_b64: opaque_payload_b64_clone.clone(),
                                     },
                                     None,
                                     realm_clone.clone(),

@@ -27,6 +27,18 @@ pub struct Channel {
     pub auth: AuthSummary,
 }
 
+pub fn validate_authenticated_node_id(auth: &AuthSummary, node_id: &str) -> Result<()> {
+    if auth.backend == SecurityBackend::Noise {
+        let Some(bound) = auth.subject.as_deref() else {
+            anyhow::bail!("Noise handshake node identity is missing");
+        };
+        if bound != node_id {
+            anyhow::bail!("Noise handshake node identity does not match HELLO node_id");
+        }
+    }
+    Ok(())
+}
+
 #[async_trait]
 pub trait SecureChannel: Send + Sync {
     async fn connect(
@@ -505,27 +517,194 @@ impl NoiseSecureChannel {
 }
 
 #[cfg(feature = "noise")]
+const NOISE_XX_PARAMS: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
+
+#[cfg(feature = "noise")]
+fn load_noise_static_keypair(config: &crate::config::Config) -> Result<(Vec<u8>, Vec<u8>)> {
+    let key_path = config
+        .encryption
+        .as_ref()
+        .and_then(|enc| enc.noise.as_ref())
+        .and_then(|noise| noise.static_key_path.as_deref())
+        .unwrap_or("pki/noise/static.key");
+    crate::network::udp_session::load_or_generate_static_keypair(std::path::Path::new(key_path))
+        .map_err(|err| {
+            anyhow::anyhow!("failed to load Noise static keypair from {key_path}: {err}")
+        })
+}
+
+#[cfg(feature = "noise")]
+fn local_noise_node_id(config: &crate::config::Config) -> String {
+    config
+        .node
+        .as_ref()
+        .map(crate::config::NodeConfig::resolve_node_id)
+        .unwrap_or_else(|| "unknown-node".to_string())
+}
+
+#[cfg(feature = "noise")]
+fn parse_noise_node_id(payload: &[u8]) -> Result<Option<String>> {
+    if payload.is_empty() {
+        anyhow::bail!("Noise handshake node identity is missing");
+    }
+    let node_id = std::str::from_utf8(payload)
+        .map_err(|_| anyhow::anyhow!("Noise handshake node identity is not UTF-8"))?;
+    if node_id.is_empty()
+        || node_id.len() > 128
+        || !node_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        anyhow::bail!("Noise handshake node identity is invalid");
+    }
+    Ok(Some(node_id.to_string()))
+}
+
+#[cfg(feature = "noise")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn evaluate_noise_fingerprint(
+    config: &crate::config::Config,
+    role: crate::events::model::ConnectionRole,
+    peer_addr: std::net::SocketAddr,
+    realm: &crate::realms::RealmInfo,
+    allow_console: bool,
+    identity: &str,
+    fingerprint: &str,
+    remote_static: Option<&[u8]>,
+) -> Result<crate::security::trust::TrustDecision> {
+    use crate::events::{
+        dispatcher,
+        model::{BindingStatus, LogEvent, LogLevel, TrustDecisionEvent},
+    };
+    use crate::security::trust::{
+        evaluate_fingerprint_trust, load_noise_fingerprints, EffectiveTrustPolicy,
+        FingerprintTrustInput, ObservedArtifact, TrustDecisionOutcome,
+    };
+
+    let noise_config = config
+        .encryption
+        .as_ref()
+        .and_then(|enc| enc.noise.as_ref());
+    let policy = EffectiveTrustPolicy::from_noise_config(noise_config);
+    let allowlist_dir = noise_config
+        .and_then(|noise| noise.trust_policy.as_ref())
+        .and_then(|trust| trust.paths.as_ref())
+        .and_then(|paths| paths.allowlist_dir.as_deref());
+    let directory_fingerprints = allowlist_dir.map(load_noise_fingerprints).transpose();
+    let allowlist_error = match (policy.mode, allowlist_dir, &directory_fingerprints) {
+        (crate::security::trust::TrustMode::Allowlist, Some(_), Err(_)) => {
+            Some("allowlist-dir-unreadable")
+        }
+        _ => None,
+    };
+    let mut observed = format!("kind=noise-static-key\nfingerprint_sha256={fingerprint}\n");
+    if let Some(remote_static) = remote_static {
+        observed.push_str(&format!("public_key_hex={}\n", hex::encode(remote_static)));
+    }
+    let observed = observed.into_bytes();
+    let decision = evaluate_fingerprint_trust(
+        &policy,
+        FingerprintTrustInput {
+            fingerprint: Some(fingerprint),
+            additional_allowlisted_fingerprints: directory_fingerprints
+                .as_ref()
+                .ok()
+                .and_then(|fingerprints| fingerprints.as_ref()),
+            allowlist_error,
+            identity: Some(identity),
+            observed_artifact: Some(ObservedArtifact {
+                extension: "noise",
+                bytes: &observed,
+            }),
+        },
+    );
+
+    let mut meta = dispatcher::meta("trust", LogLevel::Info);
+    meta.corr_id = Some(dispatcher::correlation_id());
+    if !allow_console {
+        meta.suppress_console = true;
+    }
+    dispatcher::emit(LogEvent::TrustDecision(TrustDecisionEvent {
+        meta,
+        role,
+        decision: format!("{:?}", decision.outcome),
+        reason: decision.reason.to_string(),
+        mode: format!("{:?}", policy.mode),
+        fingerprint: decision.fingerprint.clone(),
+        pinned_fingerprint_match: policy.pinned_fingerprint_match(Some(fingerprint)),
+        pinned_subject_match: None,
+        realm_binding: BindingStatus::NotApplied,
+        chain_valid: None,
+        chain_reason: None,
+        time_valid: None,
+        time_reason: None,
+        stored: Some(decision.stored.to_string()),
+        peer_addr: Some(peer_addr.to_string()),
+        realm: Some(realm.canonical_code()),
+        dry_run: false,
+        override_action: None,
+    }));
+    if matches!(decision.outcome, TrustDecisionOutcome::Reject) {
+        anyhow::bail!("trust policy reject");
+    }
+    Ok(decision)
+}
+
+#[cfg(feature = "noise")]
+fn evaluate_noise_remote_static_key(
+    config: &crate::config::Config,
+    role: crate::events::model::ConnectionRole,
+    peer_addr: std::net::SocketAddr,
+    realm: &crate::realms::RealmInfo,
+    allow_console: bool,
+    remote_node_id: Option<&str>,
+    remote_static: &[u8],
+) -> Result<crate::security::trust::TrustDecision> {
+    let fingerprint = crate::security::trust::sha256_fingerprint_hex(remote_static);
+    let identity = remote_node_id
+        .map(|node_id| format!("node:{node_id}"))
+        .unwrap_or_else(|| match role {
+            crate::events::model::ConnectionRole::Inbound => {
+                format!("noise-inbound:{}", peer_addr.ip())
+            }
+            crate::events::model::ConnectionRole::Outbound => {
+                format!("noise-outbound:{peer_addr}")
+            }
+        });
+    evaluate_noise_fingerprint(
+        config,
+        role,
+        peer_addr,
+        realm,
+        allow_console,
+        &identity,
+        &fingerprint,
+        Some(remote_static),
+    )
+}
+
+#[cfg(feature = "noise")]
 #[async_trait]
 impl SecureChannel for NoiseSecureChannel {
     async fn connect(
         &self,
         stream: TcpStream,
-        _peer_addr: std::net::SocketAddr,
-        _realm: &crate::realms::RealmInfo,
-        _config: &crate::config::Config,
-        _allow_console: bool,
+        peer_addr: std::net::SocketAddr,
+        realm: &crate::realms::RealmInfo,
+        config: &crate::config::Config,
+        allow_console: bool,
     ) -> Result<Channel> {
         use snow::Builder as NoiseBuilder;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let params = "Noise_XX_25519_ChaChaPoly_BLAKE2s".parse().unwrap();
+        let (static_private, _) = load_noise_static_keypair(config)?;
+        let params = NOISE_XX_PARAMS.parse().unwrap();
         let builder = NoiseBuilder::new(params);
-        let kp = builder.generate_keypair().unwrap();
         let mut pattern = builder
-            .local_private_key(&kp.private)
+            .local_private_key(&static_private)
             .build_initiator()
             .unwrap();
         let mut buf = vec![0u8; 65535];
-        let mut write_msg = vec![0u8; 0];
+        let mut handshake_payload = vec![0u8; 256];
         // Stage 1: send first message
         let len = pattern
             .write_message(&[], &mut buf)
@@ -550,12 +729,14 @@ impl SecureChannel for NoiseSecureChannel {
             rstream.read_exact(&mut rbuf),
         )
         .await??;
-        pattern
-            .read_message(&rbuf, &mut write_msg)
+        let remote_identity_len = pattern
+            .read_message(&rbuf, &mut handshake_payload)
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let remote_node_id = parse_noise_node_id(&handshake_payload[..remote_identity_len])?;
         // Final handshake message
+        let local_node_id = local_noise_node_id(config);
         let len3 = pattern
-            .write_message(&[], &mut buf)
+            .write_message(local_node_id.as_bytes(), &mut buf)
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         tokio::time::timeout(
             std::time::Duration::from_secs(3),
@@ -567,6 +748,21 @@ impl SecureChannel for NoiseSecureChannel {
             wstream.write_all(&buf[..len3]),
         )
         .await??;
+        let remote_static = pattern
+            .get_remote_static()
+            .ok_or_else(|| {
+                anyhow::anyhow!("noise handshake completed without a remote static key")
+            })?
+            .to_vec();
+        let decision = evaluate_noise_remote_static_key(
+            config,
+            crate::events::model::ConnectionRole::Outbound,
+            peer_addr,
+            realm,
+            allow_console,
+            remote_node_id.as_deref(),
+            &remote_static,
+        )?;
         let transport = pattern
             .into_transport_mode()
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
@@ -582,10 +778,10 @@ impl SecureChannel for NoiseSecureChannel {
             writer,
             auth: AuthSummary {
                 backend: SecurityBackend::Noise,
-                fingerprint: None,
-                subject: None,
+                fingerprint: decision.fingerprint,
+                subject: remote_node_id,
                 decision: "Accept".into(),
-                reason: "noise(xx)".into(),
+                reason: decision.reason.to_string(),
                 chain_valid: None,
                 time_valid: None,
             },
@@ -595,18 +791,18 @@ impl SecureChannel for NoiseSecureChannel {
     async fn accept(
         &self,
         stream: TcpStream,
-        _peer_addr: std::net::SocketAddr,
-        _realm: &crate::realms::RealmInfo,
-        _config: &crate::config::Config,
-        _allow_console: bool,
+        peer_addr: std::net::SocketAddr,
+        realm: &crate::realms::RealmInfo,
+        config: &crate::config::Config,
+        allow_console: bool,
     ) -> Result<Channel> {
         use snow::Builder as NoiseBuilder;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let params = "Noise_XX_25519_ChaChaPoly_BLAKE2s".parse().unwrap();
+        let (static_private, _) = load_noise_static_keypair(config)?;
+        let params = NOISE_XX_PARAMS.parse().unwrap();
         let builder = NoiseBuilder::new(params);
-        let kp = builder.generate_keypair().unwrap();
         let mut pattern = builder
-            .local_private_key(&kp.private)
+            .local_private_key(&static_private)
             .build_responder()
             .unwrap();
         let (mut rstream, mut wstream) = stream.into_split();
@@ -622,8 +818,9 @@ impl SecureChannel for NoiseSecureChannel {
         pattern
             .read_message(&rbuf1, &mut out)
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let local_node_id = local_noise_node_id(config);
         let len2 = pattern
-            .write_message(&[], &mut out)
+            .write_message(local_node_id.as_bytes(), &mut out)
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         tokio::time::timeout(
             std::time::Duration::from_secs(3),
@@ -643,10 +840,26 @@ impl SecureChannel for NoiseSecureChannel {
             rstream.read_exact(&mut rbuf3),
         )
         .await??;
-        let mut final_out = vec![0u8; 0];
-        pattern
+        let mut final_out = vec![0u8; 256];
+        let remote_identity_len = pattern
             .read_message(&rbuf3, &mut final_out)
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let remote_node_id = parse_noise_node_id(&final_out[..remote_identity_len])?;
+        let remote_static = pattern
+            .get_remote_static()
+            .ok_or_else(|| {
+                anyhow::anyhow!("noise handshake completed without a remote static key")
+            })?
+            .to_vec();
+        let decision = evaluate_noise_remote_static_key(
+            config,
+            crate::events::model::ConnectionRole::Inbound,
+            peer_addr,
+            realm,
+            allow_console,
+            remote_node_id.as_deref(),
+            &remote_static,
+        )?;
         let transport = pattern
             .into_transport_mode()
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
@@ -661,10 +874,10 @@ impl SecureChannel for NoiseSecureChannel {
             writer,
             auth: AuthSummary {
                 backend: SecurityBackend::Noise,
-                fingerprint: None,
-                subject: None,
+                fingerprint: decision.fingerprint,
+                subject: remote_node_id,
                 decision: "Accept".into(),
-                reason: "noise(xx)".into(),
+                reason: decision.reason.to_string(),
                 chain_valid: None,
                 time_valid: None,
             },

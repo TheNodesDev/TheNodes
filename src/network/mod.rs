@@ -4,6 +4,8 @@ pub mod delivery;
 pub(crate) mod events;
 pub mod listener;
 pub mod message;
+#[cfg(feature = "upnp")]
+pub mod nat_portmap;
 #[cfg(feature = "noise")]
 pub mod nat_traversal;
 pub mod peer;
@@ -32,7 +34,10 @@ pub use peer_manager::PeerManager;
 pub use peer_store::{PeerSource, PeerStore};
 pub use transport::connect_to_peer;
 
-pub(crate) fn advertised_capabilities(config: &crate::config::Config) -> Option<Vec<String>> {
+pub(crate) fn advertised_capabilities(
+    config: &crate::config::Config,
+    peer_manager: Option<&crate::network::peer_manager::PeerManager>,
+) -> Option<Vec<String>> {
     let mut caps = Vec::new();
     if let Some(relay) = config.network.as_ref().and_then(|n| n.relay.as_ref()) {
         if relay.enabled.unwrap_or(false) {
@@ -70,11 +75,24 @@ pub(crate) fn advertised_capabilities(config: &crate::config::Config) -> Option<
             }
         }
     }
+    if peer_manager.is_some_and(|manager| manager.direct_tcp_hint()) {
+        caps.push("direct_tcp".to_string());
+    }
     if caps.is_empty() {
         None
     } else {
         Some(caps)
     }
+}
+
+pub(crate) fn hello_listen_addr(
+    peer_manager: Option<&crate::network::peer_manager::PeerManager>,
+    local_ip: std::net::IpAddr,
+    listen_port: u16,
+) -> Option<String> {
+    peer_manager
+        .and_then(|manager| manager.public_tcp_hello_addr())
+        .or_else(|| Some(format!("{}:{}", local_ip, listen_port)))
 }
 
 /// Compute the UDP listen address to advertise in HELLO messages.
@@ -129,8 +147,9 @@ impl Network {
 
 #[cfg(test)]
 mod tests {
-    use super::{advertised_capabilities, udp_hello_addr};
+    use super::{advertised_capabilities, hello_listen_addr, udp_hello_addr};
     use crate::config::{Config, UdpConfig};
+    use crate::network::PeerManager;
 
     fn config_with_udp(enabled: bool, listen_port: Option<u16>) -> Config {
         let mut config = Config::default();
@@ -148,11 +167,11 @@ mod tests {
     #[test]
     fn udp_capability_respects_feature_and_config() {
         let disabled_cfg = config_with_udp(false, Some(4444));
-        let disabled_caps = advertised_capabilities(&disabled_cfg).unwrap_or_default();
+        let disabled_caps = advertised_capabilities(&disabled_cfg, None).unwrap_or_default();
         assert!(!disabled_caps.iter().any(|cap| cap == "udp"));
 
         let enabled_cfg = config_with_udp(true, Some(4444));
-        let enabled_caps = advertised_capabilities(&enabled_cfg).unwrap_or_default();
+        let enabled_caps = advertised_capabilities(&enabled_cfg, None).unwrap_or_default();
 
         if cfg!(feature = "noise") {
             assert!(enabled_caps.iter().any(|cap| cap == "udp"));
@@ -187,5 +206,34 @@ mod tests {
         } else {
             assert_eq!(udp_hello_addr(&enabled_cfg_default_port, local_ip), None);
         }
+    }
+
+    #[tokio::test]
+    async fn hello_metadata_prefers_direct_tcp_hint_and_public_mapping() {
+        let mut config = Config::default();
+        if let Some(network) = config.network.as_mut() {
+            network.udp = Some(UdpConfig {
+                enabled: Some(false),
+                listen_port: None,
+                max_datagram_bytes: Some(1200),
+                max_app_payload_bytes: Some(1176),
+            });
+        }
+
+        let peer_manager = PeerManager::new();
+        peer_manager.set_public_tcp_hello_addr(Some("198.51.100.24:50000".to_string()));
+        peer_manager.set_direct_tcp_hint(true);
+
+        assert_eq!(
+            hello_listen_addr(
+                Some(&peer_manager),
+                "10.0.0.10".parse().unwrap(),
+                config.port
+            ),
+            Some("198.51.100.24:50000".to_string())
+        );
+
+        let caps = advertised_capabilities(&config, Some(&peer_manager)).unwrap_or_default();
+        assert!(caps.iter().any(|cap| cap == "direct_tcp"));
     }
 }

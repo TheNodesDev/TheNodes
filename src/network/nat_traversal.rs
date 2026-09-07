@@ -287,6 +287,8 @@ pub async fn handle_observe_resp(peer_manager: &PeerManager, src: SocketAddr, bo
         Some(format!("addr={}", addr_str)),
         false,
     );
+    #[cfg(feature = "upnp")]
+    crate::network::nat_portmap::refresh_nat_diagnostic(peer_manager, false).await;
 }
 
 /// Send a TNCF `OBSERVE_REQ` (initial probe, cookie_len = 0) to `target_addr`.

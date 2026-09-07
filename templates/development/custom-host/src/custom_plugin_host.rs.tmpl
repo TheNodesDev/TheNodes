@@ -363,6 +363,10 @@ impl CustomPluginHost {
 
 #[async_trait::async_trait]
 impl Plugin for CustomPluginHost {
+    fn plugin_id(&self) -> &'static str {
+        "{{APP_NAME}}"
+    }
+
     async fn on_message(&self, message: &Message, ctx: &PluginContext) {
         if let Err(error) = self.handle_network_message(message, ctx).await {
             log::error!("Custom host message handling failed: {}", error);

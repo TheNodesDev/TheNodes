@@ -119,6 +119,10 @@ impl BusinessLogic {
 
 #[async_trait::async_trait]
 impl Plugin for BusinessLogic {
+    fn plugin_id(&self) -> &'static str {
+        "business_logic"
+    }
+
     async fn on_message(&self, message: &Message, _ctx: &PluginContext) {
         self.handle_network_message(message).await;
     }

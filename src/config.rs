@@ -51,6 +51,21 @@ pub struct EncryptionPaths {
 pub struct TrustPolicyPathsConfig {
     /// Directory where newly observed certificates (e.g. TOFU) are written
     pub observed_dir: Option<String>,
+    /// Directory containing approved Noise fingerprint artifacts.
+    pub allowlist_dir: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct NoiseTrustPolicyConfig {
+    /// mode: open | allowlist | tofu | observe
+    pub mode: Option<String>,
+    /// store_new: none | observed
+    pub store_new: Option<String>,
+    /// Noise static-key allowlist (SHA-256 hex fingerprints)
+    pub allowlist_fingerprints: Option<Vec<String>>,
+    /// Noise static-key pins (SHA-256 hex fingerprints)
+    pub pin_fingerprints: Option<Vec<String>>,
+    pub paths: Option<TrustPolicyPathsConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -60,6 +75,7 @@ pub struct EncryptionNoiseConfig {
     pub cipher: Option<String>,
     pub hash: Option<String>,
     pub static_key_path: Option<String>,
+    pub trust_policy: Option<NoiseTrustPolicyConfig>,
 }
 
 // Default derived above
@@ -232,6 +248,7 @@ impl Default for Config {
             network: Some(NetworkConfig {
                 persistence: Some(NetworkPersistenceConfig::default()),
                 relay: Some(RelayConfig::default()),
+                nat: Some(NatConfig::default()),
                 udp: None,
                 connection_policy: None,
                 nat_traversal: None,
@@ -447,6 +464,31 @@ impl Default for ConnectionPolicyConfig {
     }
 }
 
+/// Optional UPnP-IGD port mapping and NAT diagnostics configuration (ADR-0009).
+///
+/// ```toml
+/// [network.nat]
+/// enabled = false
+/// lease_duration_secs = 3600
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct NatConfig {
+    /// Enable UPnP-IGD discovery and TCP listen-port mapping.
+    pub enabled: Option<bool>,
+    /// Requested lease duration for the mapped TCP listen port.
+    /// A value of `0` requests an infinite lease when supported by the gateway.
+    pub lease_duration_secs: Option<u32>,
+}
+
+impl Default for NatConfig {
+    fn default() -> Self {
+        Self {
+            enabled: Some(false),
+            lease_duration_secs: Some(3600),
+        }
+    }
+}
+
 /// NAT traversal and hole-punching configuration (ADR-0005).
 ///
 /// ```toml
@@ -518,6 +560,8 @@ pub struct NetworkConfig {
     pub persistence: Option<NetworkPersistenceConfig>,
     /// Relay configuration (optional; opt-in)
     pub relay: Option<RelayConfig>,
+    /// TCP NAT discovery and UPnP-IGD listen-port mapping.
+    pub nat: Option<NatConfig>,
     /// UDP + Noise transport configuration (optional; opt-in, ADR-0004)
     pub udp: Option<UdpConfig>,
     /// Connection preference policy (ADR-0005 Phase 1)

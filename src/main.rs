@@ -254,6 +254,21 @@ async fn main() {
     //println!("{}Loaded config (post overrides): {:?}", ICON_PLACEHOLDER, config);
     println!("{}Realm: {:?}", ICON_PLACEHOLDER, realm);
 
+    #[cfg(feature = "upnp")]
+    if let Some(nat_cfg) = config
+        .network
+        .as_ref()
+        .and_then(|network| network.nat.as_ref())
+    {
+        thenodes::network::nat_portmap::initialize_port_mapping(
+            peer_manager.as_ref(),
+            nat_cfg,
+            config.port,
+            !args.prompt,
+        )
+        .await;
+    }
+
     // Start listener in the background
     let port = config.port;
     let listener_manager = peer_manager.clone();
@@ -309,7 +324,7 @@ async fn main() {
                 peer_manager.set_nat_state(nat.clone()).await;
             }
 
-            match thenodes::network::udp_listener::load_static_key() {
+            match thenodes::network::udp_listener::load_static_key(&config) {
                 Ok((static_private, _static_public)) => {
                     let udp_port = config
                         .network
@@ -324,6 +339,7 @@ async fn main() {
                         (*peer_manager).clone(),
                         plugin_manager.clone(),
                         node_id.clone(),
+                        config.clone(),
                         static_private.clone(),
                         nat_state_opt.clone(),
                     )

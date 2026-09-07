@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 use thenodes::network::{
-    message::{Message, MessageType},
+    message::{encode_relay_opaque_payload, Message, MessageType},
     peer_manager::PeerManager,
 };
 
@@ -26,6 +26,7 @@ async fn relay_forward_ttl_expired_does_not_enqueue() {
             to: "node-b".to_string(),
             from: "node-a".to_string(),
             sequence: Some(1),
+            opaque_payload_b64: encode_relay_opaque_payload(""),
         },
         None,
         None,

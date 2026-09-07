@@ -19,7 +19,7 @@ thenodes = "0.3.0"
 
 This guide targets version 0.3.0.
 
-Dynamic plugins must use the same TheNodes release as the host because 0.3.0 uses plugin ABI version 2. Pin plugin dependencies to `thenodes = "=0.3.0"` when reproducible ABI matching is required.
+Dynamic plugins must use the same TheNodes release as the host. Pin plugin dependencies to the exact host version when reproducible ABI matching is required. The unreleased plugin API uses ABI version 3.
 
 ## What Is TheNodes?
 
@@ -275,9 +275,12 @@ CAL Mode Note: When embedding as a library, you *may* still internally structure
   ```
   In prompt mode you can type `version` (or `about`) to display the running application version, protocol version, git commit (if embedded), and build timestamp.
 
-## Networking and Delivery in 0.3.0
+## Networking and Delivery
 
-Version 0.3.0 adds optional UDP + Noise transport, policy-driven route selection, NAT traversal, connection lifecycle monitoring, and framework-owned delivery semantics. Existing configurations remain valid because these sections are optional and default conservatively.
+The unreleased changes add optional UPnP-IGD port mapping, NAT diagnostics, explicit relay
+payload framing, Noise static-key trust, and isolated plugin data directories. The
+UDP + Noise transport, connection policy, lifecycle monitoring, and delivery
+semantics introduced in 0.3.0 remain available.
 
 ### UDP + Noise Transport
 
@@ -334,6 +337,22 @@ probe_interval_ms = 100
 
 Enabling traversal requires `[network.udp].enabled = true` and a build with the `noise` feature. Serving observation and punch coordination additionally requires `[network.relay].enabled = true`.
 
+Optional UPnP-IGD support maps the TCP listen port and advertises the public mapping
+through HELLO metadata:
+
+```sh
+cargo build --release --features upnp
+```
+
+```toml
+[network.nat]
+enabled = true
+lease_duration_secs = 3600
+```
+
+NAT diagnostics compare fresh observed UDP endpoints and the gateway address. PCP
+and NAT-PMP are not implemented in 0.4.0.
+
 ### Delivery Semantics
 
 The delivery layer provides three classes:
@@ -342,7 +361,7 @@ The delivery layer provides three classes:
 - `Reliable`: uses a stable UUID v7 message ID, framework acknowledgements, retries, and duplicate suppression.
 - `OrderedReliable`: adds ordering within a required caller-supplied ordering key.
 
-Plugins send through `PluginContext::deliver_message(...)` or `PluginContext::send_message(...)` with `DeliveryOptions`. Delivery state, deduplication, retries, and ordering are scoped to the current process lifetime; 0.3.0 does not promise durable delivery across restarts.
+Plugins send through `PluginContext::deliver_message(...)` or `PluginContext::send_message(...)` with `DeliveryOptions`. Delivery state, deduplication, retries, and ordering are scoped to the current process lifetime and are not durable across restarts.
 
 ```toml
 [network.delivery]
@@ -388,9 +407,25 @@ enabled = true
 backend = "noise"    # or "tls" (default) or "none"
 ```
 
-The 0.3.0 Noise implementation uses `Noise_XX_25519_ChaChaPoly_BLAKE2s`. The fields under `[encryption.noise]` are reserved for future backend configurability and do not select alternative algorithms in this release.
+The Noise implementation uses `Noise_XX_25519_ChaChaPoly_BLAKE2s`. The fields under `[encryption.noise]` are reserved for future backend configurability and do not select alternative algorithms in this release.
 
 When `backend = "noise"` but the `noise` feature is not compiled in, secure-channel creation fails with an explicit error. Connections are rejected without falling back to plaintext. Build with `--features noise` to use this backend.
+
+Noise is intentionally not a default Cargo feature. Its remote static key is
+fingerprinted with SHA-256 after the XX handshake and evaluated through the same
+core trust modes used for TLS fingerprints:
+
+```toml
+[encryption.noise.trust_policy]
+mode = "allowlist" # open | allowlist | tofu | observe
+store_new = "none"
+allowlist_fingerprints = ["<sha256-hex>"]
+pin_fingerprints = ["<sha256-hex>"]
+
+[encryption.noise.trust_policy.paths]
+allowlist_dir = "pki/noise/trusted"
+observed_dir = "pki/noise/observed"
+```
 
 ### TLS & Trust Policy (Overview)
 TheNodes supports optional TLS. When disabled, traffic is plaintext (development / controlled environments). When TLS is enabled, the `[encryption.trust_policy]` `mode` controls how peer certificates are evaluated. The currently implemented modes behave as follows:
@@ -436,7 +471,7 @@ Operational notes:
 - Certificate rotations require updating pins first to avoid availability loss.
 - If any subject-based constraint (pins or realm binding) is active and the subject cannot be parsed, the connection is currently rejected (future soft-fail option planned).
 
-Roadmap (selected upcoming): explicit `ca` / `hybrid` modes, CRL/OCSP integration, and hot reloadable pin sets.
+Roadmap (selected upcoming): explicit `ca` / `hybrid` modes and hot reloadable pin sets. CRL/OCSP enforcement is a deliberate non-goal for 0.4.0.
 
 See `SECURITY_TRUST_POLICY_PLAN.md` for detailed status.
 
@@ -724,7 +759,7 @@ Production guidance: pick a concise, stable realm name early (e.g., `prod-messag
 - Version (coordinates breaking protocol evolution)
 - Handshake validation logic
 
-Peer capabilities are separate HELLO metadata used by connection policy and routing. In 0.3.0 the framework advertises configured support for relay, UDP, punching, and punch rendezvous.
+Peer capabilities are separate HELLO metadata used by connection policy and routing. The framework advertises configured support for relay, UDP, punching, punch rendezvous, and a mapped direct TCP route.
 
 ### Example Realm Catalog
 | Realm              | Purpose                                 | Notes |
@@ -787,7 +822,11 @@ See `src/realms/realm.rs` for validation logic.
 
 Plugins are compiled as dynamic libraries that expose a single registration symbol with a C-layout function-table boundary. The boundary is explicitly versioned but remains pre-1.0 and can change between TheNodes minor releases.
 
-Version 0.3.0 uses `PLUGIN_ABI_VERSION = 2`. Plugins written for 0.2 must update `Plugin::on_message` to `async fn`, use `async-trait`, and be rebuilt against 0.3.0. Plugins can optionally narrow extension delivery through `subscribed_extension_kinds()`. Custom hosts must construct the expanded context through `PluginContext::new(...)` instead of a struct literal.
+The unreleased plugin API uses `PLUGIN_ABI_VERSION = 3`. Plugins must implement a stable
+`plugin_id()`, use the host-bound context, and be rebuilt against the matching host. A plugin
+can call `PluginContext::plugin_data_dir()` to create and obtain its isolated
+directory under the node state directory. Plugins own the storage engine and all
+schema, migration, locking, and recovery behavior inside that directory.
 
 - The host exports `thenodes::plugin_host::PluginRegistrarApi` and `PLUGIN_ABI_VERSION`. Plugins receive a raw pointer to this struct when they are loaded.
 - The struct contains only FFI-safe fields (version, opaque context pointer, function pointers). Helper methods convert it into the familiar `PluginRegistrar` behavior inside the host.

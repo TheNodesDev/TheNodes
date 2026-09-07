@@ -27,7 +27,7 @@ Security defaults:
 - Run the generator from the repository checkout
 - The generator rewrites the local `path` dependency for the selected output directory
 
-The generated manifest also pins `thenodes = "=0.3.0"`; remove the local `path` key when building solely from crates.io.
+The generated manifest also pins `thenodes = "=0.4.0"`; remove the local `path` key when building solely from crates.io.
 
 ## Usage
 
@@ -62,7 +62,7 @@ Copy-Item target\release\my_plugin.dll C:\path\to\thenodes\plugins\
 
 ## Key Features
 
-- **Version Pinned:** Targets TheNodes 0.3.0 for plugin ABI compatibility
+- **Version Pinned:** Targets TheNodes 0.4.0 for plugin ABI compatibility
 - **Plugin Defaults:** Provides configuration defaults without overriding user config
 - **Message Handling:** Template for custom message processing
 - **Prompt Integration:** Commands available in `--prompt` mode
@@ -78,7 +78,7 @@ The generator replaces these placeholders:
 ## Distribution Model
 
 This template follows the **production distribution model:**
-- TheNodes is an exact library dependency (`thenodes = "=0.3.0"`)
+- TheNodes is an exact library dependency (`thenodes = "=0.4.0"`)
 - Plugin compiles independently
 - The generated development manifest points to the local TheNodes checkout
 - Plugin dynamic library works with any compatible TheNodes binary

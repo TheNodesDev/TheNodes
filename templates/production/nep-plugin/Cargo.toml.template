@@ -13,7 +13,7 @@ crate-type = ["cdylib"]  # Required for dynamic loading
 # TheNodes library for Plugin trait and APIs
 # NOTE: Until published to crates.io, this assumes TheNodes is available as a sibling directory
 # Users should: git clone TheNodes repo, then generate apps from templates/ subdirectory
-thenodes = { version = "=0.3.0", path = "../../" }
+thenodes = { version = "=0.4.0", path = "../../" }
 
 # Async runtime and traits
 tokio = { version = "1.35", features = ["full"] }

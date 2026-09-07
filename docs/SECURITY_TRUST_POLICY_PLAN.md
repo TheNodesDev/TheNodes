@@ -19,7 +19,7 @@ Operational helpers:
 
 - Phase 1: COMPLETE (config moved under `[encryption.trust_policy]`, modes open/allowlist/observe/tofu end‑to‑end, observed persistence, fingerprinting, prompt commands).
 - mTLS flag: AVAILABLE (`[encryption].mtls = true|false`).
-- Phase 2: CORE COMPLETE (cryptographic WebPKI path validation, role-aware EKU checks, strict validity-window enforcement, and verified self-signed override delivered; dedicated `ca` / `hybrid` modes remain deferred).
+- Phase 2: CORE COMPLETE (cryptographic WebPKI path validation, role-aware EKU checks, strict validity-window enforcement, and verified self-signed override delivered; dedicated enforcing `ca` / `hybrid` modes remain deferred).
 - Phase 3: PARTIAL/CORE DELIVERED (fingerprint/subject pinning and realm binding; promotion helper; prompt‑level trust manage commands; background reconnect after promotion).
 - Audit logging: DELIVERED (structured JSON lines sink with rotation; see `logging` config). Metrics counters still TBD.
 - Noise static-key trust: DELIVERED for TCP and UDP Noise (shared fingerprint core,
@@ -52,8 +52,7 @@ enabled = true
   [encryption.trust_policy]
   mode = "open"              # open | allowlist | observe | tofu (Phase 1 implements these modes)
   accept_self_signed = true   # moved from encryption root; only relevant when mode != ca
-  allow_unlisted = true       # (allowlist/hybrid) accept even if not pre-trusted (Phase 2)
-  store_new_certs = "none"   # none | trusted | observed (Phase 1 supports none/observed)
+  store_new_certs = "none"   # none | observed
   reject_expired = true       # Phase 2
   reject_before_valid = true  # Phase 2
   enforce_ca_chain = false    # Phase 2 (ca / hybrid)
@@ -89,8 +88,8 @@ Behavioral notes:
 Interaction with trust modes:
 - open: Still accepts any presented certificate; with mTLS enabled, the client must present a syntactically valid cert but policy will not reject based on trust content.
 - allowlist: With mTLS enabled, inbound connections whose client cert is not found (fingerprint/SPKI match) in the trusted set are rejected; without mTLS they are accepted because no client cert is provided to evaluate.
-- observe: Always rejects peer certificates that are not pre-trusted, but still persists them to the observed directory for later promotion.
-- tofu: With mTLS enabled, first-seen client certs may be stored (if `store_new_certs = observed`) and subsequent changes will be detectable in future enhancements. Without mTLS, TOFU only applies to server certificates.
+- observe: Always rejects the connection while persisting the presented peer certificate to the observed directory for later promotion.
+- tofu: With mTLS enabled, first-seen client certificates are atomically bound to their peer identity and subsequent fingerprint changes are rejected. Without mTLS, TOFU only applies to server certificates. A writable `observed_dir` is mandatory.
 
 Operational guidance:
 - Populate `trusted_cert_dir` before using allowlist mode. When `enforce_ca_chain=true`, also populate `issuer_cert_dir` with root CA trust anchors; if that path is absent, `trusted_cert_dir` is used as a compatibility fallback.
@@ -105,8 +104,8 @@ Future named CA / hybrid modes will compose the existing verifier with clearer p
 - Behavior:
   - open: accept any cert (no validation beyond parse). Optionally store if `store_new_certs == observed`.
   - allowlist: only accept if cert matches something in trusted directory.
-  - observe: reject untrusted certs but copy them into the observed directory so operators can promote later.
-  - tofu: if unseen fingerprint -> store (if configured) and accept; if seen -> accept; if changed for same peer identity (future improvement - Phase 2).
+  - observe: reject every connection but copy the presented certificate into the observed directory so operators can promote it later.
+  - tofu: atomically bind an unseen fingerprint to the peer identity and accept; accept the same binding later; reject changed fingerprints, missing identities, and unavailable storage.
 - Certificate fingerprint algorithm: SHA-256 of SPKI (with helper function).
 - Storage: write PEM as-is into `observed_dir` (filename = `<sha256>.pem`).
 - Logging: decision reason and fingerprint.
@@ -186,7 +185,7 @@ pub struct TrustPolicyPathsConfig {
 pub struct TrustPolicyConfig {
   pub mode: Option<String>,                // "open" | "allowlist" | "observe" | "tofu"
     pub accept_self_signed: Option<bool>,    // migrated from encryption
-    pub store_new_certs: Option<String>,     // none | observed | trusted (trusted reserved for Phase 2)
+    pub store_new_certs: Option<String>,     // none | observed
     pub paths: Option<TrustPolicyPathsConfig>,
 }
 ```
@@ -240,4 +239,4 @@ Structured audit log:
 
 ---
 
-Status summary: Phase 1 complete; mTLS available; Phase 2 core chain/time enforcement complete; Phase 3 core pinning/promotion delivered with prompt UX and background reconnects; audit logging available. Remaining work is focused on named CA/hybrid modes, revocation handling, live reloads, and richer CLI/metrics.
+Status summary: Phase 1 complete; mTLS available; Phase 2 core chain/time enforcement complete; Phase 3 core pinning/promotion delivered with prompt UX and background reconnects; audit logging available. Remaining work is focused on enforcing named CA/hybrid modes, revocation handling, live reloads, and richer CLI/metrics.

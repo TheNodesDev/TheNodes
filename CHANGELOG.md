@@ -6,9 +6,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-07
+
 ### Breaking
 - **Plugin API/ABI**: `PLUGIN_ABI_VERSION` is now 3. Plugins must provide a valid, stable `Plugin::plugin_id()`, receive a plugin-bound context during dispatch, and rebuild against the matching host release.
-- **Wire protocol**: `RELAY_FWD` now carries opaque bytes in the required base64 `opaque_payload_b64` field. The generic outer `Message.payload` must be absent; mixed 0.3.x/0.4.x relay deployments are unsupported.
+- **Wire protocol**: `RELAY_FWD` now carries opaque bytes in the required base64 `opaque_payload_b64` field. The generic outer `Message.payload` must be `null`; mixed 0.3.x/0.4.x relay deployments are unsupported.
 
 ### Added
 - Transport-agnostic fingerprint trust evaluation shared by TLS SPKI and Noise static keys, with structured decisions, allowlist, TOFU, observe, and exact SHA-256 pins.
@@ -23,6 +25,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - Noise remains intentionally opt-in; the default Cargo feature set remains empty.
 
 ### Fixed
+- `encryption.enabled = false` now always selects plaintext, even when a stale explicit backend remains in configuration.
 - Replaced heuristic certificate-chain checks with cryptographic WebPKI path validation against configured CA trust anchors. Validation now enforces signatures, CA/path constraints, EKU, critical extensions, name constraints, and current-time validity for the complete path when `enforce_ca_chain = true`.
 - Implemented real X.509 `notBefore`/`notAfter` extraction. `reject_before_valid` and `reject_expired` now reject matching leaf certificates and fail closed when validity cannot be parsed.
 - TLS policy evaluation now uses `issuer_cert_dir` for CA trust anchors (falling back to `trusted_cert_dir` for compatibility), distinguishes server- and client-auth EKU, and verifies TLS handshake signatures even when certificate acceptance is deferred to TheNodes trust policy.

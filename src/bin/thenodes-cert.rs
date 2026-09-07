@@ -30,7 +30,7 @@ struct Cli {
     #[arg(long)]
     realm: Option<String>,
 
-    /// Common Name (CN). Defaults to thenodes-<unix_ts> (realm=<realm>)
+    /// Common Name (CN). Defaults to `thenodes-<unix_ts>` for the selected realm.
     #[arg(long)]
     cn: Option<String>,
 

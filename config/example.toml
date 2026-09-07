@@ -73,14 +73,14 @@ observed_dir = "pki/noise/observed"
 
 # Trust policy when TLS is enabled
 [encryption.trust_policy]
-mode = "open"                    # open | allowlist | tofu | observe | hybrid (future)
+mode = "open"                    # open | allowlist | tofu | observe; hybrid is a non-enforcing placeholder
 accept_self_signed = false        # Permit self-signed peers in non-CA modes
 store_new_certs = "none"         # none | observed (write new leaf certs to observed dir)
-reject_expired = false            # Phase 2: reject chain if expired
-reject_before_valid = false       # Phase 2: reject chain if not yet valid
-enforce_ca_chain = false          # Phase 2: require valid issuer chain
-pin_subjects = []                 # Phase 3: exact subject DNs or substring if prefixed with '~'
-pin_fingerprints = []             # Phase 3: allowed SPKI fingerprints (hex lowercase)
+reject_expired = false            # Reject an expired leaf certificate
+reject_before_valid = false       # Reject a not-yet-valid leaf certificate
+enforce_ca_chain = false          # Require a valid WebPKI path to a configured CA
+pin_subjects = []                 # Exact subject DNs or substring if prefixed with '~'
+pin_fingerprints = []             # Allowed SPKI fingerprints (hex lowercase)
 pin_fp_algo = "sha256"           # Fingerprint algorithm (sha256)
 realm_subject_binding = false     # Require subject to contain realm name
 

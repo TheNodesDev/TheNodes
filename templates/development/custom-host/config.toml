@@ -34,7 +34,7 @@ enabled = false  # Set to true to enable TLS encryption
 
 # Trust policy (when encryption is enabled)
 # [encryption.trust_policy]
-# mode = "allowlist"  # or "blacklist"
+# mode = "allowlist"  # open | allowlist | tofu | observe
 # accept_self_signed = true
 # store_new_certs = "observed"
 # reject_expired = true

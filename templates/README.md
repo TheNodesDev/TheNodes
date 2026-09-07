@@ -13,7 +13,7 @@ Use the `generate_app.sh` script to create new applications:
 ## Template Categories
 
 ### Production Templates (`production/`)
-Ready-to-use templates for end-user applications. Generated manifests target TheNodes 0.3.0 and use a path dependency to the current checkout; remove the `path` key to use the published crate alone.
+Ready-to-use templates for end-user applications. Generated manifests target TheNodes 0.4.0 and use a path dependency to the current checkout; remove the `path` key to use the published crate alone.
 
 - **cal-app** - Simple P2P application using TheNodes as library (CAL mode)
 - **nep-plugin** - Plugin for existing TheNodes host (NEP mode, builds a dynamic library: .so/.dylib/.dll)
@@ -38,7 +38,7 @@ Templates for TheNodes core development and advanced customization. These use pa
 **Best for:** Adding dynamically loaded application logic to a TheNodes host
 
 - Builds a dynamic library for Linux, macOS, or Windows
-- Implements the v0.3 plugin registration ABI
+- Implements plugin ABI v3
 - Handles extension messages and prompt commands
 - Supplies optional configuration defaults
 
@@ -208,7 +208,7 @@ enabled = true
 own_certificate = "pki/own/my-app.crt"
 own_private_key = "pki/own/my-app.key"
 ```
-For mutual TLS and pinning, see `[encryption.mtls]` and `[encryption.trust_policy]` in the generated config.
+For mutual TLS, set `mtls = true` in `[encryption]`. Configure pinning under `[encryption.trust_policy]` in the generated config.
 
 #### Production Settings
 ```toml

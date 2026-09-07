@@ -364,12 +364,12 @@ fn is_publicly_routable(ip: IpAddr) -> bool {
             let segments = ipv6.segments();
             let is_unique_local = segments[0] & 0xfe00 == 0xfc00;
             let is_unicast_link_local = segments[0] & 0xffc0 == 0xfe80;
-            !ipv6.is_loopback()
-                && !ipv6.is_multicast()
-                && !ipv6.is_unspecified()
-                && !is_unique_local
-                && !is_unicast_link_local
-                && !(segments[0] == 0x2001 && segments[1] == 0x0db8)
+            !(ipv6.is_loopback()
+                || ipv6.is_multicast()
+                || ipv6.is_unspecified()
+                || is_unique_local
+                || is_unicast_link_local
+                || (segments[0] == 0x2001 && segments[1] == 0x0db8))
         }
     }
 }

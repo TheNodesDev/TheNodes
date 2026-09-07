@@ -30,8 +30,8 @@ pub struct ConnectToPeerParams<'a> {
     pub peer_store: Option<crate::network::peer_store::PeerStore>,
 }
 
-pub async fn connect_to_peer<'a>(
-    params: ConnectToPeerParams<'a>,
+pub async fn connect_to_peer(
+    params: ConnectToPeerParams<'_>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let ConnectToPeerParams {
         peer,

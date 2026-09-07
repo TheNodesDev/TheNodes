@@ -25,6 +25,9 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Instant;
 
+#[cfg(feature = "noise")]
+use sha2::Digest;
+
 // ─── ADR-0004 §2.4 wire constants ─────────────────────────────────────────────
 
 /// Maximum total datagram size (including session_id header and AEAD tag).
@@ -88,7 +91,7 @@ pub enum UdpSessionState {
     /// Handshake complete; ready for encrypted transport.
     Established {
         transport: Box<snow::TransportState>,
-        /// BLAKE2s fingerprint (first 32 bytes) of the remote static public key.
+        /// SHA-256 fingerprint of the remote static public key.
         remote_static_fingerprint: [u8; 32],
     },
 }
@@ -371,8 +374,7 @@ impl NoiseUdpSession {
             .get_remote_static()
             .map(|s| {
                 let mut fp = [0u8; 32];
-                let len = s.len().min(32);
-                fp[..len].copy_from_slice(&s[..len]);
+                fp.copy_from_slice(sha2::Sha256::digest(s).as_slice());
                 fp
             })
             .unwrap_or([0u8; 32])

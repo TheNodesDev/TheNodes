@@ -22,8 +22,13 @@ Operational helpers:
 - Phase 2: CORE COMPLETE (cryptographic WebPKI path validation, role-aware EKU checks, strict validity-window enforcement, and verified self-signed override delivered; dedicated `ca` / `hybrid` modes remain deferred).
 - Phase 3: PARTIAL/CORE DELIVERED (fingerprint/subject pinning and realm binding; promotion helper; prompt‑level trust manage commands; background reconnect after promotion).
 - Audit logging: DELIVERED (structured JSON lines sink with rotation; see `logging` config). Metrics counters still TBD.
+- Noise static-key trust: DELIVERED for TCP and UDP Noise (shared fingerprint core,
+  allowlist directory/list, TOFU, observe, and pins).
+- Revocation: CRL and OCSP enforcement are deliberate non-goals for 0.4.0. Configured
+  CRL directories remain reserved and unread.
 
-What remains: hybrid/CA modes, CRL/OCSP enforcement, soft-fail toggles, live reload of pins, and optional metrics.
+What remains: hybrid/CA modes, post-1.0 reconsideration of CA revocation
+infrastructure, soft-fail toggles, live reload of pins, and optional metrics.
 
 ## 1. Objectives
 - Support multiple network trust postures: open, allowlist, observe, TOFU, CA, hybrid.
@@ -92,7 +97,7 @@ Operational guidance:
 - For early deployments using `tofu`, it is safe to enable `mtls` to begin accumulating an observed catalog of peer certs for potential later promotion.
 - If `mtls` is enabled but the local node lacks its own cert/key pair, the outbound side logs a warning and downgrades to one-way TLS; the inbound side will fail to start TLS without a valid pair.
 
-Future named CA / hybrid modes will compose the existing verifier with clearer policy presets. CRL/OCSP loading remains deferred; `mtls` remains the on/off switch for mutual presentation while trust policy governs acceptance semantics.
+Future named CA / hybrid modes will compose the existing verifier with clearer policy presets. CRL/OCSP loading is outside the 0.4.0 scope; `mtls` remains the on/off switch for mutual presentation while trust policy governs acceptance semantics.
 
 ### Phase 1 (Implemented)
 - New config structs: `TrustPolicyConfig`, limited fields: `mode`, `accept_self_signed`, `store_new_certs`, `observed_dir`.
@@ -121,7 +126,7 @@ Deferred / Not yet fully implemented:
 - New modes `ca` and `hybrid` (reserved; selecting them should currently fall back or be rejected)
 - `allow_unlisted` behavior for hybrid
 - Warn vs hard-reject toggles (currently only hard reject where applicable)
-- CRL / OCSP loading and enforcement
+- CRL / OCSP loading and enforcement (deliberately not planned for 0.4.0)
 
 `enforce_ca_chain` is the current explicit switch for strict CA validation. A named `ca` mode can later make that posture easier to configure without changing the validation engine.
 

@@ -6,7 +6,10 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::config::{Config, DeliveryConfig};
-use crate::network::message::{DeliveryMetadata, Message, MessageType, Payload};
+use crate::network::message::{
+    decode_relay_opaque_payload_utf8, encode_relay_opaque_payload, DeliveryMetadata, Message,
+    MessageType, Payload,
+};
 use crate::network::peer::Peer;
 use crate::network::peer_manager::PeerManager;
 use crate::network::transport::{connect_to_peer, ConnectToPeerParams};
@@ -601,8 +604,9 @@ impl DeliveryRuntime {
                 to: message.to.clone(),
                 from: message.from.clone(),
                 sequence: relay_sequence,
+                opaque_payload_b64: encode_relay_opaque_payload(message.as_json()),
             },
-            Some(Payload::Text(message.as_json())),
+            None,
             message.realm.clone(),
         );
         self.peer_manager
@@ -671,11 +675,15 @@ pub enum IncomingMessageDisposition {
 }
 
 pub fn unwrap_tunneled_message(message: &Message, local_node_id: &str) -> Option<Message> {
-    if let MessageType::RelayForward { to, .. } = &message.msg_type {
+    if let MessageType::RelayForward {
+        to,
+        opaque_payload_b64,
+        ..
+    } = &message.msg_type
+    {
         if to == local_node_id {
-            if let Some(Payload::Text(inner)) = &message.payload {
-                return Message::from_json(inner);
-            }
+            return decode_relay_opaque_payload_utf8(opaque_payload_b64)
+                .and_then(|inner| Message::from_json(&inner));
         }
     }
     None
@@ -878,8 +886,9 @@ async fn send_framework_ack(
                         .next_relay_sequence(local_node_id, &original_message.from)
                         .await,
                 ),
+                opaque_payload_b64: encode_relay_opaque_payload(ack.as_json()),
             },
-            Some(Payload::Text(ack.as_json())),
+            None,
             original_message.realm.clone(),
         );
         return peer_manager
@@ -983,7 +992,9 @@ mod tests {
         IncomingMessageDisposition, MessageId,
     };
     use crate::config::{Config, DeliveryConfig};
-    use crate::network::message::{DeliveryMetadata, Message, MessageType};
+    use crate::network::message::{
+        decode_relay_opaque_payload_utf8, DeliveryMetadata, Message, MessageType,
+    };
     use crate::network::peer_manager::PeerManager;
     use crate::plugin_host::manager::PluginManager;
     use std::sync::Arc;
@@ -1139,14 +1150,12 @@ mod tests {
         tokio::spawn(async move {
             while let Some(json) = rx.recv().await {
                 let outbound = Message::from_json(&json).expect("valid relay frame");
-                if let MessageType::RelayForward { .. } = outbound.msg_type {
-                    let inner = outbound
-                        .payload
-                        .and_then(|payload| match payload {
-                            crate::network::message::Payload::Text(text) => Some(text),
-                            _ => None,
-                        })
-                        .expect("relay payload should contain inner message");
+                if let MessageType::RelayForward {
+                    opaque_payload_b64, ..
+                } = &outbound.msg_type
+                {
+                    let inner = decode_relay_opaque_payload_utf8(opaque_payload_b64)
+                        .expect("relay payload should decode to inner message");
                     let inner = Message::from_json(&inner).expect("valid inner message");
                     let message_id = inner
                         .delivery

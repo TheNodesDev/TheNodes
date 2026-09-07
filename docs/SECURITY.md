@@ -102,9 +102,35 @@ When TLS is enabled, each incoming peer certificate is evaluated according to th
 
 When `enforce_ca_chain = true`, TheNodes performs cryptographic WebPKI path validation for the peer's TLS role. Trust anchors are loaded from `issuer_cert_dir`; `trusted_cert_dir` is used as a compatibility fallback when no issuer directory is configured. The peer supplies intermediate certificates during the TLS handshake. Complete-path validation includes certificate signatures, CA/path constraints, EKU, critical extensions, name constraints, and current-time validity.
 
-`reject_expired` and `reject_before_valid` independently enforce the leaf certificate's parsed `notAfter` and `notBefore` values even when CA-chain enforcement is disabled. If either applicable check is enabled and the validity window cannot be parsed, the connection is rejected. CRL/OCSP enforcement remains future work: the configured CRL directories are not currently read.
+`reject_expired` and `reject_before_valid` independently enforce the leaf certificate's parsed `notAfter` and `notBefore` values even when CA-chain enforcement is disabled. If either applicable check is enabled and the validity window cannot be parsed, the connection is rejected.
+
+CRL and OCSP processing are deliberate non-goals for version 0.4.0. The configured
+CRL directories are reserved for future use and are not read, and revocation status
+is not enforced. Operators that need to revoke a directly trusted TLS certificate or
+Noise static key must remove its fingerprint from the allowlist or pin set and
+restart the affected nodes. General CA revocation infrastructure may be reconsidered
+after 1.0.
 
 > Selecting `backend = "noise"` without the compiled `noise` feature fails secure-channel creation and rejects the connection; it never falls back to plaintext.
+
+Noise remains intentionally opt-in. When compiled, the remote XX static key is
+identified by a SHA-256 hexadecimal fingerprint and evaluated using `open`,
+`allowlist`, `tofu`, or `observe`:
+
+```toml
+[encryption.noise.trust_policy]
+mode = "allowlist"
+allowlist_fingerprints = ["<sha256-hex>"]
+pin_fingerprints = ["<sha256-hex>"]
+
+[encryption.noise.trust_policy.paths]
+allowlist_dir = "pki/noise/trusted"
+observed_dir = "pki/noise/observed"
+```
+
+Observed `.noise` artifacts can be reviewed and copied into the allowlist
+directory. A rejected Noise decision terminates the connection, and accepted
+channels expose the static-key fingerprint in their authentication summary.
 
 If you enable `store_new_certs = "observed"`, ensure the `observed_dir` path is configured in
 `[encryption.trust_policy.paths]`. Keep in mind that the setting has no effect in `allowlist`

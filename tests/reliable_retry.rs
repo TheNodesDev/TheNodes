@@ -1,5 +1,7 @@
 use std::net::SocketAddr;
-use thenodes::network::message::{Message, MessageType, Payload};
+use thenodes::network::message::{
+    decode_relay_opaque_payload_utf8, encode_relay_opaque_payload, Message, MessageType,
+};
 use thenodes::network::peer_manager::PeerManager;
 use tokio::sync::mpsc;
 
@@ -17,6 +19,7 @@ async fn delayed_retry_cancelled_by_ack() {
 
     // Craft forward with sequence
     let seq = 7u64;
+    let opaque_payload_b64 = encode_relay_opaque_payload("hello");
     let fwd = Message::new(
         "fromA",
         "toB",
@@ -24,8 +27,9 @@ async fn delayed_retry_cancelled_by_ack() {
             to: "toB".into(),
             from: "fromA".into(),
             sequence: Some(seq),
+            opaque_payload_b64: opaque_payload_b64.clone(),
         },
-        Some(Payload::Text("hello".into())),
+        None,
         None,
     );
 
@@ -38,8 +42,30 @@ async fn delayed_retry_cancelled_by_ack() {
     .await;
 
     // First send should be delivered immediately
-    let first = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await;
-    assert!(matches!(first, Ok(Some(_))), "expected initial delivery");
+    let first = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+        .await
+        .expect("expected initial delivery timeout to succeed")
+        .expect("expected initial delivery");
+    let first = Message::from_json(&first).expect("forwarded relay frame should deserialize");
+    match &first.msg_type {
+        MessageType::RelayForward {
+            to,
+            from,
+            sequence,
+            opaque_payload_b64: forwarded_payload,
+        } => {
+            assert_eq!(to, "toB");
+            assert_eq!(from, "fromA");
+            assert_eq!(sequence, &Some(seq));
+            assert_eq!(forwarded_payload, &opaque_payload_b64);
+            assert_eq!(
+                decode_relay_opaque_payload_utf8(forwarded_payload).as_deref(),
+                Some("hello")
+            );
+        }
+        _ => panic!("expected forwarded relay frame"),
+    }
+    assert!(first.payload.is_none());
 
     // Send ACK before 500ms to cancel retry
     let ack = Message::new(

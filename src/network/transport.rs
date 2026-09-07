@@ -71,6 +71,7 @@ pub async fn connect_to_peer<'a>(
         .connect(stream, addr, &our_realm, &config, allow_console)
         .await
         .map_err(|e| -> Box<dyn Error + Send + Sync> { e.into() })?;
+    let channel_auth = channel.auth.clone();
     let mut reader = channel.reader;
     let mut writer = channel.writer;
     emit_network_event(
@@ -100,6 +101,8 @@ pub async fn connect_to_peer<'a>(
         } => (node_id.clone(), node_type.clone(), capabilities.clone()),
         _ => return Err("Expected HELLO from server".into()),
     };
+    crate::security::secure_channel::validate_authenticated_node_id(&channel_auth, &remote_node_id)
+        .map_err(|e| -> Box<dyn Error + Send + Sync> { e.into() })?;
     // Optional realm access policy check on outbound for server's node_type
     if let Some(access) = &config.realm_access {
         if let Some(allowed) = &access.allowed_node_types {
@@ -175,11 +178,15 @@ pub async fn connect_to_peer<'a>(
         &hello.from,
         MessageType::Hello {
             node_id: local_node_id.clone(),
-            listen_addr: Some(format!("{}:{}", local_addr.ip(), our_port)),
+            listen_addr: crate::network::hello_listen_addr(
+                Some(&peer_manager),
+                local_addr.ip(),
+                our_port,
+            ),
             protocol: Some(PROTOCOL_NAME.to_string()),
             version: Some(PROTOCOL_VERSION.to_string()),
             node_type: config.node.as_ref().and_then(|n| n.node_type.clone()),
-            capabilities: crate::network::advertised_capabilities(&config),
+            capabilities: crate::network::advertised_capabilities(&config, Some(&peer_manager)),
             udp_listen_addr: crate::network::udp_hello_addr(&config, local_addr.ip()),
             udp_observed_addr: own_observed_udp,
         },
@@ -245,6 +252,9 @@ pub async fn connect_to_peer<'a>(
     }
     peer_manager
         .set_transport_kind(&remote_node_id, TransportKind::Tcp)
+        .await;
+    peer_manager
+        .set_peer_capabilities(&remote_node_id, remote_capabilities.clone())
         .await;
     // Update peer store with successful handshake metadata
     if let Some(store) = &peer_store {
@@ -407,6 +417,7 @@ pub async fn connect_to_peer_handshake_only(
         .connect(stream, addr, &our_realm, config, allow_console)
         .await
         .map_err(|e| -> Box<dyn Error + Send + Sync> { e.into() })?;
+    let channel_auth = channel.auth.clone();
     let mut reader = channel.reader;
     let mut writer = channel.writer;
     emit_network_event(
@@ -432,6 +443,8 @@ pub async fn connect_to_peer_handshake_only(
         } => (node_id.clone(), node_type.clone()),
         _ => return Err("Expected HELLO from server".into()),
     };
+    crate::security::secure_channel::validate_authenticated_node_id(&channel_auth, &remote_node_id)
+        .map_err(|e| -> Box<dyn Error + Send + Sync> { e.into() })?;
     if let Some(access) = &config.realm_access {
         if let Some(allowed) = &access.allowed_node_types {
             let pass = match &remote_node_type {
@@ -451,11 +464,11 @@ pub async fn connect_to_peer_handshake_only(
         &hello.from,
         MessageType::Hello {
             node_id: local_node_id,
-            listen_addr: Some(format!("{}:{}", local_addr.ip(), our_port)),
+            listen_addr: crate::network::hello_listen_addr(None, local_addr.ip(), our_port),
             protocol: Some(PROTOCOL_NAME.to_string()),
             version: Some(PROTOCOL_VERSION.to_string()),
             node_type: config.node.as_ref().and_then(|n| n.node_type.clone()),
-            capabilities: crate::network::advertised_capabilities(config),
+            capabilities: crate::network::advertised_capabilities(config, None),
             udp_listen_addr: crate::network::udp_hello_addr(config, local_addr.ip()),
             udp_observed_addr: None, // handshake-only — no peer_manager available
         },

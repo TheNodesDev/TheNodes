@@ -50,6 +50,7 @@ async fn peer_store_ttl_expiry_on_load() {
                 save_interval_secs: Some(60),
             }),
             relay: None,
+            nat: None,
             udp: None,
             connection_policy: None,
             nat_traversal: None,

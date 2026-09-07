@@ -140,6 +140,7 @@ async fn handle_connection(
             return;
         }
     };
+    let channel_auth = channel.auth.clone();
     let mut reader = channel.reader;
     let mut write_half = channel.writer;
     log_network_event(
@@ -171,11 +172,15 @@ async fn handle_connection(
         &peer_addr.to_string(),
         MessageType::Hello {
             node_id: node_id.clone(),
-            listen_addr: Some(format!("{}:{}", local_addr.ip(), our_port)),
+            listen_addr: crate::network::hello_listen_addr(
+                Some(&peer_manager),
+                local_addr.ip(),
+                our_port,
+            ),
             protocol: Some(PROTOCOL_NAME.to_string()),
             version: Some(PROTOCOL_VERSION.to_string()),
             node_type: config.node.as_ref().and_then(|n| n.node_type.clone()),
-            capabilities: crate::network::advertised_capabilities(&config),
+            capabilities: crate::network::advertised_capabilities(&config, Some(&peer_manager)),
             udp_listen_addr: crate::network::udp_hello_addr(&config, local_addr.ip()),
             udp_observed_addr: own_observed_udp,
         },
@@ -284,6 +289,21 @@ async fn handle_connection(
                         ref udp_listen_addr,
                         ref udp_observed_addr,
                     } => {
+                        if let Err(err) =
+                            crate::security::secure_channel::validate_authenticated_node_id(
+                                &channel_auth,
+                                remote_node_id,
+                            )
+                        {
+                            log_network_event(
+                                LogLevel::Warn,
+                                "noise_hello_identity_mismatch",
+                                Some(peer_addr.to_string()),
+                                Some(err.to_string()),
+                                emit_console_errors,
+                            );
+                            return;
+                        }
                         if remote_node_id == &node_id {
                             log_network_event(
                                 LogLevel::Warn,
@@ -388,6 +408,9 @@ async fn handle_connection(
                         }
                         peer_manager
                             .set_transport_kind(remote_node_id, TransportKind::Tcp)
+                            .await;
+                        peer_manager
+                            .set_peer_capabilities(remote_node_id, capabilities.clone())
                             .await;
                         if let Some(listen) = listen_addr {
                             // Track advertised listen address for suppression logic

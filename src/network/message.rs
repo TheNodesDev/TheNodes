@@ -2,6 +2,7 @@
 
 use crate::network::delivery::{DeliveryClass, MessageId};
 use crate::realms::RealmInfo;
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -57,6 +58,7 @@ pub enum MessageType {
         to: String,
         from: String,
         sequence: Option<u64>,
+        opaque_payload_b64: String,
     },
     /// Explicit unbind to close relay binding (wire token: "RELAY_UNBIND")
     #[serde(rename = "RELAY_UNBIND")]
@@ -269,20 +271,63 @@ impl Message {
         Ok(())
     }
 
+    pub fn validate_structure(&self) -> Result<(), String> {
+        if let MessageType::RelayForward {
+            opaque_payload_b64, ..
+        } = &self.msg_type
+        {
+            base64::engine::general_purpose::STANDARD
+                .decode(opaque_payload_b64)
+                .map_err(|_| {
+                    "RelayForward opaque_payload_b64 must contain valid base64".to_string()
+                })?;
+            if self.payload.is_some() {
+                return Err(
+                    "RelayForward must carry opaque_payload_b64 instead of outer payload"
+                        .to_string(),
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        self.validate_structure()?;
+        self.validate_delivery()
+    }
+
     pub fn as_json(&self) -> String {
         serde_json::to_string(self).unwrap_or_else(|_| "{}".into())
     }
 
     pub fn from_json(json: &str) -> Option<Self> {
         let message: Self = serde_json::from_str(json).ok()?;
-        message.validate_delivery().ok()?;
+        message.validate().ok()?;
         Some(message)
     }
 }
 
+pub fn encode_relay_opaque_payload(payload: impl AsRef<[u8]>) -> String {
+    base64::engine::general_purpose::STANDARD.encode(payload.as_ref())
+}
+
+pub fn decode_relay_opaque_payload(payload_b64: &str) -> Option<Vec<u8>> {
+    base64::engine::general_purpose::STANDARD
+        .decode(payload_b64)
+        .ok()
+}
+
+pub fn decode_relay_opaque_payload_utf8(payload_b64: &str) -> Option<String> {
+    String::from_utf8(decode_relay_opaque_payload(payload_b64)?).ok()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{DeliveryMetadata, Message, MessageType};
+    use super::{
+        decode_relay_opaque_payload_utf8, encode_relay_opaque_payload, DeliveryMetadata, Message,
+        MessageType, Payload,
+    };
     use crate::network::delivery::DeliveryClass;
 
     #[test]
@@ -323,5 +368,93 @@ mod tests {
         let decoded = Message::from_json(&encoded).expect("message should deserialize");
 
         assert_eq!(decoded.delivery, message.delivery);
+    }
+
+    #[test]
+    fn relay_forward_round_trip_preserves_opaque_payload() {
+        let inner = Message::new(
+            "from",
+            "to",
+            MessageType::Text("line1\nline2".into()),
+            Some(Payload::Binary(vec![0, 1, 2, b'\n'])),
+            None,
+        );
+        let inner_json = inner.as_json();
+        let opaque_payload_b64 = encode_relay_opaque_payload(&inner_json);
+        let outer = Message::new(
+            "from",
+            "relay-1",
+            MessageType::RelayForward {
+                to: "to".into(),
+                from: "from".into(),
+                sequence: Some(7),
+                opaque_payload_b64: opaque_payload_b64.clone(),
+            },
+            None,
+            None,
+        );
+
+        let encoded = outer.as_json();
+        let decoded = Message::from_json(&encoded).expect("relay frame should deserialize");
+
+        match &decoded.msg_type {
+            MessageType::RelayForward {
+                to,
+                from,
+                sequence,
+                opaque_payload_b64: decoded_payload,
+            } => {
+                assert_eq!(to, "to");
+                assert_eq!(from, "from");
+                assert_eq!(sequence, &Some(7));
+                assert_eq!(decoded_payload, &opaque_payload_b64);
+                assert_eq!(
+                    decode_relay_opaque_payload_utf8(decoded_payload).as_deref(),
+                    Some(inner_json.as_str())
+                );
+            }
+            _ => panic!("expected relay forward message"),
+        }
+        assert!(decoded.payload.is_none());
+    }
+
+    #[test]
+    fn relay_forward_wire_format_is_stable() {
+        let message = Message::new(
+            "outer-from",
+            "relay-1",
+            MessageType::RelayForward {
+                to: "node-b".into(),
+                from: "node-a".into(),
+                sequence: Some(128),
+                opaque_payload_b64: "aGVsbG8=".into(),
+            },
+            None,
+            None,
+        );
+
+        assert_eq!(
+            message.as_json(),
+            r#"{"from":"outer-from","to":"relay-1","msg_type":{"RELAY_FWD":{"to":"node-b","from":"node-a","sequence":128,"opaque_payload_b64":"aGVsbG8="}},"payload":null,"realm":null}"#
+        );
+    }
+
+    #[test]
+    fn relay_forward_rejects_outer_payload_wire_format() {
+        let encoded = Message::new(
+            "from",
+            "relay-1",
+            MessageType::RelayForward {
+                to: "to".into(),
+                from: "from".into(),
+                sequence: Some(1),
+                opaque_payload_b64: encode_relay_opaque_payload("{}"),
+            },
+            Some(Payload::Text("legacy outer payload".into())),
+            None,
+        )
+        .as_json();
+
+        assert!(Message::from_json(&encoded).is_none());
     }
 }

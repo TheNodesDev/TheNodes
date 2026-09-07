@@ -28,6 +28,7 @@ fn minimal_config() -> thenodes::config::Config {
         network: Some(NetworkConfig {
             persistence: None,
             relay: None,
+            nat: None,
             udp: None,
             connection_policy: None,
             nat_traversal: None,

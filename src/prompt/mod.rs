@@ -6,7 +6,7 @@ use crate::config::Config;
 use crate::constants::{
     build_timestamp, git_commit, APP_VERSION, ICON_PLACEHOLDER, PROTOCOL_VERSION,
 };
-use crate::plugin_host::manager::PluginManager;
+use crate::plugin_host::{manager::PluginManager, PluginContext};
 
 pub async fn run_prompt_mode(plugin_manager: Arc<PluginManager>, config: Config) {
     run_prompt_mode_with_shells(plugin_manager, config, None, false, false, None).await
@@ -47,7 +47,7 @@ pub async fn run_prompt_mode_with_shells(
     error_buffer: Option<Arc<TokioMutex<Vec<String>>>>,
 ) {
     let mut stdout = std::io::stdout();
-    let mut current_plugin: Option<Arc<dyn crate::plugin_host::Plugin>> = None;
+    let mut current_plugin: Option<(Arc<dyn crate::plugin_host::Plugin>, PluginContext)> = None;
     let mut current_prefix: Option<String> = None;
     let mut shell = if dual_shells && start_in_core {
         ShellKind::Core
@@ -512,10 +512,10 @@ pub async fn run_prompt_mode_with_shells(
                 }
                 _ => {}
             }
-            if let Some(plugin) = plugin_manager.get_prompt_plugin(input) {
+            if let Some((plugin, plugin_ctx)) = plugin_manager.get_prompt_plugin(input) {
                 println!("{}Entering plugin: {}", ICON_PLACEHOLDER, input);
                 current_prefix = Some(input.to_string());
-                current_plugin = Some(plugin);
+                current_plugin = Some((plugin, plugin_ctx));
                 if let Some(h) = rl.helper_mut() {
                     h.in_plugin = true;
                 }
@@ -530,14 +530,10 @@ pub async fn run_prompt_mode_with_shells(
             }
         }
 
-        if let Some(ref plugin) = current_plugin {
-            if let Some(ctx) = &plugin_manager.context {
-                match plugin.on_prompt(input, ctx).await {
-                    Some(reply) => println!("{}", reply),
-                    None => println!("⚠️ Unhandled input: '{}'", input),
-                }
-            } else {
-                println!("❌ Plugin context unavailable.");
+        if let Some((ref plugin, ref plugin_ctx)) = current_plugin {
+            match plugin.on_prompt(input, plugin_ctx).await {
+                Some(reply) => println!("{}", reply),
+                None => println!("⚠️ Unhandled input: '{}'", input),
             }
         }
     }

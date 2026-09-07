@@ -12,6 +12,8 @@ use crate::events::dispatcher::EventHandle;
 use crate::network::peer_manager::PeerManager;
 use crate::network::PeerStore;
 /// Trait that all plugins must implement.
+use std::io;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -25,6 +27,7 @@ pub struct PluginContext {
     pub config: Config,
     pub allow_console: bool,
     plugin_manager: Arc<RwLock<Option<Arc<PluginManager>>>>,
+    plugin_id: Option<String>,
 }
 
 impl PluginContext {
@@ -44,11 +47,64 @@ impl PluginContext {
             config,
             allow_console,
             plugin_manager: Arc::new(RwLock::new(None)),
+            plugin_id: None,
         }
     }
 
     pub async fn set_plugin_manager(&self, plugin_manager: Arc<PluginManager>) {
         *self.plugin_manager.write().await = Some(plugin_manager);
+    }
+
+    pub fn for_plugin(&self, plugin_id: &str) -> io::Result<Self> {
+        Self::validate_plugin_id(plugin_id)?;
+        let mut ctx = self.clone();
+        ctx.plugin_id = Some(plugin_id.to_string());
+        Ok(ctx)
+    }
+
+    pub fn plugin_id(&self) -> Option<&str> {
+        self.plugin_id.as_deref()
+    }
+
+    pub async fn plugin_data_dir(&self) -> io::Result<PathBuf> {
+        let plugin_id = self.plugin_id.as_deref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "plugin data dir requires a plugin-bound context",
+            )
+        })?;
+        let dir = self.node_data_dir().join("plugins").join(plugin_id);
+        tokio::fs::create_dir_all(&dir).await?;
+        Ok(dir)
+    }
+
+    fn node_data_dir(&self) -> PathBuf {
+        self.config
+            .node
+            .as_ref()
+            .and_then(|node| node.state_dir.as_ref())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("data"))
+    }
+
+    pub(crate) fn validate_plugin_id(plugin_id: &str) -> io::Result<()> {
+        if plugin_id.is_empty() || plugin_id.len() > 128 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "plugin IDs must be 1-128 characters long",
+            ));
+        }
+        if matches!(plugin_id, "." | "..")
+            || !plugin_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "plugin IDs may only contain ASCII letters, numbers, '.', '-' or '_'",
+            ));
+        }
+        Ok(())
     }
 
     pub async fn deliver_message(
@@ -90,6 +146,8 @@ impl PluginContext {
 
 #[async_trait::async_trait]
 pub trait Plugin: Send + Sync {
+    fn plugin_id(&self) -> &'static str;
+
     async fn on_message(&self, message: &Message, ctx: &PluginContext);
 
     /// Extension kinds this plugin wants to receive.

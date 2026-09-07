@@ -45,6 +45,10 @@ pub struct MyPlugin;
 
 #[async_trait::async_trait]
 impl Plugin for MyPlugin {
+    fn plugin_id(&self) -> &'static str {
+        "my-plugin"
+    }
+
     async fn on_message(&self, message: &Message, ctx: &PluginContext) {
         // Handle inbound messages. Async I/O can be awaited directly.
     }
@@ -69,12 +73,24 @@ impl Plugin for MyPlugin {
 ```
 
 Notes:
+- `plugin_id()` is required by ABI 3 and must return a stable, unique ID.
 - `on_message` and `on_prompt` are async. Add `async-trait` to plugin dependencies and annotate the implementation as shown.
 - The host awaits each plugin's `on_message` work before dispatch completes. Avoid blocking operations; use async APIs for I/O, database access, or session/state lookups.
 - Dispatch bounds each plugin's `on_message` call with an internal timeout (currently 5 seconds). If a plugin does not return within that window, the host abandons the call, logs a `plugin_dispatch_timeout` event, and continues dispatching to the remaining plugins. Design `on_message` to complete quickly and offload long-running work to a spawned task if needed.
 - `subscribed_extension_kinds()` filters only `MessageType::Extension` messages by exact `kind` match. Returning `None` (the default) receives every extension kind for backward-compatible behavior. Returning `Some(&[])` receives no extension messages. Non-extension messages are still delivered.
 
-`PluginContext` exposes shared facilities such as the peer manager and event dispatcher.
+`PluginContext` exposes shared facilities such as the peer manager, event dispatcher,
+and the plugin's isolated durable data directory:
+
+```rust
+let data_dir = ctx.plugin_data_dir().await?;
+let database_path = data_dir.join("plugin.sqlite");
+```
+
+The host binds the context to `Plugin::plugin_id()` before dispatch. Plugin IDs may
+contain ASCII letters, numbers, `.`, `-`, and `_`; path separators and traversal
+components are rejected. Plugins own storage formats, locking, migrations, backups,
+and recovery inside this directory.
 
 ## 4. Registration Entry Point (FFI ABI)
 
@@ -111,7 +127,7 @@ Important details:
 1. Depend on a compatible TheNodes release. Cargo will rebuild when the host updates.
 2. Inside your plugin, you can assert the expected version:
    ```rust
-   assert_eq!(thenodes::plugin_host::PLUGIN_ABI_VERSION, 2);
+   assert_eq!(thenodes::plugin_host::PLUGIN_ABI_VERSION, 3);
    ```
    This guards against accidental mismatches when multiple host binaries exist.
 3. During load, `PluginRegistrarApi::register_plugin` validates the version automatically and returns an error if it differs.

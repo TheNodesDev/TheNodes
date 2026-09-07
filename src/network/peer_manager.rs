@@ -1,8 +1,9 @@
 // src/network/peer_manager.rs
 
+use parking_lot::RwLock as ParkingRwLock;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Instant;
 use tokio::sync::mpsc::Sender;
@@ -160,9 +161,19 @@ pub struct PeerManager {
     // ── NAT traversal / observed addresses (ADR-0005) ─────────────────────────────────────────
     /// Own node's most recently observed public UDP address (from TNCF OBSERVE_RESP).
     own_observed_addr: Arc<Mutex<Option<ObservedUdpAddrRecord>>>,
+    /// Fresh observed public UDP address samples keyed by observer identity.
+    own_observed_addr_samples: Arc<Mutex<HashMap<String, ObservedUdpAddrRecord>>>,
     /// Observed public UDP addresses reported for remote peers (from their HELLO or OBSERVE_RESP).
     /// The timestamp records when this node last received that observation data.
     udp_observed_addrs: Arc<Mutex<HashMap<String, ObservedUdpAddrRecord>>>,
+    /// Gateway-reported external IP address discovered via UPnP-IGD.
+    gateway_external_ip: Arc<ParkingRwLock<Option<String>>>,
+    /// Public TCP address to advertise in HELLO once a direct inbound path is confirmed.
+    public_tcp_hello_addr: Arc<ParkingRwLock<Option<String>>>,
+    /// Lightweight capability hint for likely direct inbound TCP reachability.
+    direct_tcp_hint: Arc<AtomicBool>,
+    /// Last emitted NAT diagnostic summary; used to suppress duplicate events.
+    nat_diagnostic_summary: Arc<ParkingRwLock<Option<String>>>,
     /// Pending punch requests keyed by correlation id.  (ADR-0005 Phase 3)
     pending_punches: Arc<Mutex<HashMap<String, PendingPunch>>>,
     pending_observations: Arc<Mutex<HashMap<[u8; 8], PendingObservation>>>,
@@ -219,7 +230,12 @@ impl PeerManager {
             udp_listen_addrs: Arc::new(Mutex::new(HashMap::new())),
             udp_session_ids: Arc::new(Mutex::new(HashMap::new())),
             own_observed_addr: Arc::new(Mutex::new(None)),
+            own_observed_addr_samples: Arc::new(Mutex::new(HashMap::new())),
             udp_observed_addrs: Arc::new(Mutex::new(HashMap::new())),
+            gateway_external_ip: Arc::new(ParkingRwLock::new(None)),
+            public_tcp_hello_addr: Arc::new(ParkingRwLock::new(None)),
+            direct_tcp_hint: Arc::new(AtomicBool::new(false)),
+            nat_diagnostic_summary: Arc::new(ParkingRwLock::new(None)),
             pending_punches: Arc::new(Mutex::new(HashMap::new())),
             pending_observations: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(feature = "noise")]
@@ -1535,12 +1551,21 @@ impl PeerManager {
         observer_node_id: Option<&str>,
         request_nonce: Option<[u8; 8]>,
     ) {
-        *self.own_observed_addr.lock().await = Some(ObservedUdpAddrRecord {
+        let record = ObservedUdpAddrRecord {
             addr: addr.to_string(),
             observed_at: std::time::Instant::now(),
             observer_node_id: observer_node_id.map(str::to_string),
             request_nonce,
-        });
+        };
+        *self.own_observed_addr.lock().await = Some(record.clone());
+        let sample_key = observer_node_id
+            .map(str::to_string)
+            .or_else(|| request_nonce.map(hex::encode))
+            .unwrap_or_else(|| addr.to_string());
+        self.own_observed_addr_samples
+            .lock()
+            .await
+            .insert(sample_key, record);
     }
 
     /// Return own observed UDP address if it was seen less than `max_age_secs` ago.
@@ -1551,6 +1576,20 @@ impl PeerManager {
             .as_ref()
             .filter(|record| record.observed_at.elapsed().as_secs() < max_age_secs)
             .map(|record| record.addr.clone())
+    }
+
+    /// Return all fresh local UDP observation samples.
+    pub async fn own_udp_observed_records_if_fresh(
+        &self,
+        max_age_secs: u64,
+    ) -> Vec<ObservedUdpAddrRecord> {
+        self.own_observed_addr_samples
+            .lock()
+            .await
+            .values()
+            .filter(|record| record.observed_at.elapsed().as_secs() < max_age_secs)
+            .cloned()
+            .collect()
     }
 
     /// Return the configured NAT-observation freshness window in seconds.
@@ -1685,6 +1724,40 @@ impl PeerManager {
 
     pub async fn remove_pending_observation(&self, nonce: &[u8; 8]) -> Option<PendingObservation> {
         self.pending_observations.lock().await.remove(nonce)
+    }
+
+    pub fn set_gateway_external_ip(&self, external_ip: Option<String>) {
+        *self.gateway_external_ip.write() = external_ip;
+    }
+
+    pub fn gateway_external_ip(&self) -> Option<String> {
+        self.gateway_external_ip.read().clone()
+    }
+
+    pub fn set_public_tcp_hello_addr(&self, addr: Option<String>) {
+        *self.public_tcp_hello_addr.write() = addr;
+    }
+
+    pub fn public_tcp_hello_addr(&self) -> Option<String> {
+        self.public_tcp_hello_addr.read().clone()
+    }
+
+    pub fn set_direct_tcp_hint(&self, enabled: bool) {
+        self.direct_tcp_hint.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn direct_tcp_hint(&self) -> bool {
+        self.direct_tcp_hint.load(Ordering::Relaxed)
+    }
+
+    pub fn replace_nat_diagnostic_summary(&self, summary: Option<String>) -> bool {
+        let mut guard = self.nat_diagnostic_summary.write();
+        if *guard == summary {
+            false
+        } else {
+            *guard = summary;
+            true
+        }
     }
 
     /// Register the live UDP socket and Noise session map (called after `spawn_udp_listener`).

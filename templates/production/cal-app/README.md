@@ -107,7 +107,8 @@ See the main TheNodes documentation for PKI setup instructions.
 
 The trust policy determines which peers are allowed to connect:
 - **Allowlist mode**: Only explicitly trusted peers can connect
-- **Blacklist mode**: All peers except explicitly rejected ones can connect
+- **Observe mode**: Record presented certificates while rejecting every connection
+- **TOFU mode**: Bind the first fingerprint to a peer identity and reject later changes
 
 ## Deployment
 

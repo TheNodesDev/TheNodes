@@ -5,7 +5,7 @@ This document explains how to build and ship plugins for TheNodes. It focuses on
 ## 1. Prerequisites
 
 - Rust 1.83 or newer with the `cargo` toolchain (matches this repo's declared MSRV and CI).
-- Access to a TheNodes 0.3.0 checkout or the matching published crate.
+- Access to a TheNodes 0.4.0 checkout or the matching published crate.
 - Familiarity with basic Rust crate structure, `cargo build`, and dynamic library basics for your platform.
 - Optional: OpenSSL or other tooling if you plan to test TLS locally.
 
@@ -23,7 +23,7 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-thenodes = { path = "../../" } # or `thenodes = "=0.3.0"` for the matching published host version
+thenodes = { path = "../../" } # or `thenodes = "=0.4.0"` for the matching published host version
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] } # plugin-specific
 ```
@@ -94,7 +94,7 @@ and recovery inside this directory.
 
 ## 4. Registration Entry Point (FFI ABI)
 
-The host discovers plugins by looking for an exported function named `register_plugin`. The signature **must** follow the C-compatible ABI provided by `PluginRegistrarApi`:
+The host discovers plugins by looking for an exported function named `register_plugin`. The registration symbol and function-table layout use a C ABI, while plugin instances remain Rust trait objects and must be rebuilt against the matching TheNodes release:
 
 ```rust
 use thenodes::plugin_host::{PluginRegistrarApi, Plugin};
@@ -116,7 +116,7 @@ pub unsafe extern "C" fn register_plugin(api: *const PluginRegistrarApi) {
 ```
 
 Important details:
-- `PluginRegistrarApi::from_raw` validates the pointer. Always check the result and log meaningful errors.
+- `PluginRegistrarApi::from_raw` rejects a null pointer. Always check the result and log meaningful errors.
 - `register_plugin` consumes a boxed plugin and passes it back to the host. Ownership transfers to TheNodes.
 - The helper enforces ABI version matching (see below). If versions diverge, the function returns `PluginApiError::VersionMismatch` and the host logs a rejection.
 
@@ -169,7 +169,7 @@ If you must support multiple host versions simultaneously, consider building sep
 - Plugins run in-process with the host and inherit its privileges. Treat them as trusted code.
 - Follow least-privilege practices: restrict file access, avoid executing external binaries unless required, and sanitize any user input processed inside the plugin.
 - Respect TheNodes logging conventions so that audit trails remain consistent.
-- If you build plugins in other languages, ensure the generated function table exactly matches the `PluginRegistrarApi` layout (C layout, little endian). Provide thorough testing before deployment.
+- Cross-language plugins are not supported in ABI 3 because `PluginHandle` carries a Rust trait object. Build plugins with a compatible Rust toolchain and the exact TheNodes host release.
 
 ## 10. Core Infrastructure APIs
 
@@ -180,10 +180,10 @@ Plugins can interact with core TheNodes infrastructure through `PluginContext`. 
 The `PeerStore` maintains known peers with metadata. Plugins can query it for discovery or connection decisions:
 
 ```rust
-use thenodes::network::{PeerStore, PeerSource};
+use thenodes::network::PeerSource;
 
-fn example(ctx: &PluginContext) {
-    let store = ctx.peer_store();
+async fn example(ctx: &PluginContext) {
+    let store = &ctx.peer_store;
     
     // Sample random peers (excluding already-connected)
     let exclude = std::collections::HashSet::new();
@@ -207,48 +207,39 @@ Plugins can construct and send relay protocol messages using the builder APIs:
 use thenodes::network::relay::{RelayBindBuilder, RelayForwardBuilder};
 
 async fn bind_via_relay(ctx: &PluginContext, relay_addr: &SocketAddr, target: &str) {
-    let pm = ctx.peer_manager();
-    
     // Request a relay binding to a target peer
     RelayBindBuilder::new("my-node", target)
         .store_forward(true)      // Enable store-and-forward if target offline
         .qos("reliable")          // QoS: low_latency | high_throughput | bulk | reliable
         .ttl(3600)                // Binding TTL in seconds
-        .send(&pm, relay_addr, ctx.realm().cloned())
+        .send(
+            ctx.peer_manager.as_ref(),
+            relay_addr,
+            ctx.config.realm.clone(),
+        )
         .await;
 }
 
 async fn send_via_relay(ctx: &PluginContext, relay_addr: &SocketAddr, to: &str) {
-    let pm = ctx.peer_manager();
-    
     // Send an opaque forwarding frame through the relay
     RelayForwardBuilder::new("my-node", to)
         .sequence(42)                          // Optional sequence number for ordering
         .payload_text("hello via relay")       // Or .payload_json() / .payload_binary()
-        .send(&pm, relay_addr, ctx.realm().cloned())
+        .send(
+            ctx.peer_manager.as_ref(),
+            relay_addr,
+            ctx.config.realm.clone(),
+        )
         .await;
 }
 ```
 
-### Advertising Capabilities
+### Advertised Capabilities
 
-Plugins can influence the capabilities advertised in HELLO by providing configuration defaults. Capabilities like `relay` or `relay_store_forward` are used for deterministic relay selection:
-
-```rust
-use thenodes::config::ConfigDefaults;
-
-impl Plugin for MyPlugin {
-    fn early_config_defaults(&self) -> Option<ConfigDefaults> {
-        Some(ConfigDefaults {
-            // Advertise that this node can act as a relay
-            capabilities: Some(vec!["relay".into(), "my-plugin-feature".into()]),
-            ..Default::default()
-        })
-    }
-}
-```
-
-Peers advertising `relay` are eligible for Rendezvous (HRW) selection. Add `relay_store_forward` if your node supports store-and-forward buffering.
+Transport capabilities such as `relay`, `relay_store_forward`, `udp`, `punch`,
+and `punch_rendezvous` are derived by the host from runtime configuration and
+compiled Cargo features. ABI 3 does not provide a plugin API for adding
+arbitrary HELLO capabilities.
 
 ### Handling Relay Notifications
 

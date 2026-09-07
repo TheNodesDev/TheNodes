@@ -26,7 +26,7 @@
 //! See `CHANGELOG.md` for unreleased changes while pre-1.0.
 //!
 //! ## Status
-//! Version 0.3.0 is pre-1.0. Minor releases may introduce breaking changes;
+//! Version 0.4.0 is pre-1.0. Minor releases may introduce breaking changes;
 //! see `CHANGELOG.md` and `STABILITY.md` for compatibility guidance.
 //!
 //! ## Roadmap (High-Level)

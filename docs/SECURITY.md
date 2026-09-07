@@ -20,7 +20,8 @@ This document outlines the encryption and certificate trust model and how secure
 [encryption]
 enabled = true
 ```
-- When enabled, all peer connections use TLS.
+- When enabled, peer connections use the selected `tls` or `noise` backend.
+    Noise requires the `noise` Cargo feature.
 
 - Development fast-start (explicit opt-out):
 
@@ -33,8 +34,10 @@ enabled = false # Development-only; plaintext traffic
 
 ## 2. Encryption Modes
 
-- Default: **TLS** via [`rustls`](https://github.com/rustls/rustls)
-- Future plans: **QUIC** (built-in encryption) and pluggable crypto backends.
+- **TLS** via [`rustls`](https://github.com/rustls/rustls), the default backend when encryption is enabled.
+- **Noise XX** via `snow`, available with the optional `noise` Cargo feature.
+- **Plaintext**, for explicitly configured development or controlled environments only.
+- Future plans include QUIC and additional pluggable crypto backends.
 
 ---
 
@@ -95,9 +98,9 @@ When TLS is enabled, each incoming peer certificate is evaluated according to th
 | Mode            | Behaviour                                                                 | Typical Use                                | `store_new_certs = "observed"` |
 |-----------------|----------------------------------------------------------------------------|--------------------------------------------|---------------------------------|
 | `open`          | Accept any presented certificate. Still honours pinning / time / chain flags when enabled. | Quick local development or fully trusted lab networks. | Writes a PEM copy of newly seen certs to the observed directory (if configured). |
-| `allowlist`     | Accept only certificates whose SPKI fingerprint already exists under `pki/trusted/certs`. Any unrecognised cert is rejected. | Locked-down production where operators curate a fixed allowlist. | **Never** writes to `observed/`; rejected peers are stopped before storage occurs. |
-| `observe`       | Reject certificates that are not already pinned/trusted while still copying them into `pki/observed/certs` for review. | Staged rollouts where operators want visibility without permitting the connection. | Writes a PEM copy even though the session is rejected. |
-| `tofu` (Trust On First Use) | Accept the first time a fingerprint is seen, record it, and require the same fingerprint on subsequent connections. | Gradual rollout where you harvest fingerprints during an onboarding phase. | Stores the first-seen cert so future rotations can be reviewed. |
+| `allowlist`     | Accept only certificates whose SPKI fingerprint already exists under `pki/trusted/certs`. Any unrecognised cert is rejected. | Locked-down production where operators curate a fixed allowlist. | Records rejected certificates when explicitly enabled. |
+| `observe`       | Reject every connection after recording the presented certificate for review. | Staged rollouts where operators want visibility without permitting traffic. | Always attempts to write a PEM copy. |
+| `tofu` (Trust On First Use) | Atomically bind the first fingerprint to a peer identity and require the same fingerprint thereafter. Missing identity or unavailable storage rejects the connection. | Controlled onboarding with durable, writable observed storage. | Stores the first-seen certificate and identity binding. |
 | `hybrid` (placeholder) | Currently behaves like `open` but emits metadata allowing future staged enforcement. | Migration experiments before full hybrid enforcement ships. | Stores newly seen certs, same as `open`. |
 
 When `enforce_ca_chain = true`, TheNodes performs cryptographic WebPKI path validation for the peer's TLS role. Trust anchors are loaded from `issuer_cert_dir`; `trusted_cert_dir` is used as a compatibility fallback when no issuer directory is configured. The peer supplies intermediate certificates during the TLS handshake. Complete-path validation includes certificate signatures, CA/path constraints, EKU, critical extensions, name constraints, and current-time validity.
@@ -133,8 +136,9 @@ directory. A rejected Noise decision terminates the connection, and accepted
 channels expose the static-key fingerprint in their authentication summary.
 
 If you enable `store_new_certs = "observed"`, ensure the `observed_dir` path is configured in
-`[encryption.trust_policy.paths]`. Keep in mind that the setting has no effect in `allowlist`
-mode because unlisted peers are rejected before their certificates can be persisted (consider `observe` when you want to capture but still block).
+`[encryption.trust_policy.paths]`. In `allowlist` mode, unlisted peers remain rejected but their
+certificates can still be persisted for review. Use `observe` when every connection must be rejected
+while presented certificates are collected.
 
 ## 6. Certificate Management Options
 
@@ -187,12 +191,13 @@ plugins/
 
 **Mitigation:**
 - Restrict `plugins/` directory permissions (owner-only write)
-- Implement plugin signature verification
-- Use allowlists for permitted plugins
+- Distribute plugins over authenticated channels and verify artifacts externally
+- Pin plugins to the exact TheNodes host release and rebuild them with the host toolchain
 
 #### 2. FFI Interface Vulnerabilities
-Current plugin interface now ships with a C-compatible registrar API that exposes
-versioned function tables instead of raw Rust trait objects.
+The registration symbol and registrar function table use a C layout, but ABI 3
+still transfers a Rust trait object in `PluginHandle`. It is not a stable
+cross-language or arbitrary-toolchain ABI.
 
 **Remaining Considerations:**
 - Document ABI expectations for third-party authors (done in README plugin guide).
@@ -210,17 +215,14 @@ versioned function tables instead of raw Rust trait objects.
 ```toml
 # Cargo.toml - Pin compatible TheNodes version
 [dependencies]
-thenodes = "=0.3.0"  # Exact version for ABI compatibility
+thenodes = "=0.4.0"  # Exact version for ABI compatibility
 ```
 
 #### For Node Operators
-```toml
-# config.toml - Restrict plugin loading
-[plugins]
-directory = "/secure/path/plugins"
-verify_signatures = true
-allowed_plugins = ["libmydomain.so", "libmetrics.so"]
-```
+
+TheNodes 0.4.0 does not provide plugin signature verification or a plugin
+allowlist in its configuration schema. Restrict write access to the configured
+plugin directory and verify release artifacts before deployment.
 
 #### File System Security
 ```bash
@@ -233,9 +235,9 @@ chown node:node /path/to/plugins/   # Owned by node process user
 ### Future Security Enhancements
 
 #### Phase 1 (Pre-1.0)
+- [x] Versioned registration table and ABI compatibility checking
 - [ ] Plugin signature verification
-- [ ] Stable FFI-safe plugin API design
-- [ ] ABI compatibility checking
+- [ ] Stable cross-toolchain and cross-language plugin ABI
 - [ ] Plugin allowlisting configuration
 
 #### Phase 2 (Post-1.0)
@@ -261,7 +263,7 @@ For security-critical deployments, consider **CAL mode**:
 | Encryption Default         | On in production templates; configurable in core |
 | Encryption Type            | TLS via `rustls`                 |
 | Trust Mechanism            | Fully structured PKI directory   |
-| Plugin Security (NEP)      | Directory permissions + signatures |
+| Plugin Security (NEP)      | Directory permissions + exact-version ABI checks; no built-in signatures or allowlist |
 | Plugin Security (CAL)      | Compile-time only (safer)        |
 | Future Expansion           | QUIC, plugin crypto, WASM plugins |
 | Interop with C/OpenSSL     | No (by design)                   |

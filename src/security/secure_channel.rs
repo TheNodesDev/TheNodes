@@ -462,19 +462,18 @@ impl SecureChannel for PlaintextChannel {
 /// Select a secure channel, rejecting Noise when its feature is unavailable.
 pub fn make_secure_channel(cfg: &crate::config::Config) -> Result<Box<dyn SecureChannel>> {
     let enc = cfg.encryption.as_ref();
-    // Derive backend: default to tls if enabled, plaintext if disabled
-    let backend = enc
-        .and_then(|e| e.backend.as_deref())
-        .map(|b| b.trim().to_ascii_lowercase())
-        .or_else(|| {
-            enc.map(|e| {
-                if e.enabled {
-                    "tls".to_string()
-                } else {
-                    "plaintext".to_string()
-                }
-            })
-        });
+    let backend = enc.map(|encryption| {
+        if !encryption.enabled {
+            "plaintext".to_string()
+        } else {
+            encryption
+                .backend
+                .as_deref()
+                .map(str::trim)
+                .map(str::to_ascii_lowercase)
+                .unwrap_or_else(|| "tls".to_string())
+        }
+    });
     let channel: Box<dyn SecureChannel> = match backend.as_deref() {
         Some("tls") => Box::new(TlsSecureChannel::new()),
         Some("none") | Some("plaintext") => Box::new(PlaintextChannel::new()),
@@ -1194,5 +1193,24 @@ impl rustls::server::danger::ClientCertVerifier for DeferredClientCertVerifier {
         rustls::crypto::ring::default_provider()
             .signature_verification_algorithms
             .supported_schemes()
+    }
+}
+
+#[cfg(all(test, not(feature = "noise")))]
+mod tests {
+    use super::make_secure_channel;
+    use crate::config::Config;
+
+    #[test]
+    fn disabled_encryption_ignores_configured_backend() {
+        let mut config = Config::default();
+        let encryption = config
+            .encryption
+            .as_mut()
+            .expect("default encryption config");
+        encryption.enabled = false;
+        encryption.backend = Some("noise".to_string());
+
+        assert!(make_secure_channel(&config).is_ok());
     }
 }

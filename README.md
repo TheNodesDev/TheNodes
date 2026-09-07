@@ -8,18 +8,37 @@ Repository: https://github.com/TheNodesDev/TheNodes
 
 ## Install
 
-TheNodes 0.3.0 requires Rust 1.83 or newer.
+TheNodes 0.4.0 requires Rust 1.83 or newer.
 
 Add to your Cargo.toml:
 
 ```toml
 [dependencies]
-thenodes = "0.3.0"
+thenodes = "0.4.0"
 ```
 
-This guide targets version 0.3.0.
+This guide targets version 0.4.0.
 
-Dynamic plugins must use the same TheNodes release as the host. Pin plugin dependencies to the exact host version when reproducible ABI matching is required. The unreleased plugin API uses ABI version 3.
+Dynamic plugins must use the same TheNodes release as the host. Pin plugin dependencies to the exact host version when reproducible ABI matching is required. TheNodes 0.4.0 uses plugin ABI version 3.
+
+### Cargo Features
+
+The default feature set is empty. TLS and plaintext TCP support are always
+available.
+
+| Feature | Enables | Runtime activation |
+|---------|---------|--------------------|
+| `noise` | TCP Noise plus UDP Noise sessions and NAT traversal | Set `encryption.enabled = true` with `backend = "noise"` and/or enable `[network.udp]` and `[network.nat_traversal]` |
+| `upnp` | UPnP-IGD discovery, TCP port mapping, renewal, and NAT diagnostics | Set `[network.nat].enabled = true` |
+
+Enable both optional features with:
+
+```sh
+cargo build --release --features noise,upnp
+```
+
+Compile-time features and runtime settings are independent: enabling a Cargo
+feature makes the implementation available but does not activate it.
 
 ## What Is TheNodes?
 
@@ -65,7 +84,7 @@ If your requirement is only basic request/response between a few services, a sim
 This reference implementation is written in Rust to leverage strong compile-time guarantees, memory safety without GC, and an async ecosystem (Tokio) well-suited for high concurrency. Other implementations (different languages or specialized runtime targets) are welcome and encouraged; the architectural concepts—realms, message types, plugin-driven extension—are intentionally portable.
 
 ### High-Level Architecture
-![TheNodes 0.3.0 high-level architecture](docs/architecture.svg)
+![TheNodes 0.4.0 high-level architecture](docs/architecture.svg)
 
 The editable diagram source is available in [Mermaid format](docs/architecture.mmd).
 
@@ -175,7 +194,8 @@ TheNodes/
 │   ├── SECURITY_TRUST_POLICY_PLAN.md
 │   ├── releases/                  # Release-note standard and published notes
 │   │   ├── README.md
-│   │   └── v0.3.0.md
+│   │   ├── v0.3.0.md
+│   │   └── v0.4.0.md
 │   └── adr/                       # Architecture Decision Records
 │       ├── 0001-secure-channel-abstraction.md
 │       ├── 0002-persistent-peer-store.md
@@ -183,7 +203,10 @@ TheNodes/
 │       ├── 0004-udp-noise-transport.md
 │       ├── 0005-nat-traversal-and-connection-policy.md
 │       ├── 0006-delivery-semantics-and-reliability-model.md
-│       └── 0007-connection-lifecycle-policy.md
+│       ├── 0007-connection-lifecycle-policy.md
+│       ├── 0008-transport-agnostic-fingerprint-trust.md
+│       ├── 0009-upnp-port-mapping-and-nat-diagnostics.md
+│       └── 0010-explicit-relay-payload-framing.md
 └── README.md
 ```
 
@@ -208,14 +231,14 @@ my-app/
 ├── config/
 │   └── app.toml
 └── my-plugin-src/        # Separate plugin development project
-    ├── Cargo.toml        # Depends on thenodes = "0.3.0" for Plugin trait
+    ├── Cargo.toml        # Depends on thenodes = "=0.4.0" for Plugin trait
     └── src/lib.rs        # Your plugin code
 ```
 
 **CAL Mode:**
 ```
 my-app/
-├── Cargo.toml            # Lists thenodes = "0.3.0" as dependency
+├── Cargo.toml            # Lists thenodes = "0.4.0" as dependency
 ├── src/
 │   └── main.rs           # Your app using TheNodes APIs  
 └── config/
@@ -277,7 +300,7 @@ CAL Mode Note: When embedding as a library, you *may* still internally structure
 
 ## Networking and Delivery
 
-The unreleased changes add optional UPnP-IGD port mapping, NAT diagnostics, explicit relay
+Version 0.4.0 adds optional UPnP-IGD port mapping, NAT diagnostics, explicit relay
 payload framing, Noise static-key trust, and isolated plugin data directories. The
 UDP + Noise transport, connection policy, lifecycle monitoring, and delivery
 semantics introduced in 0.3.0 remain available.
@@ -431,9 +454,9 @@ observed_dir = "pki/noise/observed"
 TheNodes supports optional TLS. When disabled, traffic is plaintext (development / controlled environments). When TLS is enabled, the `[encryption.trust_policy]` `mode` controls how peer certificates are evaluated. The currently implemented modes behave as follows:
 
 - `open` – accept any presented certificate (while still applying pinning and validity flags if configured). Useful for quick internal experiments. When `store_new_certs = "observed"`, first-seen certs are copied into the observed directory.
-- `allowlist` – only accept certificates whose SPKI fingerprint already exists in `pki/trusted/certs`. New fingerprints are rejected and therefore never written to `observed/`, even if `store_new_certs` is set.
-- `observe` – always reject untrusted certificates but still write their fingerprints to `pki/observed/certs` (or the configured directory). Useful for staged rollouts that want visibility before promoting certs.
-- `tofu` – "Trust On First Use": accept a previously unseen fingerprint once, record it (if `observed_dir` is configured), and require the same fingerprint on subsequent connections. Handy for bootstrapping a trust store.
+- `allowlist` – only accept certificates whose SPKI fingerprint already exists in `pki/trusted/certs`. New fingerprints are rejected; when `store_new_certs = "observed"`, their certificates can still be recorded for review.
+- `observe` – reject every connection after recording the presented certificate in `pki/observed/certs` (or the configured directory). Useful for staged rollouts that want visibility without permitting traffic.
+- `tofu` – "Trust On First Use": atomically record the first fingerprint for a peer identity and require that fingerprint on subsequent connections. A writable `observed_dir` and a peer identity are mandatory; otherwise the connection is rejected.
 - `hybrid` (placeholder) – currently identical to `open` but tagged in logs so future staged enforcement can be layered on without config churn.
 
 > A dedicated `ca` mode is reserved for a future release. Full CA path validation is already available explicitly through `enforce_ca_chain = true`.
@@ -450,7 +473,7 @@ Phase 2 (current baseline) adds:
 Phase 3 (pinning core delivered) adds:
 - Pin sets: `pin_fingerprints` (exact SPKI SHA-256 hex) and `pin_subjects` (exact or `~substring`).
 - Realm binding: `realm_subject_binding` ensures the active realm name appears in certificate subject (if enabled).
-- Enforcement ordering: fingerprint pins -> subject pins -> realm binding -> chain/time flags -> mode logic.
+- Enforcement ordering: chain/time flags -> fingerprint pins -> subject pins -> realm binding -> mode logic.
 - Promotion helper: move observed certs into trusted directory programmatically (`promote_observed_to_trusted`).
 
 `store_new_certs` only has an effect in modes that actually admit or capture new fingerprints (`open`, `observe`, `tofu`, `hybrid`). Allowlist deployments should populate `pki/trusted/certs` out-of-band or via promotion tooling.
@@ -502,7 +525,7 @@ Behavior summary:
 - mtls=false (default): Only server cert is presented; client identity at TLS layer is unauthenticated.
 - mtls=true: Client presents its certificate; server requires and evaluates it using trust policy.
 - allowlist mode + mtls=true: Only peers with certs in `trusted_cert_dir` are accepted.
-- tofu mode + mtls=true: First-seen certs can be recorded to `observed_dir` (if configured) for future continuity checks.
+- tofu mode + mtls=true: First-seen client certificates are bound to their peer identity in `observed_dir`; missing or unwritable TOFU storage rejects the connection.
 
 Operational tips:
 - Ensure `own_certificate` / `own_private_key` exist before enabling mTLS.
@@ -822,7 +845,7 @@ See `src/realms/realm.rs` for validation logic.
 
 Plugins are compiled as dynamic libraries that expose a single registration symbol with a C-layout function-table boundary. The boundary is explicitly versioned but remains pre-1.0 and can change between TheNodes minor releases.
 
-The unreleased plugin API uses `PLUGIN_ABI_VERSION = 3`. Plugins must implement a stable
+TheNodes 0.4.0 uses `PLUGIN_ABI_VERSION = 3`. Plugins must implement a stable
 `plugin_id()`, use the host-bound context, and be rebuilt against the matching host. A plugin
 can call `PluginContext::plugin_data_dir()` to create and obtain its isolated
 directory under the node state directory. Plugins own the storage engine and all

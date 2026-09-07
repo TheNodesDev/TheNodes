@@ -14,6 +14,8 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use tokio_rustls::rustls::pki_types::CertificateDer;
 
+pub use crate::security::encryption::CertificateUsage;
+
 /// Runtime trust policy mode (Phase 1)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrustMode {
@@ -189,52 +191,108 @@ impl TrustDecision {
     }
 }
 
-/// Evaluate peer certificate chain according to effective policy.
-/// Expects leaf first. Currently only leaf fingerprint matters (Phase 1).
-pub fn evaluate_peer_cert_chain(
+/// Evaluate a peer certificate chain for its concrete TLS role.
+/// Expects the peer chain leaf first.
+pub fn evaluate_peer_cert_chain_for_usage(
     policy: &EffectiveTrustPolicy,
     trusted_cert_dir: Option<&str>,
+    trust_anchor_dir: Option<&str>,
     observed_dir: Option<&str>,
     peer_chain: &[CertificateDer<'_>],
     realm: Option<&crate::realms::RealmInfo>,
+    usage: CertificateUsage,
 ) -> TrustDecision {
-    // Placeholder chain/time validation (Phase 2 scaffolding)
-    use crate::security::encryption::{extract_validity_windows, validate_chain_simple};
+    evaluate_peer_cert_chain_at(
+        policy,
+        trusted_cert_dir,
+        trust_anchor_dir,
+        observed_dir,
+        peer_chain,
+        realm,
+        usage,
+        std::time::SystemTime::now(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_peer_cert_chain_at(
+    policy: &EffectiveTrustPolicy,
+    trusted_cert_dir: Option<&str>,
+    trust_anchor_dir: Option<&str>,
+    observed_dir: Option<&str>,
+    peer_chain: &[CertificateDer<'_>],
+    realm: Option<&crate::realms::RealmInfo>,
+    usage: CertificateUsage,
+    now: std::time::SystemTime,
+) -> TrustDecision {
+    use crate::security::encryption::{
+        extract_validity_windows, validate_certificate_chain, validate_self_signed_certificate,
+    };
+
     let mut chain_valid: Option<bool> = None;
     let mut chain_reason: Option<String> = None;
     let mut time_valid: Option<bool> = None;
     let mut time_reason: Option<String> = None;
-    let issuer_dir = trusted_cert_dir; // reuse trusted dir as issuer roots fallback (issuer_cert_dir not yet distinct in config usage here)
-    let (cv, creason, self_signed) = validate_chain_simple(peer_chain, issuer_dir);
+    let leaf_fp = peer_chain.first().and_then(spki_fingerprint);
     if policy.enforce_ca_chain {
+        let (cv, creason, self_signed) =
+            validate_certificate_chain(peer_chain, trust_anchor_dir, usage, now);
         chain_valid = Some(cv);
         chain_reason = Some(creason.clone());
+        // A self-signed override is explicit and still requires a valid
+        // self-signature, current validity, and matching TLS EKU.
+        if !cv && self_signed && policy.accept_self_signed {
+            match peer_chain
+                .first()
+                .ok_or_else(|| "empty-chain".to_string())
+                .and_then(|certificate| validate_self_signed_certificate(certificate, usage, now))
+            {
+                Ok(()) => {
+                    chain_valid = Some(true);
+                    chain_reason = Some("self-signed-override".into());
+                }
+                Err(reason) => {
+                    chain_reason = Some(reason);
+                }
+            }
+        }
     } else if !peer_chain.is_empty() {
         chain_valid = Some(true);
         chain_reason = Some("not-enforced".into());
     }
-    // If chain invalid and self-signed allowed, override
-    if policy.enforce_ca_chain
-        && chain_valid == Some(false)
-        && self_signed
-        && policy.accept_self_signed
-    {
-        chain_valid = Some(true);
-        chain_reason = Some("self-signed-override".into());
-    }
-    // Time validity
-    if let Some(leaf) = peer_chain.first() {
+
+    // The independent leaf-validity flags also work when CA-chain enforcement is off.
+    if policy.reject_before_valid || policy.reject_expired {
+        let now_unix = match now.duration_since(std::time::UNIX_EPOCH) {
+            Ok(duration) => duration.as_secs() as i64,
+            Err(_) => {
+                return TrustDecision::reject(
+                    "time-invalid",
+                    leaf_fp,
+                    chain_valid,
+                    Some(false),
+                    chain_reason,
+                    Some("system-time-before-unix-epoch".into()),
+                )
+            }
+        };
+        let Some(leaf) = peer_chain.first() else {
+            return TrustDecision::reject(
+                "time-invalid",
+                None,
+                chain_valid,
+                Some(false),
+                chain_reason,
+                Some("missing-leaf-certificate".into()),
+            );
+        };
         if let Some((nb, na)) = extract_validity_windows(leaf.as_ref()) {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64;
             let mut ok = true;
-            if policy.reject_before_valid && now < nb {
+            if policy.reject_before_valid && now_unix < nb {
                 ok = false;
                 time_reason = Some("not-yet-valid".into());
             }
-            if policy.reject_expired && now > na {
+            if policy.reject_expired && now_unix > na {
                 ok = false;
                 time_reason = Some("expired".into());
             }
@@ -242,36 +300,31 @@ pub fn evaluate_peer_cert_chain(
                 time_reason = Some("valid".into());
             }
             time_valid = Some(ok);
-            if policy.reject_before_valid && now < nb {
+            if !ok {
                 return TrustDecision::reject(
                     "time-invalid",
-                    None,
+                    leaf_fp,
                     chain_valid,
                     time_valid,
                     chain_reason,
                     time_reason,
                 );
             }
-            if policy.reject_expired && now > na {
-                return TrustDecision::reject(
-                    "time-invalid",
-                    None,
-                    chain_valid,
-                    time_valid,
-                    chain_reason,
-                    time_reason,
-                );
-            }
-        } else if policy.reject_before_valid || policy.reject_expired {
-            // Could not parse validity; be permissive (treat as valid) but note reason.
-            time_valid = Some(true);
-            time_reason = Some("unparsed".into());
+        } else {
+            return TrustDecision::reject(
+                "time-invalid",
+                leaf_fp,
+                chain_valid,
+                Some(false),
+                chain_reason,
+                Some("validity-unparseable".into()),
+            );
         }
     }
     if policy.enforce_ca_chain && chain_valid == Some(false) {
         return TrustDecision::reject(
             "chain-invalid",
-            None,
+            leaf_fp,
             chain_valid,
             time_valid,
             chain_reason,
@@ -280,7 +333,6 @@ pub fn evaluate_peer_cert_chain(
     }
 
     // Extract leaf fingerprint & subject (if parsable)
-    let leaf_fp = peer_chain.first().and_then(spki_fingerprint);
     let mut leaf_subject: Option<String> = None;
     if let Some(first) = peer_chain.first() {
         if let Ok((_, parsed)) = x509_parser::parse_x509_certificate(first.as_ref()) {

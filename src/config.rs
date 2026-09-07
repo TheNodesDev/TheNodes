@@ -76,7 +76,8 @@ pub struct TrustPolicyConfig {
     pub reject_expired: Option<bool>,
     /// Phase 2: reject certificates whose notBefore > now
     pub reject_before_valid: Option<bool>,
-    /// Phase 2: require a valid issuer chain (ca / hybrid future)
+    /// Require a cryptographically valid, current-time CA path anchored in
+    /// `encryption.paths.issuer_cert_dir` (or `trusted_cert_dir` as fallback).
     pub enforce_ca_chain: Option<bool>,
     /// Phase 3: list of allowed certificate subject strings (exact match on parsed full DN or substring if prefixed with '~')
     pub pin_subjects: Option<Vec<String>>,

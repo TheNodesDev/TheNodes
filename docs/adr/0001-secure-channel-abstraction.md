@@ -56,7 +56,7 @@ pub trait SecureChannel: Send + Sync {
 ```
 
 Implementations:
-- `TlsSecureChannel`: wraps `rustls` TLS/mTLS logic, deriving `AuthSummary` via `evaluate_peer_cert_chain` and emitting trust decision events.
+- `TlsSecureChannel`: wraps `rustls` TLS/mTLS logic, deriving `AuthSummary` via `evaluate_peer_cert_chain_for_usage` and emitting trust decision events.
 - `NoiseSecureChannel` (feature `noise`): uses `snow` (XX) with u16 length-prefixed encrypted frames and handshake timeouts; `chain_valid/time_valid=None`. Fingerprint emission for noise static keys is deferred.
 - `PlaintextChannel`: used when `encryption.enabled = false` for development.
 

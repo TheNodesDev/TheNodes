@@ -1,5 +1,6 @@
 use thenodes::security::trust::{
-    evaluate_peer_cert_chain, spki_fingerprint, EffectiveTrustPolicy, TrustDecisionOutcome,
+    evaluate_peer_cert_chain_for_usage, spki_fingerprint, CertificateUsage, EffectiveTrustPolicy,
+    TrustDecisionOutcome,
 };
 use tokio_rustls::rustls::pki_types::CertificateDer;
 
@@ -35,7 +36,15 @@ fn spki_fingerprint_fallback_hashes() {
 fn open_mode_accepts_dummy_cert() {
     let policy = make_policy(true);
     let dummy = CertificateDer::from(DUMMY_CERT.to_vec());
-    let decision = evaluate_peer_cert_chain(&policy, None, None, &[dummy], None);
+    let decision = evaluate_peer_cert_chain_for_usage(
+        &policy,
+        None,
+        None,
+        None,
+        &[dummy],
+        None,
+        CertificateUsage::Either,
+    );
     assert!(matches!(decision.outcome, TrustDecisionOutcome::Accept));
 }
 
@@ -52,8 +61,15 @@ fn fingerprint_pin_enforced() {
         ..Default::default()
     };
     let policy = EffectiveTrustPolicy::from_config(&enc);
-    let decision =
-        evaluate_peer_cert_chain(&policy, None, None, std::slice::from_ref(&dummy), None);
+    let decision = evaluate_peer_cert_chain_for_usage(
+        &policy,
+        None,
+        None,
+        None,
+        std::slice::from_ref(&dummy),
+        None,
+        CertificateUsage::Either,
+    );
     assert_eq!(
         decision.outcome,
         TrustDecisionOutcome::Accept,
@@ -70,7 +86,15 @@ fn fingerprint_pin_enforced() {
         ..Default::default()
     };
     let policy2 = EffectiveTrustPolicy::from_config(&enc);
-    let decision2 = evaluate_peer_cert_chain(&policy2, None, None, &[dummy], None);
+    let decision2 = evaluate_peer_cert_chain_for_usage(
+        &policy2,
+        None,
+        None,
+        None,
+        &[dummy],
+        None,
+        CertificateUsage::Either,
+    );
     assert_eq!(
         decision2.outcome,
         TrustDecisionOutcome::Reject,
@@ -91,7 +115,15 @@ fn subject_pin_unparsed_rejects() {
         ..Default::default()
     };
     let policy = EffectiveTrustPolicy::from_config(&enc);
-    let decision = evaluate_peer_cert_chain(&policy, None, None, &[dummy], None);
+    let decision = evaluate_peer_cert_chain_for_usage(
+        &policy,
+        None,
+        None,
+        None,
+        &[dummy],
+        None,
+        CertificateUsage::Either,
+    );
     assert_eq!(
         decision.outcome,
         TrustDecisionOutcome::Reject,

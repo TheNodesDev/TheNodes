@@ -23,6 +23,10 @@ impl Default for {{APP_NAME_PASCAL}}Plugin {
 
 #[async_trait::async_trait]
 impl Plugin for {{APP_NAME_PASCAL}}Plugin {
+    fn plugin_id(&self) -> &'static str {
+        "{{APP_NAME}}"
+    }
+
     /// Handle incoming network messages.
     async fn on_message(&self, message: &Message, _ctx: &PluginContext) {
         if let MessageType::Extension { kind } = &message.msg_type {
@@ -59,7 +63,7 @@ impl Plugin for {{APP_NAME_PASCAL}}Plugin {
 ///
 /// # Safety
 ///
-/// `api` must be a valid pointer to the host's v0.3 plugin registrar API and
+/// `api` must be a valid pointer to the host's ABI v3 plugin registrar API and
 /// remain valid for the duration of this call.
 #[no_mangle]
 pub unsafe extern "C" fn register_plugin(api: *const PluginRegistrarApi) {

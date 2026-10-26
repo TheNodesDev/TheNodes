@@ -598,8 +598,9 @@ fn evaluate_peer_cert_chain_at(
         chain_valid = Some(cv);
         chain_reason = Some(creason.clone());
         // A self-signed override is explicit and still requires a valid
-        // self-signature, current validity, and matching TLS EKU.
-        if !cv && self_signed && policy.accept_self_signed {
+        // self-signature, current validity, and matching TLS EKU. It never
+        // overrides a key that webpki explicitly distrusts.
+        if !cv && self_signed && policy.accept_self_signed && creason != "certificate-distrusted" {
             match peer_chain
                 .first()
                 .ok_or_else(|| "empty-chain".to_string())

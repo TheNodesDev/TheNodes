@@ -2,12 +2,12 @@ use std::fs;
 
 use rcgen::{
     date_time_ymd, BasicConstraints, Certificate, CertificateParams, ExtendedKeyUsagePurpose, IsCa,
-    KeyPair, KeyUsagePurpose,
+    KeyPair, KeyUsagePurpose, PublicKeyData, SignatureAlgorithm,
 };
 use tempfile::TempDir;
 use thenodes::config::{Config, EncryptionConfig, EncryptionPaths, TrustPolicyConfig};
 use thenodes::realms::RealmInfo;
-use thenodes::security::encryption::extract_validity_windows;
+use thenodes::security::encryption::{extract_validity_windows, validate_certificate_chain};
 use thenodes::security::secure_channel::{SecureChannel, TlsSecureChannel};
 use thenodes::security::trust::{
     evaluate_peer_cert_chain_for_usage, CertificateUsage, EffectiveTrustPolicy,
@@ -86,6 +86,49 @@ fn self_signed_leaf() -> CertificateDer<'static> {
     params.not_after = date_time_ymd(2040, 1, 1);
     let key = KeyPair::generate().unwrap();
     params.self_signed(&key).unwrap().der().clone()
+}
+
+/// Uncompressed P-384 point of `EMOVTLSCAG3B`, one of the eMudhra intermediate
+/// CA keys on rustls-webpki's distrusted SPKI list.
+const DISTRUSTED_EMUDHRA_KEY: &str = concat!(
+    "0473897aa0eb3cfdca8b12402ffaf0abc4e1212baf8dee778ac9ee2d6db83fac",
+    "280c5e05638ae7a2acd71c322a8e361cdeb9f69c4302b9dd8d73d1cc6caab2cc",
+    "0aee4e216ce979dd518a4af4b626e5684cdd658037ed0c854e4cc12f4cf8646d",
+    "0d",
+);
+
+struct DistrustedPublicKey(Vec<u8>);
+
+impl PublicKeyData for DistrustedPublicKey {
+    fn der_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    fn algorithm(&self) -> &SignatureAlgorithm {
+        &rcgen::PKCS_ECDSA_P384_SHA384
+    }
+}
+
+/// Issues a leaf for the distrusted eMudhra key. The test has no private key
+/// for it, so the leaf is signed by `issuer`.
+fn distrusted_key_leaf(
+    issuer: &CertificateAuthority,
+    common_name: &str,
+) -> CertificateDer<'static> {
+    let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, common_name);
+    params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    params.not_before = date_time_ymd(2022, 1, 1);
+    params.not_after = date_time_ymd(2038, 1, 1);
+    let key = DistrustedPublicKey(hex::decode(DISTRUSTED_EMUDHRA_KEY).unwrap());
+    params
+        .signed_by(&key, &issuer.certificate, &issuer.key)
+        .unwrap()
+        .der()
+        .clone()
 }
 
 fn trust_anchor_directory(ca: &CertificateAuthority) -> TempDir {
@@ -198,6 +241,41 @@ fn rejects_a_tampered_certificate_signature() {
 }
 
 #[test]
+fn reports_an_unsupported_signature_algorithm_as_a_stable_reason() {
+    const ECDSA_WITH_SHA256: [u8; 10] =
+        [0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02];
+    let root = certificate_authority("Trusted root");
+    let leaf = leaf_certificate(&root, ExtendedKeyUsagePurpose::ServerAuth, 2022, 2038);
+    // Relabel both signature algorithm fields as ecdsa-with-SHA224, which
+    // webpki does not support.
+    let mut relabeled = leaf.as_ref().to_vec();
+    let positions: Vec<usize> = relabeled
+        .windows(ECDSA_WITH_SHA256.len())
+        .enumerate()
+        .filter(|(_, window)| *window == ECDSA_WITH_SHA256)
+        .map(|(position, _)| position)
+        .collect();
+    assert_eq!(positions.len(), 2);
+    for position in positions {
+        relabeled[position + ECDSA_WITH_SHA256.len() - 1] = 0x01;
+    }
+    let roots = trust_anchor_directory(&root);
+
+    let decision = evaluate(
+        &policy(true, false, false, false),
+        roots.path().to_str(),
+        &[CertificateDer::from(relabeled)],
+        CertificateUsage::ServerAuth,
+    );
+
+    assert_eq!(decision.outcome, TrustDecisionOutcome::Reject);
+    assert_eq!(
+        decision.chain_reason.as_deref(),
+        Some("unsupported-signature-algorithm")
+    );
+}
+
+#[test]
 fn enforces_the_certificate_tls_role() {
     let root = certificate_authority("Trusted root");
     let server_leaf = leaf_certificate(&root, ExtendedKeyUsagePurpose::ServerAuth, 2022, 2038);
@@ -253,6 +331,89 @@ fn rejects_a_self_signed_override_with_a_tampered_signature() {
         decision.chain_reason.as_deref(),
         Some("self-signed-signature-invalid")
     );
+}
+
+#[test]
+fn rejects_a_leaf_with_a_distrusted_public_key() {
+    let root = certificate_authority("Trusted root");
+    let leaf = distrusted_key_leaf(&root, "node.thenodes.test");
+    let roots = trust_anchor_directory(&root);
+
+    let decision = evaluate(
+        &policy(true, false, false, false),
+        roots.path().to_str(),
+        &[leaf],
+        CertificateUsage::ServerAuth,
+    );
+
+    assert_eq!(decision.outcome, TrustDecisionOutcome::Reject);
+    assert_eq!(decision.reason, "chain-invalid");
+    assert_eq!(decision.chain_valid, Some(false));
+    assert_eq!(
+        decision.chain_reason.as_deref(),
+        Some("certificate-distrusted")
+    );
+}
+
+#[test]
+fn does_not_apply_the_self_signed_override_to_a_distrusted_key() {
+    let root = certificate_authority("Distrusted peer");
+    // Subject equals issuer, so the override treats the leaf as self-signed.
+    let leaf = distrusted_key_leaf(&root, "Distrusted peer");
+    let roots = trust_anchor_directory(&root);
+
+    let decision = evaluate(
+        &policy(true, false, false, true),
+        roots.path().to_str(),
+        &[leaf],
+        CertificateUsage::ServerAuth,
+    );
+
+    assert_eq!(decision.outcome, TrustDecisionOutcome::Reject);
+    assert_eq!(decision.reason, "chain-invalid");
+    assert_eq!(
+        decision.chain_reason.as_deref(),
+        Some("certificate-distrusted")
+    );
+}
+
+#[test]
+fn validates_certificate_chain_time_at_a_fixed_instant() {
+    let root = certificate_authority("Trusted root");
+    let roots = trust_anchor_directory(&root);
+    let now = std::time::UNIX_EPOCH
+        + std::time::Duration::from_secs(
+            date_time_ymd(2026, 1, 1)
+                .unix_timestamp()
+                .try_into()
+                .unwrap(),
+        );
+
+    for (not_before_year, not_after_year, expected_valid, expected_reason) in [
+        (2022, 2038, true, "webpki-path-valid"),
+        (2022, 2023, false, "certificate-expired"),
+        (2030, 2038, false, "certificate-not-yet-valid"),
+    ] {
+        let leaf = leaf_certificate(
+            &root,
+            ExtendedKeyUsagePurpose::ServerAuth,
+            not_before_year,
+            not_after_year,
+        );
+        let (valid, reason, self_signed) = validate_certificate_chain(
+            &[leaf],
+            roots.path().to_str(),
+            CertificateUsage::ServerAuth,
+            now,
+        );
+
+        assert_eq!(
+            valid, expected_valid,
+            "validity window: {not_before_year}..{not_after_year}"
+        );
+        assert_eq!(reason, expected_reason);
+        assert!(!self_signed);
+    }
 }
 
 #[test]

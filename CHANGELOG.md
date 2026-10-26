@@ -6,6 +6,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+### Security
+- Upgraded the direct `rustls-webpki` dependency to 0.103.16 with an explicit `ring` backend. CA-chain validation now rejects any path containing one of the known compromised eMudhra public keys, with chain reason `certificate-distrusted`, and the self-signed override does not apply to such keys. Trust-policy defaults are unchanged, but a configured trust anchor carrying one of these keys now causes every path through it to be rejected.
+- Removed the unused `webpki-roots` dependency. TheNodes uses application-configured CA trust anchors rather than the bundled root store.
+- `rustls` 0.22 still depends on `rustls-webpki` 0.102 for TLS handshake signature verification; TheNodes certificate path validation uses the upgraded direct dependency.
+
+### Changed
+- Unsupported signature algorithms now report the chain reasons `unsupported-signature-algorithm` and `unsupported-signature-algorithm-for-public-key` instead of `certificate-path-invalid:<webpki error>`. An empty extended key usage extension reports `certificate-der-invalid`.
+
 ## [0.4.0] - 2026-09-07
 
 ### Breaking

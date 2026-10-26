@@ -236,21 +236,30 @@ fn chain_error_reason(error: webpki::Error) -> String {
     use webpki::Error;
 
     match error {
-        Error::CertExpired => "certificate-expired".to_string(),
-        Error::CertNotValidYet => "certificate-not-yet-valid".to_string(),
+        Error::CertDistrusted => "certificate-distrusted".to_string(),
+        Error::CertExpired { .. } => "certificate-expired".to_string(),
+        Error::CertNotValidYet { .. } => "certificate-not-yet-valid".to_string(),
         Error::InvalidSignatureForPublicKey | Error::SignatureAlgorithmMismatch => {
             "invalid-certificate-signature".to_string()
+        }
+        // The context payloads list every supported algorithm; keep reasons short and stable.
+        Error::UnsupportedSignatureAlgorithmContext(_) => {
+            "unsupported-signature-algorithm".to_string()
+        }
+        Error::UnsupportedSignatureAlgorithmForPublicKeyContext(_) => {
+            "unsupported-signature-algorithm-for-public-key".to_string()
         }
         Error::UnknownIssuer => "unknown-issuer".to_string(),
         Error::CaUsedAsEndEntity => "ca-used-as-end-entity".to_string(),
         Error::EndEntityUsedAsCa => "end-entity-used-as-ca".to_string(),
-        Error::RequiredEkuNotFound => "required-eku-not-found".to_string(),
+        Error::RequiredEkuNotFoundContext(_) => "required-eku-not-found".to_string(),
         Error::PathLenConstraintViolated => "path-length-constraint-violated".to_string(),
         Error::NameConstraintViolation => "name-constraint-violation".to_string(),
         Error::UnsupportedCriticalExtension => "unsupported-critical-extension".to_string(),
-        Error::BadDer | Error::BadDerTime | Error::InvalidCertValidity => {
-            "certificate-der-invalid".to_string()
-        }
+        Error::BadDer
+        | Error::BadDerTime
+        | Error::InvalidCertValidity
+        | Error::EmptyEkuExtension => "certificate-der-invalid".to_string(),
         other => format!("certificate-path-invalid:{other}"),
     }
 }

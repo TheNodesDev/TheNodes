@@ -1,7 +1,73 @@
 use crate::realms::RealmInfo;
 use serde::Deserialize;
 
+/// The values security settings accept. A value the node does not know stops
+/// config loading instead of falling back to a default, so a misspelt mode
+/// cannot leave a node open. Values are compared ignoring ASCII case.
+mod setting {
+    use serde::de::Error;
+    use serde::{Deserialize, Deserializer};
+
+    fn one_of<'de, D: Deserializer<'de>>(
+        deserializer: D,
+        allowed: &[&str],
+    ) -> Result<Option<String>, D::Error> {
+        let value = Option::<String>::deserialize(deserializer)?;
+        if let Some(value) = &value {
+            if !allowed
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(value.trim()))
+            {
+                return Err(D::Error::custom(format!(
+                    "unknown value {value:?}, expected one of: {}",
+                    allowed.join(", ")
+                )));
+            }
+        }
+        Ok(value)
+    }
+
+    macro_rules! setting {
+        ($name:ident: $($value:literal),+) => {
+            pub(super) fn $name<'de, D: Deserializer<'de>>(
+                deserializer: D,
+            ) -> Result<Option<String>, D::Error> {
+                one_of(deserializer, &[$($value),+])
+            }
+        };
+    }
+
+    setting!(backend: "tls", "noise", "none", "plaintext");
+    setting!(trust_mode: "open", "allowlist", "tofu", "observe", "record", "quarantine", "hybrid");
+    setting!(fingerprint_algorithm: "sha256");
+    setting!(node_identity_mode: "off", "tofu", "pinned", "certificate");
+    // The Noise suite is fixed; these settings only document it.
+    setting!(noise_pattern: "XX");
+    setting!(noise_curve: "25519");
+    setting!(noise_cipher: "ChaChaPoly");
+    setting!(noise_hash: "BLAKE2s");
+
+    /// A list of node IDs. Each must be a valid node ID, so an entry that
+    /// cannot name any node is an error instead of a list that never matches.
+    pub(super) fn node_ids<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<Vec<String>>, D::Error> {
+        let ids = Option::<Vec<String>>::deserialize(deserializer)?;
+        if let Some(invalid) = ids
+            .iter()
+            .flatten()
+            .find(|id| !crate::security::node_identity::is_valid_node_id(id))
+        {
+            return Err(D::Error::custom(format!(
+                "{invalid:?} is not a node ID: 1-128 ASCII letters, digits, '-', '_' or '.'"
+            )));
+        }
+        Ok(ids)
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeliveryConfig {
     /// Default overall timeout for FireAndForget delivery attempts (ms).
     pub fire_and_forget_timeout_ms: Option<u64>,
@@ -36,110 +102,203 @@ impl Default for DeliveryConfig {
     }
 }
 
+/// `[encryption.tls.paths]`: the TLS certificate store (ADR-0016).
 #[derive(Debug, Clone, Deserialize, Default)]
-pub struct EncryptionPaths {
+#[serde(deny_unknown_fields)]
+pub struct TlsPaths {
     pub own_certificate: Option<String>,
     pub own_private_key: Option<String>,
+    /// Trusted peer certificates: their SPKI fingerprints are accepted, and
+    /// `tofu` adds the certificates it accepts for the first time.
     pub trusted_cert_dir: Option<String>,
+    /// CRLs checked when a peer's chain is validated against a CA (ADR-0014).
     pub trusted_crl_dir: Option<String>,
+    /// Certificates the trust policy rejected, kept for review and promotion.
     pub rejected_dir: Option<String>,
+    /// CA certificates: the only trust anchors for `enforce_ca_chain`.
     pub issuer_cert_dir: Option<String>,
+    /// CRLs checked when a peer's chain is validated against a CA (ADR-0014).
     pub issuer_crl_dir: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct TrustPolicyPathsConfig {
-    /// Directory where newly observed certificates (e.g. TOFU) are written
-    pub observed_dir: Option<String>,
-    /// Directory containing approved Noise fingerprint artifacts.
-    pub allowlist_dir: Option<String>,
+impl TlsPaths {
+    /// The configured CRL directories (`trusted_crl_dir`, `issuer_crl_dir`).
+    pub fn crl_dirs(&self) -> Vec<String> {
+        [&self.trusted_crl_dir, &self.issuer_crl_dir]
+            .into_iter()
+            .flatten()
+            .filter(|dir| !dir.trim().is_empty())
+            .cloned()
+            .collect()
+    }
 }
 
+/// `[encryption.noise.paths]`: the Noise key store, laid out like the TLS one
+/// (ADR-0016).
 #[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct NoisePaths {
+    /// This node's static private key (default `pki/noise/static.key`).
+    pub static_key: Option<String>,
+    /// Trusted static keys (`<fingerprint>.noise` files): their fingerprints
+    /// are accepted, and `tofu` adds the keys it accepts for the first time.
+    pub trusted_dir: Option<String>,
+    /// Static keys the trust policy rejected, kept for review and promotion.
+    pub rejected_dir: Option<String>,
+}
+
+impl NoisePaths {
+    /// Default location of the static private key.
+    pub const DEFAULT_STATIC_KEY: &'static str = "pki/noise/static.key";
+}
+
+/// `[encryption.noise.trust_policy]`.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct NoiseTrustPolicyConfig {
     /// mode: open | allowlist | tofu | observe
+    #[serde(default, deserialize_with = "setting::trust_mode")]
     pub mode: Option<String>,
-    /// store_new: none | observed
-    pub store_new: Option<String>,
-    /// Noise static-key allowlist (SHA-256 hex fingerprints)
+    /// Trusted static keys besides those in `[encryption.noise.paths] trusted_dir`
+    /// (SHA-256 hex fingerprints).
     pub allowlist_fingerprints: Option<Vec<String>>,
     /// Noise static-key pins (SHA-256 hex fingerprints)
     pub pin_fingerprints: Option<Vec<String>>,
-    pub paths: Option<TrustPolicyPathsConfig>,
 }
 
+/// `[encryption.noise]`: settings of the Noise backend, which UDP sessions
+/// always use.
 #[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct EncryptionNoiseConfig {
+    /// Only `XX` (the suite is `Noise_XX_25519_ChaChaPoly_BLAKE2s`).
+    #[serde(default, deserialize_with = "setting::noise_pattern")]
     pub pattern: Option<String>,
+    /// Only `25519`.
+    #[serde(default, deserialize_with = "setting::noise_curve")]
     pub curve: Option<String>,
+    /// Only `ChaChaPoly`.
+    #[serde(default, deserialize_with = "setting::noise_cipher")]
     pub cipher: Option<String>,
+    /// Only `BLAKE2s`.
+    #[serde(default, deserialize_with = "setting::noise_hash")]
     pub hash: Option<String>,
-    pub static_key_path: Option<String>,
+    pub paths: Option<NoisePaths>,
     pub trust_policy: Option<NoiseTrustPolicyConfig>,
 }
 
-// Default derived above
+impl EncryptionNoiseConfig {
+    /// This node's static private key file.
+    pub fn static_key_path(&self) -> &str {
+        self.paths
+            .as_ref()
+            .and_then(|paths| paths.static_key.as_deref())
+            .unwrap_or(NoisePaths::DEFAULT_STATIC_KEY)
+    }
+}
 
+/// `[encryption.tls.trust_policy]`.
 #[derive(Debug, Clone, Deserialize)]
-pub struct TrustPolicyConfig {
+#[serde(deny_unknown_fields)]
+pub struct TlsTrustPolicyConfig {
     /// mode: open | allowlist | tofu | observe | hybrid (Phase 1)
+    #[serde(default, deserialize_with = "setting::trust_mode")]
     pub mode: Option<String>,
-    /// migrated from EncryptionConfig.accept_self_signed (kept for non-CA modes)
+    /// Accept a self-signed peer certificate (not for chains validated against a CA).
     pub accept_self_signed: Option<bool>,
-    /// store_new_certs: none | observed (trusted reserved for later phases)
-    pub store_new_certs: Option<String>,
     /// Phase 2: reject certificates whose notAfter < now
     pub reject_expired: Option<bool>,
     /// Phase 2: reject certificates whose notBefore > now
     pub reject_before_valid: Option<bool>,
     /// Require a cryptographically valid, current-time CA path anchored in
-    /// `encryption.paths.issuer_cert_dir` (or `trusted_cert_dir` as fallback).
+    /// `[encryption.tls.paths] issuer_cert_dir`.
     pub enforce_ca_chain: Option<bool>,
     /// Phase 3: list of allowed certificate subject strings (exact match on parsed full DN or substring if prefixed with '~')
     pub pin_subjects: Option<Vec<String>>,
     /// Phase 3: list of allowed SPKI fingerprints (hex lowercase)
     pub pin_fingerprints: Option<Vec<String>>,
-    /// Phase 3: fingerprint hash algorithm (currently only sha256 supported)
+    /// Phase 3: fingerprint hash algorithm (only sha256)
+    #[serde(default, deserialize_with = "setting::fingerprint_algorithm")]
     pub pin_fp_algo: Option<String>,
-    /// Phase 3: require leaf subject to contain realm name (simple binding)
-    pub realm_subject_binding: Option<bool>,
-    pub paths: Option<TrustPolicyPathsConfig>,
+    /// Require the peer's leaf certificate to name a node in this node's realm
+    /// with a `URI:node://<realm>/<node_id>` SAN (ADR-0012), as `thenodes-cert
+    /// --realm-code <code> --node-id <id>` adds. A certificate issued for
+    /// another realm is refused, even by a CA both realms trust.
+    pub require_realm_node_name: Option<bool>,
 }
 
-impl Default for TrustPolicyConfig {
+impl Default for TlsTrustPolicyConfig {
     fn default() -> Self {
         Self {
             mode: Some("open".to_string()),
             accept_self_signed: Some(false),
-            store_new_certs: Some("none".to_string()),
             reject_expired: Some(false),
             reject_before_valid: Some(false),
             enforce_ca_chain: Some(false),
             pin_subjects: Some(vec![]),
             pin_fingerprints: Some(vec![]),
             pin_fp_algo: Some("sha256".to_string()),
-            realm_subject_binding: Some(false),
-            paths: Some(TrustPolicyPathsConfig::default()),
+            require_realm_node_name: Some(false),
         }
     }
 }
 
+/// `[encryption.tls]`: settings of the TLS backend.
 #[derive(Debug, Clone, Deserialize)]
-pub struct EncryptionConfig {
-    pub enabled: bool,
-    /// Optional secure channel backend selector: tls | noise | plaintext
-    pub backend: Option<String>,
-    /// Optional Noise backend settings (used when backend = "noise")
-    pub noise: Option<EncryptionNoiseConfig>,
+#[serde(deny_unknown_fields)]
+pub struct EncryptionTlsConfig {
     /// Enable mutual TLS (client auth). Both sides must present certs.
     pub mtls: Option<bool>,
-    /// DEPRECATED: use encryption.trust_policy.accept_self_signed
-    pub accept_self_signed: Option<bool>,
-    pub paths: Option<EncryptionPaths>,
-    pub trust_policy: Option<TrustPolicyConfig>,
+    pub paths: Option<TlsPaths>,
+    pub trust_policy: Option<TlsTrustPolicyConfig>,
+}
+
+impl Default for EncryptionTlsConfig {
+    fn default() -> Self {
+        Self {
+            mtls: Some(false),
+            paths: Some(TlsPaths::default()),
+            trust_policy: Some(TlsTrustPolicyConfig::default()),
+        }
+    }
+}
+
+/// `[encryption]`. Each backend has its own section, `[encryption.tls]` and
+/// `[encryption.noise]`; a node uses both when it runs TLS over TCP and UDP
+/// sessions, which are always Noise. Node identity binding applies to both.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EncryptionConfig {
+    pub enabled: bool,
+    /// Optional secure channel backend selector: tls | noise | none | plaintext
+    #[serde(default, deserialize_with = "setting::backend")]
+    pub backend: Option<String>,
+    /// TLS backend settings (`[encryption.tls]`).
+    pub tls: Option<EncryptionTlsConfig>,
+    /// Noise backend settings (`[encryption.noise]`).
+    pub noise: Option<EncryptionNoiseConfig>,
+    /// Binding of HELLO node IDs to transport identities (`[encryption.node_identity]`).
+    pub node_identity: Option<NodeIdentityConfig>,
+}
+
+/// How a peer's HELLO `node_id` is bound to the TLS certificate key or Noise
+/// static key that authenticated its connection. See ADR-0012.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct NodeIdentityConfig {
+    /// mode: off | tofu | pinned | certificate (default: tofu)
+    #[serde(default, deserialize_with = "setting::node_identity_mode")]
+    pub mode: Option<String>,
+    /// File that persists TOFU bindings across restarts. In memory only when unset.
+    pub bindings_file: Option<String>,
+    /// Maximum number of TOFU bindings kept (default 4096).
+    pub max_bindings: Option<usize>,
+    /// Explicit bindings: node ID -> SHA-256 fingerprints (TLS SPKI or Noise static key).
+    pub pins: Option<std::collections::HashMap<String, Vec<String>>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     pub port: u16,
     pub encryption: Option<EncryptionConfig>,
@@ -206,6 +365,7 @@ impl ConfigDefaults {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LoggingConfig {
     /// Path to JSON line audit log (rotated). If unset, defaults to logs/trust_audit.jsonl
     pub json_path: Option<String>,
@@ -224,11 +384,9 @@ impl Default for EncryptionConfig {
         Self {
             enabled: false,
             backend: None,
+            tls: Some(EncryptionTlsConfig::default()),
             noise: None,
-            mtls: Some(false),
-            accept_self_signed: Some(false),
-            paths: Some(EncryptionPaths::default()),
-            trust_policy: Some(TrustPolicyConfig::default()),
+            node_identity: None,
         }
     }
 }
@@ -246,6 +404,7 @@ impl Default for Config {
             discovery: Some(DiscoveryConfig::default()),
             realm_access: None,
             network: Some(NetworkConfig {
+                bind_ip: None,
                 persistence: Some(NetworkPersistenceConfig::default()),
                 relay: Some(RelayConfig::default()),
                 nat: Some(NatConfig::default()),
@@ -253,12 +412,131 @@ impl Default for Config {
                 connection_policy: None,
                 nat_traversal: None,
                 delivery: Some(DeliveryConfig::default()),
+                limits: Some(NetworkLimitsConfig::default()),
             }),
         }
     }
 }
 
+/// Settings that 0.5.0 moved or removed, as (TOML path, what to do instead).
+/// The paths are those of 0.4 configurations (ADR-0016).
+const MOVED_SETTINGS: &[(&[&str], &str)] = &[
+    (
+        &["encryption", "mtls"],
+        "moved to `[encryption.tls] mtls`",
+    ),
+    (
+        &["encryption", "paths"],
+        "moved to `[encryption.tls.paths]`",
+    ),
+    (
+        &["encryption", "trust_policy"],
+        "moved to `[encryption.tls.trust_policy]`",
+    ),
+    (
+        &["encryption", "accept_self_signed"],
+        "was never read; use `[encryption.tls.trust_policy] accept_self_signed`",
+    ),
+    (
+        &["encryption", "trust_policy", "store_new_certs"],
+        "is removed: rejected certificates are kept in `[encryption.tls.paths] rejected_dir`, and `tofu` adds the certificates it accepts to `trusted_cert_dir`",
+    ),
+    (
+        &["encryption", "trust_policy", "paths"],
+        "is removed: `observed_dir` is replaced by `[encryption.tls.paths] rejected_dir`, and `tofu` trusts through `trusted_cert_dir`",
+    ),
+    (
+        &["encryption", "noise", "static_key_path"],
+        "moved to `[encryption.noise.paths] static_key`",
+    ),
+    (
+        &["encryption", "noise", "trust_policy", "store_new"],
+        "is removed: rejected keys are kept in `[encryption.noise.paths] rejected_dir`, and `tofu` adds the keys it accepts to `trusted_dir`",
+    ),
+    (
+        &["encryption", "noise", "trust_policy", "paths"],
+        "is removed: `allowlist_dir` moved to `[encryption.noise.paths] trusted_dir`, and `observed_dir` is replaced by `rejected_dir`",
+    ),
+    (
+        &["encryption", "trust_policy", "realm_subject_binding"],
+        REALM_SUBJECT_BINDING_REPLACED,
+    ),
+    (
+        &["encryption", "tls", "trust_policy", "realm_subject_binding"],
+        REALM_SUBJECT_BINDING_REPLACED,
+    ),
+];
+
+const REALM_SUBJECT_BINDING_REPLACED: &str = "is replaced by `[encryption.tls.trust_policy] require_realm_node_name`, which requires a `URI:node://<realm>/<node_id>` SAN in this realm instead of the realm name in the subject";
+
+fn moved_settings(text: &str) -> Vec<String> {
+    let Ok(table) = text.parse::<toml::Table>() else {
+        return Vec::new();
+    };
+    MOVED_SETTINGS
+        .iter()
+        .filter(|(path, _)| {
+            let mut value = table.get(path[0]);
+            for key in &path[1..] {
+                value = value.and_then(|value| value.get(*key));
+            }
+            value.is_some()
+        })
+        .map(|(path, hint)| format!("`{}` {hint}", path.join(".")))
+        .collect()
+}
+
+impl Config {
+    /// Parse a config file. When parsing fails, the error also names any
+    /// setting that 0.5.0 moved or removed, since such a file fails as
+    /// having an unknown key.
+    pub fn from_toml_str(text: &str) -> Result<Self, String> {
+        toml::from_str::<Self>(text).map_err(|err| {
+            let moved = moved_settings(text);
+            if moved.is_empty() {
+                err.to_string()
+            } else {
+                format!("{err}\n{}", moved.join("\n"))
+            }
+        })
+    }
+
+    /// The TLS backend settings (`[encryption.tls]`), if configured.
+    pub fn tls(&self) -> Option<&EncryptionTlsConfig> {
+        self.encryption.as_ref()?.tls.as_ref()
+    }
+
+    /// Whether this node may use `node_id` as a relay: `[network.relay]
+    /// allowed_relays` names it, or is unset.
+    pub fn relay_allowed(&self, node_id: &str) -> bool {
+        self.network
+            .as_ref()
+            .and_then(|network| network.relay.as_ref())
+            .and_then(|relay| relay.allowed_relays.as_ref())
+            .is_none_or(|allowed| allowed.iter().any(|id| id == node_id))
+    }
+
+    /// Whether this node may use `node_id` as a rendezvous for address
+    /// observation and hole punching: `[network.nat_traversal]
+    /// allowed_rendezvous` names it, or is unset.
+    pub fn rendezvous_allowed(&self, node_id: &str) -> bool {
+        self.network
+            .as_ref()
+            .and_then(|network| network.nat_traversal.as_ref())
+            .is_none_or(|nat| nat.rendezvous_allowed(node_id))
+    }
+
+    /// Address the TCP and UDP listeners bind to (`[network] bind_ip`).
+    pub fn bind_ip(&self) -> std::net::IpAddr {
+        self.network
+            .as_ref()
+            .and_then(|network| network.bind_ip)
+            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NodeConfig {
     /// Explicit node ID (highest precedence if provided)
     pub id: Option<String>,
@@ -334,7 +612,7 @@ impl NodeConfig {
         "unknown-node".to_string()
     }
 
-    fn valid_id(id: &str) -> bool {
+    pub(crate) fn valid_id(id: &str) -> bool {
         id.len() <= 128
             && id
                 .chars()
@@ -343,6 +621,7 @@ impl NodeConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DiscoveryConfig {
     /// Enable dynamic peer discovery (PeerRequest / PeerList gossip)
     pub enabled: bool,
@@ -366,12 +645,14 @@ impl Default for DiscoveryConfig {
 /// Developers may define their own node types for a given realm (e.g., "daemon", "admin", "worker").
 /// If set, remote peers MUST advertise a node_type present in this allow-list; otherwise the connection is rejected.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RealmAccessConfig {
     /// Allowed peer node types for the active realm. If None, all types are allowed.
     pub allowed_node_types: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NetworkPersistenceConfig {
     pub enabled: Option<bool>,
     pub path: Option<String>,
@@ -413,6 +694,7 @@ impl Default for NetworkPersistenceConfig {
 /// reconnect_jitter_ratio = 0.2
 /// ```
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConnectionPolicyConfig {
     /// Strategy string.
     ///
@@ -472,6 +754,7 @@ impl Default for ConnectionPolicyConfig {
 /// lease_duration_secs = 3600
 /// ```
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NatConfig {
     /// Enable UPnP-IGD discovery and TCP listen-port mapping.
     pub enabled: Option<bool>,
@@ -501,6 +784,7 @@ impl Default for NatConfig {
 /// probe_interval_ms = 100
 /// ```
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NatTraversalConfig {
     /// Enable NAT traversal features (`"punch"` capability).
     pub enabled: Option<bool>,
@@ -515,6 +799,22 @@ pub struct NatTraversalConfig {
     pub probe_count: Option<u32>,
     /// Delay between successive probe datagrams (ms).
     pub probe_interval_ms: Option<u64>,
+    /// Node IDs this node may use as rendezvous, for address observation and
+    /// hole punching. When set, only these peers are chosen and only their
+    /// punch invitations are accepted; an empty list allows none. When unset,
+    /// any peer that announces the `punch_rendezvous` capability may be
+    /// chosen.
+    #[serde(default, deserialize_with = "setting::node_ids")]
+    pub allowed_rendezvous: Option<Vec<String>>,
+}
+
+impl NatTraversalConfig {
+    /// Whether `allowed_rendezvous` names `node_id`, or is unset.
+    pub fn rendezvous_allowed(&self, node_id: &str) -> bool {
+        self.allowed_rendezvous
+            .as_ref()
+            .is_none_or(|allowed| allowed.iter().any(|id| id == node_id))
+    }
 }
 
 impl Default for NatTraversalConfig {
@@ -526,12 +826,14 @@ impl Default for NatTraversalConfig {
             cookie_ttl_secs: Some(30),
             probe_count: Some(6),
             probe_interval_ms: Some(100),
+            allowed_rendezvous: None,
         }
     }
 }
 
 /// UDP + Noise transport configuration (optional; opt-in, ADR-0004).
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UdpConfig {
     /// Enable the UDP Noise transport listener.  Default: false.
     pub enabled: Option<bool>,
@@ -539,7 +841,7 @@ pub struct UdpConfig {
     pub listen_port: Option<u16>,
     /// Maximum total datagram size enforced on send.  Must not exceed 1200.
     pub max_datagram_bytes: Option<usize>,
-    /// Maximum application payload bytes.  Must not exceed 1176.
+    /// Maximum application payload bytes.  Must not exceed 1168.
     pub max_app_payload_bytes: Option<usize>,
 }
 
@@ -549,13 +851,57 @@ impl Default for UdpConfig {
             enabled: Some(false),
             listen_port: None,
             max_datagram_bytes: Some(1200),
-            max_app_payload_bytes: Some(1176),
+            max_app_payload_bytes: Some(1168),
+        }
+    }
+}
+
+/// Resource limits for the TCP transport.
+///
+/// ```toml
+/// [network.limits]
+/// max_frame_bytes = 1048576
+/// handshake_timeout_ms = 10000
+/// idle_timeout_ms = 300000
+/// max_inbound_connections = 1024
+/// max_inbound_connections_per_ip = 32
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkLimitsConfig {
+    /// Maximum size of one wire frame (a JSON line including its newline) on an
+    /// established connection. Larger frames close the connection.
+    /// HELLO frames are always limited to 64 KiB regardless of this value.
+    pub max_frame_bytes: Option<usize>,
+    /// Time budget for the secure-channel handshake plus the HELLO exchange (ms).
+    pub handshake_timeout_ms: Option<u64>,
+    /// Close a connection that has not delivered any frame for this long (ms).
+    /// `0` disables the idle timeout.
+    pub idle_timeout_ms: Option<u64>,
+    /// Maximum number of concurrently accepted inbound connections.
+    pub max_inbound_connections: Option<usize>,
+    /// Maximum number of concurrently accepted inbound connections per remote IP.
+    pub max_inbound_connections_per_ip: Option<usize>,
+}
+
+impl Default for NetworkLimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_frame_bytes: Some(1024 * 1024),
+            handshake_timeout_ms: Some(10_000),
+            idle_timeout_ms: Some(300_000),
+            max_inbound_connections: Some(1024),
+            max_inbound_connections_per_ip: Some(32),
         }
     }
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct NetworkConfig {
+    /// Local address the TCP and UDP listeners bind to; `0.0.0.0` (every IPv4
+    /// interface) when unset.
+    pub bind_ip: Option<std::net::IpAddr>,
     /// Persistent known peer store configuration (optional)
     pub persistence: Option<NetworkPersistenceConfig>,
     /// Relay configuration (optional; opt-in)
@@ -570,9 +916,12 @@ pub struct NetworkConfig {
     pub nat_traversal: Option<NatTraversalConfig>,
     /// Delivery semantics configuration (ADR-0006)
     pub delivery: Option<DeliveryConfig>,
+    /// TCP transport resource limits (frame size, timeouts, connection caps)
+    pub limits: Option<NetworkLimitsConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RelayConfig {
     /// Enable relay role on this node
     pub enabled: Option<bool>,
@@ -582,8 +931,14 @@ pub struct RelayConfig {
     pub queue_max_per_target: Option<usize>,
     /// Optional global queue cap (fallback to internal defaults if None)
     pub queue_max_global: Option<usize>,
-    /// Selection strategy to pick a relay when target is absent (none|rendezvous)
-    pub selection: Option<String>,
+    /// Optional global cap on buffered store-and-forward bytes across all targets
+    pub queue_max_bytes: Option<usize>,
+    /// Node IDs this node may use as relays for its own messages. When set,
+    /// only these peers are chosen; an empty list allows none. When unset,
+    /// any peer that announces the `relay` capability may be chosen. A relay
+    /// can read and modify what it forwards.
+    #[serde(default, deserialize_with = "setting::node_ids")]
+    pub allowed_relays: Option<Vec<String>>,
 }
 
 impl Default for RelayConfig {
@@ -593,7 +948,8 @@ impl Default for RelayConfig {
             store_forward: Some(false),
             queue_max_per_target: Some(1024),
             queue_max_global: Some(8192),
-            selection: Some("none".to_string()),
+            queue_max_bytes: Some(64 * 1024 * 1024),
+            allowed_relays: None,
         }
     }
 }

@@ -29,7 +29,8 @@ async fn relay_bind_and_forward_cross_a_real_two_node_connection() {
         store_forward: Some(true),
         queue_max_per_target: Some(16),
         queue_max_global: Some(32),
-        selection: Some("none".to_string()),
+        queue_max_bytes: None,
+        allowed_relays: None,
     });
 
     let relay_manager = PeerManager::new();
@@ -101,7 +102,7 @@ async fn relay_bind_and_forward_cross_a_real_two_node_connection() {
         Some(realm.clone()),
     );
     client_manager
-        .send_to_node_id("relay-node", bind.as_json())
+        .send_to_node_id("relay-node", bind)
         .await
         .expect("send relay bind");
 
@@ -130,7 +131,7 @@ async fn relay_bind_and_forward_cross_a_real_two_node_connection() {
         Some(realm),
     );
     client_manager
-        .send_to_node_id("relay-node", forward.as_json())
+        .send_to_node_id("relay-node", forward)
         .await
         .expect("send relay forward");
 

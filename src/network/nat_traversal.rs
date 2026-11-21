@@ -34,7 +34,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 use tokio::net::UdpSocket;
@@ -49,6 +49,8 @@ const OBSERVE_NONCE_LEN: usize = 8;
 const OBSERVE_RESP_OBSERVED_AT_LEN: usize = 8;
 /// Milliseconds of lead time before both peers start their punch window.
 const PUNCH_COORDINATE_DELAY_MS: u64 = 500;
+/// Source addresses a rendezvous remembers from answered observations.
+const MAX_OBSERVED_SOURCES: usize = 4096;
 
 // ─── NatState ──────────────────────────────────────────────────────────────────
 
@@ -70,6 +72,42 @@ pub struct NatState {
     pub serve: bool,
     /// How often to re-probe peers for an updated observed address (seconds).
     pub refresh_secs: u64,
+    /// Addresses this node answered a cookie-verified `OBSERVE_REQ` from. As a
+    /// rendezvous it hands only these out in `PUNCH_GO` (ADR-0015).
+    pub observed_sources: ObservedSources,
+    /// Node IDs this node may use as rendezvous (`[network.nat_traversal]
+    /// allowed_rendezvous`); `None` allows any peer that announces the role.
+    pub allowed_rendezvous: Option<Vec<String>>,
+}
+
+/// UDP source addresses seen sending a cookie-verified `OBSERVE_REQ`: the
+/// cookie shows that the sender receives at the address, so a spoofed source
+/// never gets in.
+#[derive(Debug, Default)]
+pub struct ObservedSources(std::sync::Mutex<std::collections::HashMap<SocketAddr, Instant>>);
+
+impl ObservedSources {
+    /// Remember `src`, forgetting entries older than `max_age`. When the table
+    /// is full of fresh entries, `src` is not added.
+    pub fn record(&self, src: SocketAddr, max_age: Duration) {
+        let mut sources = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        sources.retain(|_, seen| seen.elapsed() < max_age);
+        if sources.len() < MAX_OBSERVED_SOURCES || sources.contains_key(&src) {
+            sources.insert(src, Instant::now());
+        }
+    }
+
+    /// Whether `addr` sent a verified observation within `max_age`.
+    pub fn is_fresh(&self, addr: SocketAddr, max_age: Duration) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&addr)
+            .is_some_and(|seen| seen.elapsed() < max_age)
+    }
 }
 
 impl NatState {
@@ -85,7 +123,22 @@ impl NatState {
             probe_interval_ms: cfg.probe_interval_ms.unwrap_or(100),
             serve: cfg.serve.unwrap_or(false),
             refresh_secs: cfg.refresh_secs.unwrap_or(300),
+            observed_sources: ObservedSources::default(),
+            allowed_rendezvous: cfg.allowed_rendezvous.clone(),
         }
+    }
+
+    /// Whether this node may use `node_id` as a rendezvous.
+    pub fn rendezvous_allowed(&self, node_id: &str) -> bool {
+        self.allowed_rendezvous
+            .as_ref()
+            .is_none_or(|allowed| allowed.iter().any(|id| id == node_id))
+    }
+
+    /// How long an observation of a peer's address stays usable: peers
+    /// re-observe every `refresh_secs`.
+    pub fn observation_max_age(&self) -> Duration {
+        Duration::from_secs(self.refresh_secs.saturating_mul(2).max(1))
     }
 }
 
@@ -110,34 +163,41 @@ fn now_unix_ms() -> u64 {
         .as_millis() as u64
 }
 
-/// Derive a 16-byte cookie: `SHA-256(secret ‖ bucket_le ‖ addr_utf8)[..16]`.
-fn make_cookie(secret: &[u8; 32], ttl_secs: u64, addr: SocketAddr) -> [u8; 16] {
-    let bucket = now_unix_ms() / (ttl_secs * 1000);
+fn cookie_in_bucket(secret: &[u8; 32], bucket: u64, addr: SocketAddr, context: &[u8]) -> [u8; 16] {
     let mut h = Sha256::new();
     h.update(secret);
     h.update(bucket.to_le_bytes());
     h.update(addr.to_string().as_bytes());
+    h.update(context);
     h.finalize()[..16].try_into().unwrap()
 }
 
+/// Derive a 16-byte cookie: `SHA-256(secret ‖ bucket_le ‖ addr_utf8 ‖ context)[..16]`.
+/// `context` binds the cookie to one request, e.g. a handshake's session ID.
+pub(crate) fn make_cookie(
+    secret: &[u8; 32],
+    ttl_secs: u64,
+    addr: SocketAddr,
+    context: &[u8],
+) -> [u8; 16] {
+    cookie_in_bucket(secret, now_unix_ms() / (ttl_secs * 1000), addr, context)
+}
+
 /// Validate a cookie against the current and previous time bucket (boundary tolerance).
-fn validate_cookie(secret: &[u8; 32], ttl_secs: u64, addr: SocketAddr, cookie: &[u8]) -> bool {
+pub(crate) fn validate_cookie(
+    secret: &[u8; 32],
+    ttl_secs: u64,
+    addr: SocketAddr,
+    context: &[u8],
+    cookie: &[u8],
+) -> bool {
     if cookie.len() != 16 {
         return false;
     }
-    let now_ms = now_unix_ms();
-    let ttl_ms = ttl_secs * 1000;
-    let current_bucket = now_ms / ttl_ms;
-    for bucket in [current_bucket, current_bucket.saturating_sub(1)] {
-        let mut h = Sha256::new();
-        h.update(secret);
-        h.update(bucket.to_le_bytes());
-        h.update(addr.to_string().as_bytes());
-        if &h.finalize()[..16] == cookie {
-            return true;
-        }
-    }
-    false
+    let current_bucket = now_unix_ms() / (ttl_secs * 1000);
+    [current_bucket, current_bucket.saturating_sub(1)]
+        .into_iter()
+        .any(|bucket| cookie_in_bucket(secret, bucket, addr, context) == cookie)
 }
 
 // ─── Phase 2: UDP observed-address handlers ───────────────────────────────────
@@ -166,7 +226,7 @@ pub async fn handle_observe_req(
 
     if cookie_len == 0 {
         // Initial probe — issue a stateless cookie challenge.
-        let cookie = make_cookie(&nat.cookie_secret, nat.cookie_ttl_secs, src);
+        let cookie = make_cookie(&nat.cookie_secret, nat.cookie_ttl_secs, src, &[]);
         let mut challenge_body = Vec::with_capacity(OBSERVE_NONCE_LEN + 1 + 16);
         challenge_body.extend_from_slice(nonce);
         challenge_body.push(16u8);
@@ -182,9 +242,10 @@ pub async fn handle_observe_req(
         return;
     }
     let cookie = &body[cookie_start..cookie_start + cookie_len];
-    if !validate_cookie(&nat.cookie_secret, nat.cookie_ttl_secs, src, cookie) {
+    if !validate_cookie(&nat.cookie_secret, nat.cookie_ttl_secs, src, &[], cookie) {
         return; // invalid cookie — drop silently
     }
+    nat.observed_sources.record(src, nat.observation_max_age());
 
     let addr_str = src.to_string();
     let addr_bytes = addr_str.as_bytes();
@@ -321,9 +382,10 @@ pub fn spawn_observation_refresh_loop(
             interval.tick().await;
             let node_ids = peer_manager.list_node_ids().await;
             for nid in node_ids {
-                if !peer_manager
-                    .peer_has_capability(&nid, "punch_rendezvous")
-                    .await
+                if !nat.rendezvous_allowed(&nid)
+                    || !peer_manager
+                        .peer_has_capability(&nid, "punch_rendezvous")
+                        .await
                 {
                     continue;
                 }
@@ -371,9 +433,7 @@ pub async fn handle_punch_coordinate(
         .await;
 
     if initiator_obs.is_none() || responder_obs.is_none() {
-        let abort = crate::network::message::Message::new(
-            "thenodes",
-            from_node_id,
+        let abort = crate::network::message::Message::outbound(
             crate::network::message::MessageType::PunchAbort {
                 attempt_id: attempt_id.to_string(),
                 target: target_node_id.to_string(),
@@ -382,9 +442,7 @@ pub async fn handle_punch_coordinate(
             None,
             None,
         );
-        let _ = peer_manager
-            .send_to_node_id(from_node_id, abort.as_json())
-            .await;
+        let _ = peer_manager.send_to_node_id(from_node_id, abort).await;
         return;
     }
 
@@ -392,9 +450,7 @@ pub async fn handle_punch_coordinate(
         .peer_has_capability(target_node_id, "punch")
         .await
     {
-        let abort = crate::network::message::Message::new(
-            "thenodes",
-            from_node_id,
+        let abort = crate::network::message::Message::outbound(
             crate::network::message::MessageType::PunchAbort {
                 attempt_id: attempt_id.to_string(),
                 target: target_node_id.to_string(),
@@ -403,19 +459,39 @@ pub async fn handle_punch_coordinate(
             None,
             None,
         );
-        let _ = peer_manager
-            .send_to_node_id(from_node_id, abort.as_json())
-            .await;
+        let _ = peer_manager.send_to_node_id(from_node_id, abort).await;
         return;
     }
 
-    peer_manager
+    if !peer_manager
         .add_pending_punch(attempt_id, target_node_id, from_node_id, timeout_ms)
-        .await;
+        .await
+    {
+        crate::network::events::emit_network_event(
+            "nat_traversal",
+            crate::events::model::LogLevel::Warn,
+            "punch_coordinate_refused",
+            None,
+            Some(format!(
+                "attempt_id_bytes={} initiator={from_node_id} target={target_node_id}",
+                attempt_id.len()
+            )),
+            false,
+        );
+        let abort = crate::network::message::Message::outbound(
+            crate::network::message::MessageType::PunchAbort {
+                attempt_id: attempt_id.to_string(),
+                target: target_node_id.to_string(),
+                reason: Some(crate::network::message::Reason::Overload),
+            },
+            None,
+            None,
+        );
+        let _ = peer_manager.send_to_node_id(from_node_id, abort).await;
+        return;
+    }
 
-    let invite = crate::network::message::Message::new(
-        "thenodes",
-        target_node_id,
+    let invite = crate::network::message::Message::outbound(
         crate::network::message::MessageType::PunchInvite {
             attempt_id: attempt_id.to_string(),
             from_node_id: from_node_id.to_string(),
@@ -424,9 +500,7 @@ pub async fn handle_punch_coordinate(
         None,
         None,
     );
-    let _ = peer_manager
-        .send_to_node_id(target_node_id, invite.as_json())
-        .await;
+    let _ = peer_manager.send_to_node_id(target_node_id, invite).await;
 }
 
 /// Rendezvous: handle `PunchReady { target, ok }` from `responder_node_id`.
@@ -440,39 +514,31 @@ pub async fn handle_punch_ready(
     target_node_id: &str, // "target" in PunchReady = the initiator
     ok: bool,
 ) {
+    // `target_node_id` in PunchReady is the initiator who requested the punch.
+    // `responder_node_id` is whoever sent us this PunchReady. Only the invited
+    // responder settles the attempt, with its first answer (ADR-0015).
+    let Some(pending) = peer_manager
+        .take_pending_punch(attempt_id, target_node_id, responder_node_id)
+        .await
+    else {
+        return;
+    };
     if !ok {
-        // Clean up; notify initiator.
-        let pending = peer_manager.get_pending_punch(attempt_id).await;
-        peer_manager.remove_pending_punch(attempt_id).await;
-        if let Some(p) = pending {
-            let abort = crate::network::message::Message::new(
-                "thenodes",
-                &p.initiator_node_id,
-                crate::network::message::MessageType::PunchAbort {
-                    attempt_id: attempt_id.to_string(),
-                    target: responder_node_id.to_string(),
-                    reason: Some(crate::network::message::Reason::Declined),
-                },
-                None,
-                None,
-            );
-            let _ = peer_manager
-                .send_to_node_id(&p.initiator_node_id, abort.as_json())
-                .await;
-        }
+        let abort = crate::network::message::Message::outbound(
+            crate::network::message::MessageType::PunchAbort {
+                attempt_id: attempt_id.to_string(),
+                target: responder_node_id.to_string(),
+                reason: Some(crate::network::message::Reason::Declined),
+            },
+            None,
+            None,
+        );
+        let _ = peer_manager
+            .send_to_node_id(&pending.initiator_node_id, abort)
+            .await;
         return;
     }
 
-    // `target_node_id` in PunchReady is the initiator who requested the punch.
-    // `responder_node_id` is whoever sent us this PunchReady.
-    let pending = match peer_manager.get_pending_punch(attempt_id).await {
-        Some(p) => p,
-        None => return,
-    };
-    if pending.responder_node_id != responder_node_id || pending.initiator_node_id != target_node_id
-    {
-        return;
-    }
     let initiator_node_id = &pending.initiator_node_id;
     let timeout_ms = pending.timeout_ms;
 
@@ -490,6 +556,28 @@ pub async fn handle_punch_ready(
         Some(a) => a,
         None => return,
     };
+    // The addresses come from the peers' HELLOs. Hand them out only if this
+    // node itself saw them send a verified observation, so that a peer cannot
+    // make two honest nodes probe a victim (ADR-0015).
+    let verified = |addr: &str| {
+        addr.parse::<SocketAddr>().is_ok_and(|addr| {
+            nat.observed_sources
+                .is_fresh(addr, nat.observation_max_age())
+        })
+    };
+    if !verified(&init_obs) || !verified(&resp_obs) {
+        crate::network::events::emit_network_event(
+            "nat_traversal",
+            crate::events::model::LogLevel::Warn,
+            "punch_address_unverified",
+            None,
+            Some(format!(
+                "attempt_id={attempt_id} initiator={initiator_node_id}:{init_obs} responder={responder_node_id}:{resp_obs}"
+            )),
+            false,
+        );
+        return;
+    }
 
     let start_at_ms = now_unix_ms() + PUNCH_COORDINATE_DELAY_MS;
 
@@ -498,9 +586,7 @@ pub async fn handle_punch_ready(
         (responder_node_id, init_obs.as_str()),
     ] {
         let _ = dest_obs; // suppress unused
-        let go = crate::network::message::Message::new(
-            "thenodes",
-            dest,
+        let go = crate::network::message::Message::outbound(
             crate::network::message::MessageType::PunchGo {
                 attempt_id: attempt_id.to_string(),
                 initiator: initiator_node_id.clone(),
@@ -513,17 +599,17 @@ pub async fn handle_punch_ready(
             None,
             None,
         );
-        let _ = peer_manager.send_to_node_id(dest, go.as_json()).await;
+        let _ = peer_manager.send_to_node_id(dest, go).await;
     }
-
-    peer_manager.remove_pending_punch(attempt_id).await;
 }
 
 /// Both peers: execute the synchronized hole-punch window on receipt of `PunchGo`.
 ///
-/// 1. Waits until `start_at_ms`.
+/// 1. Waits until `start_at_ms`, but never past `deadline`, the end of the
+///    attempt this node agreed to.
 /// 2. Sends `probe_count` KEEPALIVE packets to the remote's observed address.
 /// 3. If this node is the **initiator**, begins a Noise handshake with `connect_udp`.
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_punch_window(
     _peer_manager: &PeerManager,
     socket: &Arc<UdpSocket>,
@@ -532,11 +618,14 @@ pub async fn execute_punch_window(
     nat: &NatState,
     local_node_id: &str,
     punch: PunchGoParams,
+    deadline: Instant,
 ) {
-    let now_ms = now_unix_ms();
-    if punch.start_at_ms > now_ms {
-        tokio::time::sleep(Duration::from_millis(punch.start_at_ms - now_ms)).await;
+    let until_start = Duration::from_millis(punch.start_at_ms.saturating_sub(now_unix_ms()));
+    let until_deadline = deadline.saturating_duration_since(Instant::now());
+    if until_start >= until_deadline {
+        return;
     }
+    tokio::time::sleep(until_start).await;
 
     let am_initiator = local_node_id == punch.initiator;
     let remote_observed_str = if am_initiator {

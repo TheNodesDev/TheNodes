@@ -1,14 +1,15 @@
 use clap::Parser;
 use std::fs;
 use std::sync::Arc;
-use tokio::signal;
 use tokio::sync::Mutex as TokioMutex;
 
 // Import TheNodes framework via prelude
 use thenodes::network::{
-    connect_to_bootstrap_nodes, peer_manager::PeerManager, start_listener, PeerStore,
+    bind_listener, connect_to_bootstrap_nodes, peer_manager::PeerManager, run_listener, PeerStore,
 };
-use thenodes::plugin_host::{PluginContext, PluginManager, PluginRegistrar};
+use thenodes::plugin_host::{
+    PluginContext, PluginManager, PluginRegistrar, ShutdownMode, StartPolicy,
+};
 use thenodes::prelude::*;
 
 mod business_logic;
@@ -60,8 +61,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .and_then(|network| network.delivery.clone()),
     );
 
-    // Initialize your custom business logic
-    let business_logic = BusinessLogic::new(config.clone());
+    // Register your business logic as a plugin. The context holds the final
+    // configuration before any plugin starts.
     let plugin_context = PluginContext::new(
         peer_manager.clone(),
         peer_store.clone(),
@@ -71,11 +72,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         true,
     );
     let mut plugin_manager = PluginManager::with_context(plugin_context);
-    plugin_manager.register_handler(Box::new(business_logic.clone()));
+    plugin_manager.register_handler(Box::new(BusinessLogic::new(config.clone())))?;
     let plugin_manager = Arc::new(plugin_manager);
-    if let Some(context) = &plugin_manager.context {
-        context.set_plugin_manager(plugin_manager.clone()).await;
-    }
+    let mut failures = plugin_manager.subscribe_failures();
     peer_manager
         .configure_connection_lifecycle(
             config.clone(),
@@ -86,7 +85,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await;
 
-    // Start TheNodes networking
+    // 1. Start plugins. Every plugin in this application is required.
+    let report = plugin_manager
+        .start_all(StartPolicy::StopOnFirstFailure)
+        .await?;
+    if !report.all_started() {
+        for failure in report.failures() {
+            log::error!("{failure}");
+        }
+        plugin_manager.shutdown(ShutdownMode::Discard).await?;
+        return Err("plugin startup failed".into());
+    }
+
+    // 2. Bind the listener and observe the result before activation.
+    let listener = match bind_listener(config.port, true).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            plugin_manager.shutdown(ShutdownMode::Discard).await?;
+            return Err(error.into());
+        }
+    };
     let listener_handle = tokio::spawn({
         let peer_manager = peer_manager.clone();
         let plugin_manager = plugin_manager.clone();
@@ -95,8 +113,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let node_id = node_id.clone();
         let peer_store = peer_store.clone();
         async move {
-            if let Err(e) = start_listener(
-                config.port,
+            if let Err(e) = run_listener(
+                listener,
                 realm,
                 (*peer_manager).clone(),
                 plugin_manager,
@@ -112,13 +130,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Connect to bootstrap nodes
+    // 3. Activate plugin admission, then begin outbound networking.
+    plugin_manager.activate()?;
     let error_buffer = Arc::new(TokioMutex::new(Vec::new()));
     connect_to_bootstrap_nodes(
         &config,
         realm,
         (*peer_manager).clone(),
-        plugin_manager,
+        plugin_manager.clone(),
         error_buffer,
         true,
         node_id,
@@ -126,22 +145,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await;
 
-    // Start your custom business logic
-    let business_handle = tokio::spawn({
-        async move {
-            business_logic.start().await;
-        }
-    });
-
     log::info!("🚀 {{APP_NAME}} is running. Press Ctrl+C to shutdown...");
 
-    // Wait for shutdown signal
-    signal::ctrl_c().await?;
-    log::info!("🛑 Shutting down {{APP_NAME}}...");
+    // 4. Run until Ctrl+C or a plugin failure. Failure policy is yours: this
+    // application stops when any plugin fails.
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => {
+            result?;
+            log::info!("🛑 Shutting down {{APP_NAME}}...");
+        }
+        failure = failures.recv() => {
+            if let Some(failure) = failure {
+                log::error!("{failure}; shutting down {{APP_NAME}}");
+            }
+        }
+    }
 
-    // Cleanup
+    // 5. One cleanup path. TheNodes imposes no deadline; a second Ctrl+C
+    // escalates and stops waiting on uncooperative plugin work.
+    let shutdown = plugin_manager.begin_shutdown(ShutdownMode::Drain);
     listener_handle.abort();
-    business_handle.abort();
+    let _ = listener_handle.await;
+    let wait = shutdown.wait();
+    tokio::pin!(wait);
+    let report = tokio::select! {
+        report = &mut wait => report?,
+        _ = tokio::signal::ctrl_c() => {
+            log::warn!("Second Ctrl+C: escalating shutdown");
+            plugin_manager.escalate();
+            wait.await?
+        }
+    };
+    if !report.is_clean() {
+        log::warn!("Plugin shutdown report: {:?}", report);
+    }
 
     log::info!("✅ {{APP_NAME}} shutdown complete");
     Ok(())

@@ -25,9 +25,9 @@ Security defaults:
 
 Generate self-signed certs for testing:
 ```bash
-cargo run --bin thenodes-cert -- --realm <realm> --copy-to-trusted
+cargo run --bin thenodes-cert -- --realm-code <realm-code> --node-id <node-id> --copy-to-trusted
 ```
-This creates cert/key under `pki/` and prints an SPKI fingerprint. You can pin it in `[encryption.trust_policy]`.
+This creates cert/key under `pki/` and prints an SPKI fingerprint. You can pin it in `[encryption.tls.trust_policy]`.
 
 ### Development Templates (`development/`)
 Templates for TheNodes core development and advanced customization. These use path dependencies to the TheNodes source.
@@ -38,7 +38,8 @@ Templates for TheNodes core development and advanced customization. These use pa
 **Best for:** Adding dynamically loaded application logic to a TheNodes host
 
 - Builds a dynamic library for Linux, macOS, or Windows
-- Implements plugin ABI v3
+- Implements plugin ABI 4 with `export_plugin!`
+- Initializes in `on_start`, runs a managed task after activation, and cleans up in `on_stop`
 - Handles extension messages and prompt commands
 - Supplies optional configuration defaults
 
@@ -204,11 +205,11 @@ version = "1.0"
 [encryption]
 enabled = true
 
-[encryption.paths]
+[encryption.tls.paths]
 own_certificate = "pki/own/my-app.crt"
 own_private_key = "pki/own/my-app.key"
 ```
-For mutual TLS, set `mtls = true` in `[encryption]`. Configure pinning under `[encryption.trust_policy]` in the generated config.
+For mutual TLS, set `mtls = true` in `[encryption.tls]`. Configure pinning under `[encryption.tls.trust_policy]` in the generated config.
 
 #### Production Settings
 ```toml

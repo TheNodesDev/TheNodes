@@ -75,7 +75,7 @@ Usage examples:
 Tip: Use the included certificate helper to bootstrap test credentials:
 
 ```bash
-cargo run --bin thenodes-cert -- --realm <your-realm> --copy-to-trusted
+cargo run --bin thenodes-cert -- --realm-code <your-realm-code> --node-id <your-node-id> --copy-to-trusted
 ```
 This writes PKI files under `pki/` and prints an SPKI fingerprint you can pin in config.
 

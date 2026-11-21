@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use thenodes::plugin_host::{Plugin, PluginContext};
+use thenodes::plugin_host::{Plugin, PluginContext, PluginError, TaskContext};
 use thenodes::prelude::*;
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -31,56 +31,42 @@ impl BusinessLogic {
         }
     }
 
-    /// Start your custom business logic
-    pub async fn start(&self) {
-        log::info!(
-            "🔧 Starting business logic for {}",
-            self.config
-                .app_name
-                .as_ref()
-                .unwrap_or(&"Unknown".to_string())
-        );
-
-        // Example: Periodic task
-        let state = self.state.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
-            loop {
-                interval.tick().await;
-                let state_guard = state.read().await;
-                log::info!(
-                    "📊 Status {}: {} data items, {} peers",
-                    state_guard.id,
-                    state_guard.data.len(),
-                    state_guard.peer_count
-                );
+    /// Periodic status reporting. Runs as a managed task: it stops when the
+    /// plugin's task scope is cancelled during shutdown.
+    async fn report_status(state: Arc<RwLock<BusinessState>>, task: TaskContext) {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    let state_guard = state.read().await;
+                    log::info!(
+                        "📊 Status {}: {} data items, {} peers",
+                        state_guard.id,
+                        state_guard.data.len(),
+                        state_guard.peer_count
+                    );
+                }
+                _ = task.cancelled() => return,
             }
-        });
-
-        // Example: Handle custom business events
-        self.handle_business_events().await;
+        }
     }
 
-    async fn handle_business_events(&self) {
-        // This is where you'd implement your custom business logic
-        // For example:
-        // - Processing custom messages from peers
-        // - Handling custom events
-        // - Managing application-specific state
-
+    /// Example of application-specific background work.
+    async fn handle_business_events(state: Arc<RwLock<BusinessState>>, task: TaskContext) {
+        // This is where you'd implement your custom business logic, for example
+        // processing custom events or managing application-specific state.
         log::info!("💼 Business event handler started");
-
-        // Example custom logic
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
         loop {
-            tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
-
-            // Example: Add some data periodically
-            {
-                let mut state = self.state.write().await;
-                let key = format!("data_{}", state.data.len());
-                let value = format!("value_at_{}", unix_timestamp());
-                state.data.insert(key.clone(), value.clone());
-                log::debug!("📝 Added: {} = {}", key, value);
+            tokio::select! {
+                _ = interval.tick() => {
+                    let mut state = state.write().await;
+                    let key = format!("data_{}", state.data.len());
+                    let value = format!("value_at_{}", unix_timestamp());
+                    state.data.insert(key.clone(), value.clone());
+                    log::debug!("📝 Added: {} = {}", key, value);
+                }
+                _ = task.cancelled() => return,
             }
         }
     }
@@ -121,6 +107,35 @@ impl BusinessLogic {
 impl Plugin for BusinessLogic {
     fn plugin_id(&self) -> &'static str {
         "business_logic"
+    }
+
+    /// Start background work in the plugin's managed task scope. The tasks
+    /// wait for host activation and end when the scope is cancelled.
+    async fn on_start(&self, ctx: &PluginContext) -> Result<(), PluginError> {
+        log::info!(
+            "🔧 Starting business logic for {}",
+            self.config
+                .app_name
+                .as_ref()
+                .unwrap_or(&"Unknown".to_string())
+        );
+        let state = self.state.clone();
+        ctx.spawn_task("status", move |task| async move {
+            if task.activated().await.is_ok() {
+                Self::report_status(state, task).await;
+            }
+            Ok(())
+        })
+        .map_err(|error| PluginError::new(error.to_string()))?;
+        let state = self.state.clone();
+        ctx.spawn_task("business-events", move |task| async move {
+            if task.activated().await.is_ok() {
+                Self::handle_business_events(state, task).await;
+            }
+            Ok(())
+        })
+        .map_err(|error| PluginError::new(error.to_string()))?;
+        Ok(())
     }
 
     async fn on_message(&self, message: &Message, _ctx: &PluginContext) {

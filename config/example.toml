@@ -19,73 +19,78 @@ id_file = "node_id"              # Filename within state_dir to persist node id
 allow_ephemeral = true            # Allow ephemeral UUID when persistence fails
 node_type = "daemon"             # Optional node type label advertised in HELLO
 
-# Encryption settings (TLS) — optional
+# Encryption settings — optional
 [encryption]
 enabled = false                   # Set to true to enable encryption on network transport
-mtls = false                      # TLS-only: enable mutual TLS (client auth)
 
-# Select encryption backend:
-# - "tls"   : Rustls/TLS with certificates (see [encryption.paths])
-# - "noise" : Noise protocol (feature-gated; experimental)
+# Select the backend for TCP connections:
+# - "tls"   : Rustls/TLS with certificates (see [encryption.tls])
+# - "noise" : Noise protocol (feature-gated; see [encryption.noise])
 # - "none"  : Explicitly disable (same effect as enabled=false)
 # If omitted, defaults to "none" when enabled=false, or "tls" when enabled=true.
+# UDP sessions ([network.udp]) always use Noise, whatever the backend.
 backend = "tls"
 
-# When encryption is enabled, configure certificate/key and trust paths
-[encryption.paths]
-own_certificate = "pki/own/example-app.crt"   # Client cert for mTLS (optional)
-own_private_key = "pki/own/example-app.key"   # Client key for mTLS (optional)
-trusted_cert_dir = "pki/trusted/certs"        # Directory of trusted peer certs (PEM)
-trusted_crl_dir = "pki/trusted/crl"           # Directory of CRLs for trusted peers (optional)
-rejected_dir = "pki/rejected"                 # Directory to store rejected certs (optional)
-issuer_cert_dir = "pki/issuers/certs"         # Directory of issuer/CA certs (optional)
-issuer_crl_dir = "pki/issuers/crl"            # Directory of issuer CRLs (optional)
+# TLS backend. The certificate store has own, trusted, issuers and rejected
+# (ADR-0016).
+[encryption.tls]
+mtls = false                      # Mutual TLS: both sides present certificates
 
-# Noise backend configuration (experimental; requires the `noise` feature)
-# Only used when `backend = "noise"` and `enabled = true`.
+[encryption.tls.paths]
+own_certificate = "pki/own/example-app.crt"   # This node's certificate
+own_private_key = "pki/own/example-app.key"   # This node's private key
+trusted_cert_dir = "pki/trusted/certs"        # Trusted peer certs (PEM); tofu adds the ones it accepts
+# CRL directories (PEM or DER). Checked only with enforce_ca_chain = true;
+# the node refuses to start if they are set without it (ADR-0014).
+# trusted_crl_dir = "pki/trusted/crl"
+rejected_dir = "pki/rejected"                 # Rejected peer certs, for review and `trust promote`
+issuer_cert_dir = "pki/issuers/certs"         # CA certs: the only trust anchors for enforce_ca_chain
+# issuer_crl_dir = "pki/issuers/crl"
+
+[encryption.tls.trust_policy]
+mode = "open"                    # open | allowlist | tofu | observe; hybrid is a non-enforcing placeholder
+accept_self_signed = false        # Permit self-signed peers in non-CA modes
+reject_expired = false            # Reject an expired leaf certificate
+reject_before_valid = false       # Reject a not-yet-valid leaf certificate
+enforce_ca_chain = false          # Require a valid WebPKI path to a CA in issuer_cert_dir
+pin_subjects = []                 # Exact subject DNs or substring if prefixed with '~'
+pin_fingerprints = []             # Allowed SPKI fingerprints (hex lowercase)
+pin_fp_algo = "sha256"           # Fingerprint algorithm (sha256)
+require_realm_node_name = false   # Require a URI:node://<realm>/<node_id> SAN for this realm
+
+# Noise backend (requires the `noise` feature). Used for TCP when
+# backend = "noise", and always for UDP sessions.
 [encryption.noise]
-# Handshake pattern: e.g., "XX", "IK", or full spec like
-# "Noise_XX_25519_ChaChaPoly_BLAKE2s".
+# The suite is fixed (Noise_XX_25519_ChaChaPoly_BLAKE2s); these settings only
+# document it, and any other value is an error.
 pattern = "XX"
-
-# Curve: "25519" (or "448" if supported)
 curve = "25519"
-
-# Cipher: "ChaChaPoly" or "AESGCM" (subject to feature support)
 cipher = "ChaChaPoly"
-
-# Hash: "BLAKE2s" or "SHA256"
 hash = "BLAKE2s"
 
-# Optional: path to static private key for identity/pinning
-# static_key_path = "pki/own/noise_static.key"
+# The Noise key store, laid out like the TLS one (ADR-0016).
+[encryption.noise.paths]
+# static_key = "pki/noise/static.key"         # This node's static key; created on first start
+trusted_dir = "pki/noise/trusted"             # Trusted static keys (<fingerprint>.noise); tofu adds the ones it accepts
+rejected_dir = "pki/noise/rejected"           # Rejected static keys, for review and `trust promote`
 
 # Noise static-key trust policy. Fingerprints are lowercase SHA-256 hex.
 [encryption.noise.trust_policy]
 mode = "open"                       # open | allowlist | tofu | observe
-store_new = "none"                  # none | observed
-allowlist_fingerprints = []
+allowlist_fingerprints = []         # Trusted keys besides those in trusted_dir
 pin_fingerprints = []
 
-[encryption.noise.trust_policy.paths]
-allowlist_dir = "pki/noise/trusted"
-observed_dir = "pki/noise/observed"
+# Binding of HELLO node IDs to the TLS certificate key or Noise static key that
+# authenticated the connection (ADR-0012). Applies to TLS and Noise alike.
+[encryption.node_identity]
+mode = "tofu"                     # off | tofu | pinned | certificate
+bindings_file = "pki/node-identity/bindings.jsonl"  # Persist TOFU bindings (in memory when unset)
+max_bindings = 4096               # TOFU bindings kept
 
-# Trust policy when TLS is enabled
-[encryption.trust_policy]
-mode = "open"                    # open | allowlist | tofu | observe; hybrid is a non-enforcing placeholder
-accept_self_signed = false        # Permit self-signed peers in non-CA modes
-store_new_certs = "none"         # none | observed (write new leaf certs to observed dir)
-reject_expired = false            # Reject an expired leaf certificate
-reject_before_valid = false       # Reject a not-yet-valid leaf certificate
-enforce_ca_chain = false          # Require a valid WebPKI path to a configured CA
-pin_subjects = []                 # Exact subject DNs or substring if prefixed with '~'
-pin_fingerprints = []             # Allowed SPKI fingerprints (hex lowercase)
-pin_fp_algo = "sha256"           # Fingerprint algorithm (sha256)
-realm_subject_binding = false     # Require subject to contain realm name
-
-[encryption.trust_policy.paths]
-observed_dir = "pki/observed/certs"  # Directory to write newly observed leaf certs
+# Explicit bindings: another node's ID -> the SHA-256 fingerprints it may use
+# (TLS SPKI or Noise static key), one line per pinned node.
+[encryption.node_identity.pins]
+# "<peer-node-id>" = ["<sha256-hex>"]
 
 # Logging / events configuration
 [logging]
@@ -104,6 +109,9 @@ request_want = 16            # Peers requested per interval
 [realm_access]
 allowed_node_types = ["daemon", "admin"]  # Only allow peers that advertise one of these types
 
+[network]
+# bind_ip = "0.0.0.0"             # Address the TCP and UDP listeners bind to (default: every IPv4 interface)
+
 # Persistent known peer store (ADR-0002)
 [network.persistence]
 enabled = true                    # Enable persistence across runs
@@ -121,6 +129,19 @@ enabled = false                   # Enable this node to act as a relay
 store_forward = false             # Allow bounded buffering for temporarily absent peers
 # queue_max_per_target = 1024     # Optional override per-target cap
 # queue_max_global = 8192         # Optional override global cap across targets
+# queue_max_bytes = 67108864      # Optional override global byte cap across targets
+# Node IDs this node may use as relays for its own messages. Unset: any peer
+# that announces the `relay` capability; [] uses none. A relay can read and
+# modify what it forwards.
+# allowed_relays = ["relay-1"]
+
+# TCP transport resource limits (apply regardless of trust policy)
+[network.limits]
+max_frame_bytes = 1048576            # Largest JSON line accepted after HELLO (HELLO itself is capped at 64 KiB)
+handshake_timeout_ms = 10000         # Budget for TLS/Noise handshake plus HELLO exchange
+idle_timeout_ms = 300000             # Close connections without inbound frames for this long; 0 disables
+max_inbound_connections = 1024       # Concurrently accepted inbound connections
+max_inbound_connections_per_ip = 32  # Concurrently accepted inbound connections per remote IP
 
 # Optional UPnP-IGD TCP port mapping (requires the `upnp` Cargo feature).
 [network.nat]

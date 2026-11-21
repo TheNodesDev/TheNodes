@@ -28,6 +28,11 @@ jobs:
         run: cargo build --workspace --all-targets --locked
       - name: Tests
         run: cargo test --workspace --all-features --locked -- --nocapture
+      # The lifecycle tests build native plugin fixtures with the same Cargo,
+      # lockfile, and features as the test binary; run them without optional
+      # features too.
+      - name: Plugin tests (default features)
+        run: cargo test --test plugin_lifecycle --test plugin_dispatch --locked -- --nocapture
 
   msrv:
     name: build (MSRV)
@@ -45,6 +50,8 @@ jobs:
         run: cargo build --workspace --all-targets --all-features --locked
       - name: Tests all features (locked)
         run: cargo test --workspace --all-features --locked -- --nocapture
+      - name: Plugin tests default features (locked)
+        run: cargo test --test plugin_lifecycle --test plugin_dispatch --locked -- --nocapture
       - name: Check standalone plugin example (locked)
         run: cargo check --manifest-path examples/kvstore_plugin/Cargo.toml --locked
       - name: Check generated templates

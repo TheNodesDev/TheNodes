@@ -19,7 +19,7 @@ thenodes = "0.4.0"
 
 This guide targets version 0.4.0.
 
-Dynamic plugins must use the same TheNodes release as the host. Pin plugin dependencies to the exact host version when reproducible ABI matching is required. TheNodes 0.4.0 uses plugin ABI version 3.
+Dynamic plugins must be built from the same TheNodes source release, Rust toolchain, `Cargo.lock`, and TheNodes feature set as the host. The current development tree uses plugin ABI version 4 (TheNodes 0.4.0 used ABI 3); ABI 3 plugins are rejected and must be migrated as described in [`docs/PLUGIN_ABI_4_MIGRATION.md`](docs/PLUGIN_ABI_4_MIGRATION.md).
 
 ### Cargo Features
 
@@ -108,12 +108,12 @@ TheNodes/
 ├── CONTRIBUTING.md                # Contribution guidelines
 ├── config/                        # Example node configurations
 │   └── example.toml
-├── pki/                           # Runtime PKI material (own/trusted/observed)
+├── pki/                           # Certificate store (ADR-0016)
 │   ├── own/
 │   ├── trusted/
-│   ├── observed/
 │   ├── rejected/
-│   └── issuers/                   # (optional, may be empty)
+│   ├── issuers/                   # (optional, may be empty)
+│   └── noise/                     # static.key, trusted/, rejected/ for Noise
 ├── data/                          # Node state directories (node_id persistence)
 ├── logs/                          # JSONL audit/event logs
 ├── src/
@@ -149,10 +149,12 @@ TheNodes/
 │   │   ├── transport.rs
 │   │   ├── udp_listener.rs        # Feature-gated UDP + Noise listener
 │   │   └── udp_session.rs         # TNCF framing and Noise UDP sessions
-│   ├── plugin_host/               # Dynamic plugin loading & orchestration
-│   │   ├── mod.rs
-│   │   ├── loader.rs
-│   │   └── manager.rs
+│   ├── plugin_host/               # Plugin lifecycle, native loading & orchestration
+│   │   ├── mod.rs                 # Plugin trait and PluginContext
+│   │   ├── lifecycle.rs           # States, outcomes, options, and reports
+│   │   ├── loader.rs              # ABI 4 loader, registration, library pinning
+│   │   ├── manager.rs             # Lifecycle owner, inboxes, dispatch, shutdown
+│   │   └── runtime.rs             # Native endpoint, library runtime, task scopes
 │   ├── prompt/                    # Interactive prompt support
 │   │   └── mod.rs
 │   ├── realms/
@@ -161,12 +163,13 @@ TheNodes/
 │   ├── security/                  # Encryption / trust policy
 │   │   ├── mod.rs
 │   │   ├── encryption.rs
+│   │   ├── node_identity.rs       # Binding of HELLO node IDs to transport keys
 │   │   ├── secure_channel.rs
 │   │   └── trust.rs
 │   └── utils/                     # Misc helpers (kept minimal intentionally)
 │       └── mod.rs
 ├── examples/
-│   ├── simple_node.rs             # Simple embedded usage example
+│   ├── simple_node.rs             # CAL host with an explicit plugin lifecycle
 │   └── kvstore_plugin/            # Example plugin crate
 │       ├── Cargo.toml
 │       └── src/lib.rs
@@ -181,6 +184,8 @@ TheNodes/
 │   ├── node_id_uniqueness.rs
 │   ├── pins.rs
 │   ├── plugin_dispatch.rs
+│   ├── plugin_lifecycle.rs        # Lifecycle tests with real native fixtures
+│   ├── fixtures/                  # Native plugin fixtures (workspace members)
 │   ├── promotion_event.rs
 │   ├── trust_policy.rs
 │   └── udp_transport.rs
@@ -188,6 +193,7 @@ TheNodes/
 │   ├── architecture.mmd           # Editable Mermaid architecture source
 │   ├── architecture.svg           # Rendered architecture diagram
 │   ├── EVENTS_RELIABILITY_AND_CONSENSUS_PLAN.md
+│   ├── PLUGIN_ABI_4_MIGRATION.md
 │   ├── PLUGIN_AUTHORING.md
 │   ├── PLUGIN_STORAGE_DECISION.md
 │   ├── SECURITY.md
@@ -206,7 +212,13 @@ TheNodes/
 │       ├── 0007-connection-lifecycle-policy.md
 │       ├── 0008-transport-agnostic-fingerprint-trust.md
 │       ├── 0009-upnp-port-mapping-and-nat-diagnostics.md
-│       └── 0010-explicit-relay-payload-framing.md
+│       ├── 0010-explicit-relay-payload-framing.md
+│       ├── 0011-plugin-runtime-and-lifecycle.md
+│       ├── 0012-node-identity-binding.md
+│       ├── 0013-udp-session-replay-protection-and-handshake-cookies.md
+│       ├── 0014-certificate-revocation-lists.md
+│       ├── 0015-hole-punch-authorization.md
+│       └── 0016-secure-channel-configuration-and-certificate-store.md
 └── README.md
 ```
 
@@ -298,6 +310,15 @@ CAL Mode Note: When embedding as a library, you *may* still internally structure
   ```
   In prompt mode you can type `version` (or `about`) to display the running application version, protocol version, git commit (if embedded), and build timestamp.
 
+The host refuses to start without its config file (`config.toml` unless `--config` names another); `--allow-default-config` runs with the built-in defaults instead, which are plaintext with open trust and meant for development only. A key the config does not define, such as a misspelt `[encryption] enable`, is an error, and so is an unknown value of a security setting, such as `mode = "allowlst"`. Relative paths in the config, and the built-in defaults such as `plugins/`, `pki/`, `data/` and `logs/`, are relative to the directory the node is started in; a service should set it explicitly, for example with `WorkingDirectory=` in a systemd unit.
+
+The TCP and UDP listeners bind to every IPv4 interface unless `[network] bind_ip` names an address:
+
+```toml
+[network]
+bind_ip = "127.0.0.1"
+```
+
 ## Networking and Delivery
 
 Version 0.4.0 adds optional UPnP-IGD port mapping, NAT diagnostics, explicit relay
@@ -318,10 +339,12 @@ cargo build --release --features noise
 enabled = true
 listen_port = 50002          # Defaults to the TCP port + 1
 max_datagram_bytes = 1200    # Maximum supported value
-max_app_payload_bytes = 1176 # Maximum supported value
+max_app_payload_bytes = 1168 # Maximum supported value
 ```
 
 The UDP listener uses Noise XX sessions and TNCF control frames. When enabled, HELLO can include optional UDP listen and observed addresses, and the framework tracks UDP sessions independently of mutable network paths.
+
+Every session frame carries its nonce, so sessions survive lost and reordered datagrams, and a 1024-nonce replay window drops replays. A handshake cannot reuse an existing session ID, and a responder under load asks the initiator for a cookie proving its source address before it does any Diffie-Hellman ([ADR-0013](docs/adr/0013-udp-session-replay-protection-and-handshake-cookies.md)).
 
 ### Connection Policy and Lifecycle
 
@@ -342,7 +365,24 @@ reconnect_max_attempts = 8
 reconnect_jitter_ratio = 0.2
 ```
 
-Supported strategies are `direct_only`, `direct_then_relay` (default), `direct_then_udp_then_relay`, `direct_then_punch_then_relay`, and `relay_only`. Active routes are tracked as unknown, healthy, suspect, or unresponsive. Known TCP peers can be reconnected with bounded exponential backoff and jitter.
+Supported strategies are `direct_only`, `direct_then_relay` (default), `direct_then_udp_then_relay`, `direct_then_punch_then_relay`, and `relay_only`. Active routes are tracked as unknown, healthy, suspect, or unresponsive. A peer becomes unresponsive once it has been silent for `heartbeat_timeout_ms` and has left the heartbeats sent meanwhile unanswered, so a node that was itself stalled (load, suspend) probes its peers before dropping any. Known TCP peers can be reconnected with bounded exponential backoff and jitter. `direct_tcp_timeout_ms` bounds every outbound TCP connect, including bootstrap and reconnect dials.
+
+A node reconnects only to peers it dialled itself, at the address where it reached them; a peer that connected in is left to reconnect on its own. The listen address a peer announces in HELLO is a claim: it may be tried as a delivery route, but it never suppresses a bootstrap dial, drives a reconnect, or reaches the peer store. What a peer announced (listen addresses, capabilities, UDP addresses) is forgotten once it has neither a TCP connection nor a UDP session.
+
+### Transport Limits
+
+The TCP transport enforces resource limits independent of the trust policy, so an unauthenticated or misbehaving peer cannot hold memory or connection slots indefinitely:
+
+```toml
+[network.limits]
+max_frame_bytes = 1048576            # Largest JSON line accepted after HELLO; larger frames close the connection
+handshake_timeout_ms = 10000         # Budget for TLS/Noise handshake plus the HELLO exchange
+idle_timeout_ms = 300000             # Close connections with no inbound frame for this long; 0 disables
+max_inbound_connections = 1024       # Concurrently accepted inbound connections
+max_inbound_connections_per_ip = 32  # Concurrently accepted inbound connections per remote IP
+```
+
+HELLO frames are always limited to 64 KiB. Connections that do not complete a valid HELLO within the handshake budget are closed before any message reaches plugins, and `accept()` errors such as file-descriptor exhaustion back off instead of spinning.
 
 ### NAT Traversal
 
@@ -356,9 +396,12 @@ refresh_secs = 300
 cookie_ttl_secs = 30
 probe_count = 6
 probe_interval_ms = 100
+# allowed_rendezvous = ["relay-1"]   # node IDs this node may use as rendezvous; unset: any
 ```
 
 Enabling traversal requires `[network.udp].enabled = true` and a build with the `noise` feature. Serving observation and punch coordination additionally requires `[network.relay].enabled = true`.
+
+A node follows a `PUNCH_GO` only for a punch it requested or an invitation it accepted, from that punch's rendezvous, and only before the punch's deadline (at most 30 seconds). A rendezvous hands out a peer's UDP address only if that address answered one of its cookie-verified observation requests ([ADR-0015](docs/adr/0015-hole-punch-authorization.md)), so peers punch through a rendezvous they also observe through.
 
 Optional UPnP-IGD support maps the TCP listen port and advertises the public mapping
 through HELLO metadata:
@@ -384,7 +427,9 @@ The delivery layer provides three classes:
 - `Reliable`: uses a stable UUID v7 message ID, framework acknowledgements, retries, and duplicate suppression.
 - `OrderedReliable`: adds ordering within a required caller-supplied ordering key.
 
-Plugins send through `PluginContext::deliver_message(...)` or `PluginContext::send_message(...)` with `DeliveryOptions`. Delivery state, deduplication, retries, and ordering are scoped to the current process lifetime and are not durable across restarts.
+Duplicate suppression keeps at most 16 384 message IDs per origin (262 144 in total), evicting an origin's own oldest IDs first. Out-of-order `OrderedReliable` messages are buffered up to 1 024 ordering keys and 4 MiB per origin (65 536 keys and 64 MiB in total); a message that does not fit is not acknowledged, so its sender retries it, and an `ordered_delivery_deferred` event is emitted.
+
+Plugins send through `PluginContext::deliver_message(...)` or `PluginContext::send_message(...)` with `DeliveryOptions`. These host services run on the host runtime and are available after the host activates its plugins; earlier sends return `DeliveryFailureReason::NotReady`, and sends after shutdown has drained admitted messages return `Stopping`. Delivery state, deduplication, retries, and ordering are scoped to the current process lifetime and are not durable across restarts.
 
 ```toml
 [network.delivery]
@@ -430,7 +475,7 @@ enabled = true
 backend = "noise"    # or "tls" (default) or "none"
 ```
 
-The Noise implementation uses `Noise_XX_25519_ChaChaPoly_BLAKE2s`. The fields under `[encryption.noise]` are reserved for future backend configurability and do not select alternative algorithms in this release.
+The Noise implementation uses `Noise_XX_25519_ChaChaPoly_BLAKE2s`. The `pattern`, `curve`, `cipher` and `hash` fields under `[encryption.noise]` only document that suite; any other value is an error. `[encryption.noise]` applies to TCP when `backend = "noise"` and always to UDP sessions, which are Noise whatever the backend. TLS settings are under `[encryption.tls]`.
 
 When `backend = "noise"` but the `noise` feature is not compiled in, secure-channel creation fails with an explicit error. Connections are rejected without falling back to plaintext. Build with `--features noise` to use this backend.
 
@@ -439,25 +484,27 @@ fingerprinted with SHA-256 after the XX handshake and evaluated through the same
 core trust modes used for TLS fingerprints:
 
 ```toml
+[encryption.noise.paths]
+static_key   = "pki/noise/static.key"   # default; created on first start
+trusted_dir  = "pki/noise/trusted"      # <fingerprint>.noise files
+rejected_dir = "pki/noise/rejected"
+
 [encryption.noise.trust_policy]
 mode = "allowlist" # open | allowlist | tofu | observe
-store_new = "none"
 allowlist_fingerprints = ["<sha256-hex>"]
 pin_fingerprints = ["<sha256-hex>"]
-
-[encryption.noise.trust_policy.paths]
-allowlist_dir = "pki/noise/trusted"
-observed_dir = "pki/noise/observed"
 ```
 
 ### TLS & Trust Policy (Overview)
-TheNodes supports optional TLS. When disabled, traffic is plaintext (development / controlled environments). When TLS is enabled, the `[encryption.trust_policy]` `mode` controls how peer certificates are evaluated. The currently implemented modes behave as follows:
+TheNodes supports optional TLS. When disabled, traffic is plaintext (development / controlled environments). When TLS is enabled, the `[encryption.tls.trust_policy]` `mode` controls how peer certificates are evaluated. The currently implemented modes behave as follows:
 
-- `open` – accept any presented certificate (while still applying pinning and validity flags if configured). Useful for quick internal experiments. When `store_new_certs = "observed"`, first-seen certs are copied into the observed directory.
-- `allowlist` – only accept certificates whose SPKI fingerprint already exists in `pki/trusted/certs`. New fingerprints are rejected; when `store_new_certs = "observed"`, their certificates can still be recorded for review.
-- `observe` – reject every connection after recording the presented certificate in `pki/observed/certs` (or the configured directory). Useful for staged rollouts that want visibility without permitting traffic.
-- `tofu` – "Trust On First Use": atomically record the first fingerprint for a peer identity and require that fingerprint on subsequent connections. A writable `observed_dir` and a peer identity are mandatory; otherwise the connection is rejected.
+- `open` – accept any presented certificate (while still applying pinning and validity flags if configured). Useful for quick internal experiments.
+- `allowlist` – only accept certificates whose SPKI fingerprint is in a certificate under `trusted_cert_dir` (`pki/trusted/certs`).
+- `observe` – reject every connection; the certificates are kept in `rejected_dir`, which this mode requires. Useful for staged rollouts that want visibility without permitting traffic.
+- `tofu` – "Trust On First Use": accept a trusted certificate, and a new one once, adding it to `trusted_cert_dir` when its connection is admitted. Which node ID a key may use is the node identity binding's decision, so `tofu` requires `trusted_cert_dir` and node identity binding. A `CA:true` certificate is never trusted on first use. Switch to `allowlist` after onboarding to freeze the trusted store.
 - `hybrid` (placeholder) – currently identical to `open` but tagged in logs so future staged enforcement can be layered on without config churn.
+
+In every mode, a certificate the trust policy rejects is kept in `rejected_dir` when it is set. The certificate store has `own`, `trusted`, `issuers` and `rejected` ([ADR-0016](docs/adr/0016-secure-channel-configuration-and-certificate-store.md)): an operator reviews `rejected` and promotes a certificate to `trusted` with `trust promote <fingerprint>` in the prompt or `thenodes-ctl trust promote <fingerprint>`.
 
 > A dedicated `ca` mode is reserved for a future release. Full CA path validation is already available explicitly through `enforce_ca_chain = true`.
 
@@ -465,74 +512,90 @@ Phased trust policy work adds layered security features without breaking existin
 
 Phase 2 (current baseline) adds:
 - SPKI fingerprint (SHA-256) via ASN.1 parsing (fallback to DER hash only on parse failure).
-- Cryptographic WebPKI path validation through `enforce_ca_chain`, using `issuer_cert_dir` as the CA trust-anchor store and `trusted_cert_dir` as a compatibility fallback.
+- Cryptographic WebPKI path validation through `enforce_ca_chain`, using `issuer_cert_dir` as the only CA trust-anchor store (required with `enforce_ca_chain`).
 - Real X.509 validity parsing and fail-closed enforcement through `reject_expired` and `reject_before_valid`.
 - TLS-role-aware EKU validation for outbound server certificates and inbound mTLS client certificates.
 - Expanded logging fields: `chain_valid`, `chain_reason`, `time_valid`, `time_reason`.
 
 Phase 3 (pinning core delivered) adds:
 - Pin sets: `pin_fingerprints` (exact SPKI SHA-256 hex) and `pin_subjects` (exact or `~substring`).
-- Realm binding: `realm_subject_binding` ensures the active realm name appears in certificate subject (if enabled).
-- Enforcement ordering: chain/time flags -> fingerprint pins -> subject pins -> realm binding -> mode logic.
-- Promotion helper: move observed certs into trusted directory programmatically (`promote_observed_to_trusted`).
+- Realm binding: `require_realm_node_name` requires the leaf certificate to name a node in this node's realm (`URI:node://<realm>/<node_id>`, as `thenodes-cert --realm-code --node-id` adds).
+- Enforcement ordering: chain/time flags -> fingerprint pins -> subject pins -> realm node name -> mode logic.
+- Promotion helper: move a rejected certificate into the trusted directory programmatically (`promote_rejected_to_trusted`).
 
-`store_new_certs` only has an effect in modes that actually admit or capture new fingerprints (`open`, `observe`, `tofu`, `hybrid`). Allowlist deployments should populate `pki/trusted/certs` out-of-band or via promotion tooling.
+Allowlist deployments populate `pki/trusted/certs` out-of-band, by promoting reviewed certificates from `pki/rejected`, or by onboarding with `tofu` first.
 
 Example trust policy snippet with pinning:
 ```toml
-[encryption.trust_policy]
+[encryption.tls.trust_policy]
 mode = "allowlist"              # or open | observe | tofu
 pin_fingerprints = ["a1b2c3...deadbeef"]
 pin_subjects = ["~MyOrg-Nodes", "CN=Node-Primary"]
-realm_subject_binding = true
-store_new_certs = "observed"     # still useful for TOFU discovery if mode=tofu
-accept_self_signed = true         # still honored for self-signed deployments
+require_realm_node_name = true
+accept_self_signed = true         # for self-signed deployments
 ```
 
 Operational notes:
 - Populate pin lists after an initial observation period (e.g., run in TOFU mode, harvest fingerprints from logs / observed dir filenames).
 - Certificate rotations require updating pins first to avoid availability loss.
-- If any subject-based constraint (pins or realm binding) is active and the subject cannot be parsed, the connection is currently rejected (future soft-fail option planned).
+- If subject pins are set and the subject cannot be parsed, the connection is rejected.
 
-Roadmap (selected upcoming): explicit `ca` / `hybrid` modes and hot reloadable pin sets. CRL/OCSP enforcement is a deliberate non-goal for 0.4.0.
+Roadmap (selected upcoming): explicit `ca` / `hybrid` modes and hot reloadable pin sets. OCSP is not supported.
 
 See `SECURITY_TRUST_POLICY_PLAN.md` for detailed status.
 
 ### Mutual TLS (mTLS)
-Mutual TLS can be enabled to authenticate BOTH sides of a connection. Set `mtls = true` in the `[encryption]` section.
+Mutual TLS can be enabled to authenticate BOTH sides of a connection. Set `mtls = true` in the `[encryption.tls]` section.
 
 Minimal config example:
 ```toml
 [encryption]
 enabled = true
-mtls = true                # require and present client certs
 
-  [encryption.paths]
+  [encryption.tls]
+  mtls = true              # require and present client certs
+
+  [encryption.tls.paths]
   own_certificate  = "pki/own/cert.pem"
   own_private_key  = "pki/own/key.pem"
-  trusted_cert_dir = "pki/trusted/certs"   # leaf allowlist / compatibility root fallback
+  trusted_cert_dir = "pki/trusted/certs"   # trusted peer certificates
+  rejected_dir     = "pki/rejected"        # rejected ones, for review and promotion
   issuer_cert_dir  = "pki/issuers/certs"   # CA trust anchors for enforce_ca_chain
 
-  [encryption.trust_policy]
+  [encryption.tls.trust_policy]
   mode = "allowlist"       # open | observe | allowlist | tofu | hybrid (hybrid placeholder)
-  store_new_certs = "observed"  # (optional for tofu mode)
-
-  [encryption.trust_policy.paths]
-  observed_dir = "pki/observed/certs"
 ```
 
 Behavior summary:
 - mtls=false (default): Only server cert is presented; client identity at TLS layer is unauthenticated.
 - mtls=true: Client presents its certificate; server requires and evaluates it using trust policy.
 - allowlist mode + mtls=true: Only peers with certs in `trusted_cert_dir` are accepted.
-- tofu mode + mtls=true: First-seen client certificates are bound to their peer identity in `observed_dir`; missing or unwritable TOFU storage rejects the connection.
+- tofu mode + mtls=true: A new client certificate is accepted once and added to `trusted_cert_dir` when the connection is admitted; a full or unwritable trusted directory rejects the connection.
 
 Operational tips:
 - Ensure `own_certificate` / `own_private_key` exist before enabling mTLS.
 - Populate `trusted_cert_dir` before switching to `allowlist` + mTLS or connections will be rejected.
 - Missing client cert (on outbound) logs a warning and falls back to one-way TLS; inbound without a cert is rejected when mTLS is enabled.
 
-The `enforce_ca_chain` flag performs full WebPKI path validation today. Future phases may add dedicated `ca` / `hybrid` modes without changing the `mtls` flag semantics. CRL/OCSP enforcement remains deferred.
+The `enforce_ca_chain` flag performs full WebPKI path validation today, including revocation: with it, the leaf and intermediates are checked against the CRLs in `trusted_crl_dir` and `issuer_crl_dir` ([ADR-0014](docs/adr/0014-certificate-revocation-lists.md)). A certificate whose CA has no CRL there is not revoked, a CRL past its nextUpdate still applies (with a warning at startup), and an unreadable CRL rejects the chain. Setting CRL directories without `enforce_ca_chain` stops the node at startup, since no CRL would be consulted. Future phases may add dedicated `ca` / `hybrid` modes without changing the `mtls` flag semantics.
+
+### Node Identity Binding
+The trust policy decides whether a key may connect; `[encryption.node_identity]` decides whether that key may use the node ID it claims in HELLO ([ADR-0012](docs/adr/0012-node-identity-binding.md)). It covers TLS and Noise, over TCP and UDP:
+
+```toml
+[encryption.node_identity]
+mode = "tofu"              # off | tofu (default) | pinned | certificate
+bindings_file = "pki/node-identity/bindings.jsonl"   # in memory when unset
+
+  [encryption.node_identity.pins]
+  "<peer-node-id>" = ["<sha256-hex>"]   # another node's ID -> the fingerprints it may use
+```
+
+- `tofu` binds a node ID to the first TLS or Noise key accepted for it; `pinned` requires a pin; `certificate` requires a `URI:node://<realm>/<node_id>` SAN, naming the node in this node's realm (its canonical `[realm]` code), in a certificate whose chain validated against `issuer_cert_dir` (or a pin). Each realm is its own namespace: a name in another realm certifies nothing. A pin or certificate name that contradicts the claim is rejected in every mode except `off`.
+- Connections without a transport identity (plaintext, or TLS without mTLS on the accepting side) carry an unverified node ID.
+- `thenodes-cert --realm-code <code> --node-id <id>` adds the node-name SAN (`<code>` is the realm's canonical code); `thenodes-ctl node-binding list|forget <node_id>` manages persisted bindings.
+- `from` and `to` on every frame are the node IDs of the two ends of the connection, stamped by the transport; frames that name anyone else are dropped.
+- Plugins read `Message::origin()`: a direct message's `from` is the node bound to the delivering connection, and `origin().authenticated_sender()` returns it when that node ID is bound to a key. Messages unwrapped from a relay tunnel are marked with `origin().relayed_from` and are not authenticated end to end.
 
 ### Logging / Events Configuration
 Add an optional `[logging]` section to control event sinks:
@@ -591,10 +654,10 @@ TheNodes uses an asynchronous event pipeline (see `src/events/`) instead of ad-h
 
 Components:
 - `EventDispatcher` – global async fan-out loop.
-- `EventHandle` – lightweight clone for emitting events or registering sinks (exposed to plugins).
+- `EventHandle` – lightweight clone for emitting events or registering sinks (exposed to plugins through `PluginContext::events`). In native plugin contexts it submits events to the host's dispatcher.
 - Sinks – implement `LogSink` with an async `handle(&self, event: &LogEvent)` method.
 
-`PromotionEvent` is emitted when an observed certificate is promoted to the trusted store via `promote_observed_to_trusted`, providing an immutable audit record of trust-state changes distinct from per-connection `TrustDecisionEvent`s.
+`PromotionEvent` is emitted when a rejected certificate or key is promoted to the trusted store via `promote_rejected_to_trusted`, providing an immutable audit record of trust-state changes distinct from per-connection `TrustDecisionEvent`s.
 
 Current PromotionEvent fields:
 - `fingerprint` (SPKI SHA-256 hex)
@@ -605,11 +668,11 @@ Current PromotionEvent fields:
 
 Example JSON (abridged):
 ```jsonc
-{ "type": "promotion", "fingerprint": "d4b7...ce42", "from_store": "pki/observed/certs/d4b7...ce42.pem", "to_store": "pki/trusted/certs/d4b7...ce42.pem", "operator": "runtime", "success": true }
+{ "type": "promotion", "fingerprint": "d4b7...ce42", "from_store": "pki/rejected/d4b7...ce42.pem", "to_store": "pki/trusted/certs/d4b7...ce42.pem", "operator": "runtime", "success": true }
 ```
 
 #### Plugin: Registering a Custom Sink
-Plugins can capture events (for metrics, forwarding, alerting) by registering a sink during initialization.
+Statically registered (CAL) plugins can capture events (for metrics, forwarding, alerting) by registering a sink, typically in `on_start`. Native plugins cannot register sinks: the dispatcher would poll futures created by plugin code on the host runtime, so `register_sink` returns `SinkRegistrationError::NotAvailableInNativePlugin` there.
 
 Minimal sink pattern:
 ```rust
@@ -630,7 +693,9 @@ impl LogSink for MetricsSink {
 }
 
 fn register(ctx: &PluginContext) {
-  ctx.events.register_sink(Arc::new(MetricsSink));
+  if let Err(err) = ctx.events.register_sink(Arc::new(MetricsSink)) {
+    eprintln!("metrics sink unavailable: {err}");
+  }
 }
 ```
 
@@ -674,12 +739,15 @@ Four QoS modes control forwarding behavior:
 When peers are offline, messages can be queued for later delivery:
 - Per-target queue cap: 1024 messages
 - Global queue cap: 8192 messages across all targets
+- Global byte cap: 64 MiB of buffered frames across all targets
 - TTL-based expiry with origin notification on timeout
 - Overload notifications sent to origin when caps are reached
 
-### Relay Selection
+### Forwarding Rules
 
-Deterministic relay selection via Rendezvous (HRW) hashing ensures consistent routing. Peers must advertise the `relay` capability (and optionally `relay_store_forward`) to be selected.
+A relay forwards a `RELAY_FWD` only for a live binding the sending peer created with `RELAY_BIND`, and only when the frame names that peer as its origin. It forwards only to targets connected to it, or queues for store-and-forward; it never hands a frame to another relay. A client may hold 64 bindings on a relay, and they end with its connection. Only a binding's owner can remove it with `RELAY_UNBIND`, binding IDs are random, and an `ACK` counts only from the target the frame was forwarded to. Refusals emit `relay_forward_rejected`, `relay_ack_rejected`, or `relay_unbind_processed` with `removed=false`.
+
+Peers must advertise the `relay` capability (and optionally `relay_store_forward`) to be used as a relay. Any peer can advertise it, and a relay can read and alter what it forwards; `allowed_relays` limits the relays a node uses to the node IDs it lists.
 
 ### Configuration
 
@@ -689,7 +757,8 @@ enabled = true
 store_forward = true
 queue_max_per_target = 1024
 queue_max_global = 8192
-selection = "rendezvous"          # or "none"
+queue_max_bytes = 67108864
+# allowed_relays = ["relay-1"]   # relays this node may use; unset: any peer that announces `relay`
 ```
 
 ### Example: Binding to a Relay
@@ -715,7 +784,8 @@ TheNodes maintains an in-memory peer store that can optionally persist to disk, 
 
 - **Peer records**: Each entry tracks `addr`, `source` (Bootstrap/Handshake/Gossip/Manual), `failures`, `last_success_epoch`, `node_id`, and `capabilities`.
 - **TTL expiry**: Old entries are filtered on load based on `ttl_secs`.
-- **Entry cap**: Maximum entries enforced via `max_entries`; oldest are dropped first (LRU).
+- **Entry cap**: `max_entries` applies while the node runs, not only on load. A full store drops a candidate it has never connected to, gossiped ones first, and keeps nodes it has reached.
+- **Gossip**: a `PEER_LIST` adds at most 64 addresses, each no more local than the peer that sent the list (a peer on a public address cannot name LAN or loopback addresses), as candidates rather than successes. Answers to `PEER_REQUEST` contain only addresses this node has connected to.
 - **Periodic flush**: Background task saves store at configurable intervals.
 - **Metadata capture**: On successful handshake, `node_id` and `capabilities` are extracted from HELLO and stored.
 
@@ -825,58 +895,48 @@ See `src/realms/realm.rs` for validation logic.
 
 ## Example Plugin Workflow
 
-1. **Build the plugin:**
+1. **Build the plugin** (it is a workspace member, so it shares the host's `Cargo.lock`; add `--features noise,upnp` if the host is built with them):
    ```sh
-   cd examples/kvstore_plugin
-   cargo build --release
+   cargo build --release -p kvstore_plugin
    ```
-2. **Copy the compiled `.so` to the plugin directory:**
+2. **Copy the compiled library to the plugin directory:**
    ```sh
-   cp target/release/libkvstore_plugin.so ../../plugins/
+   cp target/release/libkvstore_plugin.so plugins/
    ```
 3. **Run TheNodes:**
    ```sh
-   cd ../../
-   cargo run --bin thenodes -- --config config/example.toml
+   cargo run --release --bin thenodes -- --config config/example.toml
    ```
-   The plugin loader will load all plugins from the `plugins/` directory at runtime.
+   The host loads every library in `plugins/` (sorted by path), starts each plugin, binds its listener, and then activates plugin admission. Every plugin is required: a library that fails to load or a plugin that fails to start stops the host with a nonzero exit code. Press Ctrl+C to shut down; press it again to stop waiting on plugin work that does not finish.
 
-### Plugin ABI Basics
+   On Unix the host refuses a library that another user could have written or replaced: the library and every directory above it must be owned by the node's user or root and not writable by other users. Group write is accepted for the owner's private group (the default under `umask 002`) unless the file or directory has a POSIX ACL, and a directory with the sticky bit, such as `/tmp`, may be writable by others.
 
-Plugins are compiled as dynamic libraries that expose a single registration symbol with a C-layout function-table boundary. The boundary is explicitly versioned but remains pre-1.0 and can change between TheNodes minor releases.
+### Plugin ABI and Lifecycle Basics
 
-TheNodes 0.4.0 uses `PLUGIN_ABI_VERSION = 3`. Plugins must implement a stable
-`plugin_id()`, use the host-bound context, and be rebuilt against the matching host. A plugin
-can call `PluginContext::plugin_data_dir()` to create and obtain its isolated
-directory under the node state directory. Plugins own the storage engine and all
-schema, migration, locking, and recovery behavior inside that directory.
+Plugins are compiled as dynamic libraries. The boundary is explicitly versioned but remains pre-1.0 and can change between TheNodes minor releases. The current development tree uses `PLUGIN_ABI_VERSION = 4`:
 
-- The host exports `thenodes::plugin_host::PluginRegistrarApi` and `PLUGIN_ABI_VERSION`. Plugins receive a raw pointer to this struct when they are loaded.
-- The struct contains only FFI-safe fields (version, opaque context pointer, function pointers). Helper methods convert it into the familiar `PluginRegistrar` behavior inside the host.
-- Use the safe helper `PluginRegistrarApi::register_plugin` to hand the plugin implementation back to the host. The helper performs ABI version checking and reports any mismatch.
+- A library exports `thenodes_plugin_abi_version` and `register_plugin`, generated by `thenodes::export_plugin!`. The host checks the version before any plugin code is invoked and rejects other versions.
+- Registration is authoritative and all-or-nothing per library. Invalid or duplicate IDs, duplicate prompt prefixes, conflicting configuration defaults, and registration panics are returned as typed errors.
+- Each handler is wrapped in an adapter inside the plugin's own copy of TheNodes. Callbacks run on a Tokio runtime owned by the library; plugin panics are caught there and reported as data. No future crosses the boundary.
+- `on_start` and `on_stop` provide initialization and cleanup. `PluginContext::spawn_task` runs managed background work that can wait for host activation. Each plugin handles its messages one at a time from a bounded inbox; there is no dispatch timeout.
+- Loaded libraries stay mapped until the process exits.
+
+A plugin can call `PluginContext::plugin_data_dir()` to create and obtain its isolated directory under the node state directory. Plugins own the storage engine and all schema, migration, locking, and recovery behavior inside that directory.
 
 Minimal registration pattern inside a plugin crate:
 
 ```rust
-use thenodes::plugin_host::{Plugin, PluginContext, PluginRegistrarApi};
+use thenodes::plugin_host::{NativeRegistrar, PluginRegistrationError};
 
-#[no_mangle]
-pub unsafe extern "C" fn register_plugin(api: *const PluginRegistrarApi) {
-  let api = match PluginRegistrarApi::from_raw(api) {
-    Ok(api) => api,
-    Err(err) => {
-      eprintln!("[example_plugin] invalid registrar API: {err}");
-      return;
-    }
-  };
-
-  if let Err(err) = api.register_plugin(Box::new(MyPlugin::new())) {
-    eprintln!("[example_plugin] failed to register: {err}");
-  }
+fn register(registrar: &mut NativeRegistrar) -> Result<(), PluginRegistrationError> {
+  registrar.register(Box::new(MyPlugin::new()));
+  Ok(())
 }
+
+thenodes::export_plugin!(register);
 ```
 
-`PluginRegistrarApi::register_plugin` returns an error if the host and plugin expose different `PLUGIN_ABI_VERSION` values. The current `PluginHandle` carries a Rust trait object, so this is not yet a stable cross-language or arbitrary-toolchain plugin ABI; use matching TheNodes releases and rebuild plugins with the host.
+The transferred endpoint is a Rust trait object, so this is not a stable cross-language or arbitrary-toolchain plugin ABI: build plugins with the host's source release, toolchain, lockfile, features, and allocator, and rebuild them whenever the host is rebuilt. TheNodes imposes no time limits on plugins; hosts apply their own through shutdown and escalation (see `examples/simple_node.rs` and [ADR-0011](docs/adr/0011-plugin-runtime-and-lifecycle.md)).
 
 See `docs/PLUGIN_AUTHORING.md` for a complete walkthrough of project setup, registration patterns, testing, and distribution tips.
 

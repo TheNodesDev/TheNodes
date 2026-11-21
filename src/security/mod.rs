@@ -1,4 +1,5 @@
 pub mod encryption;
+pub mod node_identity;
 pub mod secure_channel;
 pub mod trust;
 

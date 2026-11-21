@@ -259,7 +259,7 @@ pub async fn connect_with_policy(
             .await
         {
             if let (Some(relay_node_id), Ok(addr)) = (
-                punch_rendezvous_route(peer_manager).await,
+                punch_rendezvous_route(peer_manager, config).await,
                 obs_addr.parse::<SocketAddr>(),
             ) {
                 candidates.push(RouteCandidate {
@@ -275,7 +275,7 @@ pub async fn connect_with_policy(
     }
 
     if !matches!(policy.strategy, ConnectionStrategy::DirectOnly) {
-        candidates.extend(relay_candidates(peer_manager).await);
+        candidates.extend(relay_candidates(peer_manager, config).await);
     }
 
     choose_healthiest_route(peer_manager, candidates)
@@ -323,10 +323,14 @@ async fn udp_candidate(peer_manager: &PeerManager, node_id: &str) -> Option<Rout
     })
 }
 
-async fn relay_candidates(peer_manager: &PeerManager) -> Vec<RouteCandidate> {
+/// Relays this node may use: peers that announce the `relay` capability and
+/// that `[network.relay] allowed_relays` allows.
+async fn relay_candidates(peer_manager: &PeerManager, config: &Config) -> Vec<RouteCandidate> {
     let mut candidates = Vec::new();
     for node_id in peer_manager.list_node_ids().await {
-        if peer_manager.peer_has_capability(&node_id, "relay").await {
+        if config.relay_allowed(&node_id)
+            && peer_manager.peer_has_capability(&node_id, "relay").await
+        {
             candidates.push(RouteCandidate {
                 health_node_id: node_id.clone(),
                 kind: RouteKind::Relay,
@@ -369,12 +373,16 @@ async fn resolve_tcp(peer_manager: &PeerManager, node_id: &str) -> Option<Socket
     addr_str.parse::<SocketAddr>().ok()
 }
 
-async fn punch_rendezvous_route(peer_manager: &PeerManager) -> Option<String> {
+/// The first peer this node may use as rendezvous: it announces the
+/// `punch_rendezvous` capability and `[network.nat_traversal]
+/// allowed_rendezvous` allows it.
+async fn punch_rendezvous_route(peer_manager: &PeerManager, config: &Config) -> Option<String> {
     let node_ids = peer_manager.list_node_ids().await;
     for nid in node_ids {
-        if peer_manager
-            .peer_has_capability(&nid, "punch_rendezvous")
-            .await
+        if config.rendezvous_allowed(&nid)
+            && peer_manager
+                .peer_has_capability(&nid, "punch_rendezvous")
+                .await
         {
             return Some(nid);
         }

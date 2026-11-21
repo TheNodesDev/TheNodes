@@ -25,19 +25,19 @@
       pki/
         own/            # Node's own cert/key
         trusted/        # Trusted peer certs and CRLs
-        rejected/       # Optionally store rejected certs
+        rejected/       # Certs the trust policy rejected, for review and promotion
         issuers/        # CA/issuer certs and CRLs
       ```
       Example config paths:
       ```toml
-      [encryption.paths]
+      [encryption.tls.paths]
       own_certificate  = "pki/own/cert.pem"
       own_private_key  = "pki/own/key.pem"
       trusted_cert_dir = "pki/trusted/certs"
-      trusted_crl_dir  = "pki/trusted/crl"
-      rejected_dir     = "pki/rejected"
       issuer_cert_dir  = "pki/issuers/certs"
-      issuer_crl_dir   = "pki/issuers/crl"
+      # With [encryption.tls.trust_policy] enforce_ca_chain = true:
+      # trusted_crl_dir = "pki/trusted/crl"
+      # issuer_crl_dir  = "pki/issuers/crl"
       ```
     - TheNodes **does not generate or manage certificates**. Use external tools (e.g., `openssl`) to create and manage certs, and place them in the correct subdirectories.
     - Both direct peer validation and CA-based validation chains are supported by the PKI layout.

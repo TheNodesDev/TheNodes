@@ -34,3 +34,21 @@ fn explicit_plaintext_and_tls_remain_available() {
         assert!(make_secure_channel(&config).is_ok(), "{backend}");
     }
 }
+
+/// A config file cannot name an unknown backend; one set in code is an error
+/// rather than another backend.
+#[test]
+fn an_unknown_backend_is_an_error() {
+    let config = Config {
+        encryption: Some(EncryptionConfig {
+            enabled: true,
+            backend: Some("tsl".into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    match make_secure_channel(&config) {
+        Ok(_) => panic!("an unknown backend must not select one"),
+        Err(error) => assert!(error.to_string().contains("tsl"), "{error}"),
+    }
+}

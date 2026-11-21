@@ -1,12 +1,16 @@
 use thenodes::config::ConfigDefaults;
 use thenodes::network::message::{Message, MessageType};
-use thenodes::plugin_host::{Plugin, PluginContext, PluginRegistrarApi};
+use thenodes::plugin_host::{
+    NativeRegistrar, Plugin, PluginContext, PluginError, PluginRegistrationError,
+};
 use thenodes::realms::RealmInfo;
 
 /// {{APP_NAME}} Plugin
 ///
 /// This plugin demonstrates the NEP (Node-Embedded Plugin) pattern.
 /// It is designed to be compiled as a dynamic library and loaded by TheNodes.
+/// Its callbacks run on the library's own runtime; host functionality is
+/// reached through `PluginContext` host services.
 pub struct {{APP_NAME_PASCAL}}Plugin;
 
 impl {{APP_NAME_PASCAL}}Plugin {
@@ -27,11 +31,40 @@ impl Plugin for {{APP_NAME_PASCAL}}Plugin {
         "{{APP_NAME}}"
     }
 
-    /// Handle incoming network messages.
+    /// Finish local initialization before the host activates the node.
+    async fn on_start(&self, ctx: &PluginContext) -> Result<(), PluginError> {
+        let data_dir = ctx.plugin_data_dir().await?;
+        log::info!("{{APP_NAME}} using data directory {}", data_dir.display());
+
+        // Long-running work belongs in a managed task. Sends are allowed only
+        // after activation, so the task waits for it and stops on cancellation.
+        ctx.spawn_task("{{APP_NAME}}-status", |task| async move {
+            if task.activated().await.is_err() {
+                return Ok(());
+            }
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => log::debug!("{{APP_NAME}} is running"),
+                    _ = task.cancelled() => return Ok(()),
+                }
+            }
+        })
+        .map_err(|error| PluginError::new(error.to_string()))?;
+        Ok(())
+    }
+
+    /// Handle incoming network messages, one at a time in admission order.
     async fn on_message(&self, message: &Message, _ctx: &PluginContext) {
         if let MessageType::Extension { kind } = &message.msg_type {
             println!("{{APP_NAME}} received extension message: {kind}");
         }
+    }
+
+    /// Release resources. Also runs after a failed start, so tolerate
+    /// incomplete initialization.
+    async fn on_stop(&self, _ctx: &PluginContext) -> Result<(), PluginError> {
+        Ok(())
     }
 
     /// Receive only the extension kinds handled by this plugin.
@@ -59,19 +92,11 @@ impl Plugin for {{APP_NAME_PASCAL}}Plugin {
     }
 }
 
-/// Plugin registration function required for NEP mode.
-///
-/// # Safety
-///
-/// `api` must be a valid pointer to the host's ABI v3 plugin registrar API and
-/// remain valid for the duration of this call.
-#[no_mangle]
-pub unsafe extern "C" fn register_plugin(api: *const PluginRegistrarApi) {
-    let Ok(api) = PluginRegistrarApi::from_raw(api) else {
-        eprintln!("[{{APP_NAME}}] registrar API pointer was null");
-        return;
-    };
-    if let Err(err) = api.register_plugin(Box::new({{APP_NAME_PASCAL}}Plugin::new())) {
-        eprintln!("[{{APP_NAME}}] failed to register plugin: {err}");
-    }
+/// Register this library's handlers. All handlers of one library share its runtime.
+fn register(registrar: &mut NativeRegistrar) -> Result<(), PluginRegistrationError> {
+    registrar.register(Box::new({{APP_NAME_PASCAL}}Plugin::new()));
+    Ok(())
 }
+
+// Exports `thenodes_plugin_abi_version` and `register_plugin` (plugin ABI 4).
+thenodes::export_plugin!(register);

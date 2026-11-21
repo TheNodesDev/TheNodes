@@ -17,7 +17,7 @@
 //! * `config` – Runtime configuration & plugin-provided defaults.
 //! * `network` – Transport, peer management, discovery, protocol messages.
 //! * `security` – Encryption (TLS optional) & trust policy scaffolding.
-//! * `plugin_host` – Dynamic plugin loading + dispatch context.
+//! * `plugin_host` – Plugin lifecycle, native plugin loading, and managed plugin execution.
 //! * `realms` – RealmInfo definitions for segmentation.
 //! * `events` – Structured logging/events dispatcher.
 //! * `prompt` – Optional interactive prompt integration.

@@ -62,8 +62,7 @@ async fn relay_forward_timeout_when_store_forward_disabled() {
         None,
         None,
     );
-    thenodes::network::relay::handle_forward(&msg, &addr_local(), &pm, true, false, false, true)
-        .await;
+    thenodes::network::relay::handle_forward(&msg, &addr_local(), &pm, true, false, true).await;
     // Since store-forward disabled and target absent, it should not enqueue
     assert!(pm.can_enqueue_store_forward("node-b").await);
 }
@@ -87,8 +86,7 @@ async fn relay_forward_store_forward_queue_preserves_opaque_payload() {
         None,
     );
 
-    thenodes::network::relay::handle_forward(&msg, &addr_local(), &pm, true, true, false, true)
-        .await;
+    thenodes::network::relay::handle_forward(&msg, &addr_local(), &pm, true, true, true).await;
 
     let queue = pm.test_get_queue_for("node-b").await;
     assert_eq!(queue.len(), 1, "expected one queued relay frame");

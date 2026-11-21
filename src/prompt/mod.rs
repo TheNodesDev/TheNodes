@@ -6,7 +6,7 @@ use crate::config::Config;
 use crate::constants::{
     build_timestamp, git_commit, APP_VERSION, ICON_PLACEHOLDER, PROTOCOL_VERSION,
 };
-use crate::plugin_host::{manager::PluginManager, PluginContext};
+use crate::plugin_host::manager::{PluginManager, PromptTarget};
 
 pub async fn run_prompt_mode(plugin_manager: Arc<PluginManager>, config: Config) {
     run_prompt_mode_with_shells(plugin_manager, config, None, false, false, None).await
@@ -47,7 +47,7 @@ pub async fn run_prompt_mode_with_shells(
     error_buffer: Option<Arc<TokioMutex<Vec<String>>>>,
 ) {
     let mut stdout = std::io::stdout();
-    let mut current_plugin: Option<(Arc<dyn crate::plugin_host::Plugin>, PluginContext)> = None;
+    let mut current_plugin: Option<PromptTarget> = None;
     let mut current_prefix: Option<String> = None;
     let mut shell = if dual_shells && start_in_core {
         ShellKind::Core
@@ -94,11 +94,11 @@ pub async fn run_prompt_mode_with_shells(
     let peer_manager = plugin_manager
         .context
         .as_ref()
-        .map(|ctx| ctx.peer_manager.clone());
+        .and_then(|ctx| ctx.peer_manager().cloned());
     let peer_store = plugin_manager
         .context
         .as_ref()
-        .map(|ctx| ctx.peer_store.clone());
+        .and_then(|ctx| ctx.peer_store().cloned());
 
     // Load history from HOME/USERPROFILE if available; fallback to local file
     let hist_path = std::env::var("HOME")
@@ -212,9 +212,9 @@ pub async fn run_prompt_mode_with_shells(
                         },
                         "exit                Leave plugin; at root, confirm + exit app",
                         "quit, /quit         Confirm + exit app",
-                        "trust observed list List observed cert fingerprints",
-                        "trust trusted list  List trusted cert filenames",
-                        "trust promote <fp>  Promote observed fingerprint to trusted",
+                        "trust rejected list List rejected keys (TLS and Noise)",
+                        "trust trusted list  List trusted keys (TLS and Noise)",
+                        "trust promote <fp>  Move a rejected key to trusted",
                         "trust own list      List own cert fingerprints",
                     ];
                     println!("Available commands:");
@@ -295,19 +295,13 @@ pub async fn run_prompt_mode_with_shells(
                     continue;
                 }
                 cmd if cmd.starts_with("trust ") || cmd == "trust" => {
-                    // trust commands: list observed|trusted, promote <fingerprint>
-                    // Resolve dirs from config
-                    let enc = config.encryption.as_ref();
-                    let tp = enc.and_then(|e| e.trust_policy.as_ref());
-                    let paths = enc.and_then(|e| e.paths.as_ref());
-                    let observed_dir = tp
-                        .and_then(|t| t.paths.as_ref())
-                        .and_then(|p| p.observed_dir.as_deref());
-                    let trusted_dir = paths.and_then(|p| p.trusted_cert_dir.as_deref());
+                    // trust commands: list rejected|trusted, promote <fingerprint>
+                    let paths = config.tls().and_then(|t| t.paths.as_ref());
+                    let stores = crate::security::trust::key_stores(&config);
 
                     let parts: Vec<&str> = cmd.split_whitespace().collect();
                     if parts.len() == 1 {
-                        println!("{}Usage:\n      trust observed list\n      trust trusted list\n      trust promote <spki_sha256_fingerprint>\n      trust own list", ICON_PLACEHOLDER);
+                        println!("{}Usage:\n      trust rejected list\n      trust trusted list\n      trust promote <sha256_fingerprint>\n      trust own list", ICON_PLACEHOLDER);
                         continue;
                     }
                     match (
@@ -315,110 +309,93 @@ pub async fn run_prompt_mode_with_shells(
                         parts.get(2).copied(),
                         parts.get(3).copied(),
                     ) {
-                        (Some("observed"), Some("list"), _) => {
-                            if let Some(dir) = observed_dir {
-                                match std::fs::read_dir(dir) {
-                                    Ok(entries) => {
-                                        println!("{}Observed certs in {}:", ICON_PLACEHOLDER, dir);
-                                        let mut count = 0u32;
-                                        for e in entries.flatten() {
-                                            if let Some(name) = e.file_name().to_str() {
-                                                if name.ends_with(".pem") {
-                                                    println!(
-                                                        "{}  {}",
-                                                        ICON_PLACEHOLDER,
-                                                        name.trim_end_matches(".pem")
-                                                    );
-                                                    count += 1;
-                                                }
-                                            }
-                                        }
-                                        if count == 0 {
+                        (Some(which @ ("rejected" | "trusted")), Some("list"), _) => {
+                            let mut configured = false;
+                            for store in &stores {
+                                let dir = if which == "rejected" {
+                                    &store.rejected_dir
+                                } else {
+                                    &store.trusted_dir
+                                };
+                                let Some(dir) = dir else { continue };
+                                configured = true;
+                                match crate::security::trust::list_key_files(dir, store.extension) {
+                                    Ok(names) => {
+                                        println!(
+                                            "{}{} {} keys in {}:",
+                                            ICON_PLACEHOLDER, store.backend, which, dir
+                                        );
+                                        if names.is_empty() {
                                             println!("{}  <none>", ICON_PLACEHOLDER);
                                         }
+                                        for name in names {
+                                            println!("{}  {}", ICON_PLACEHOLDER, name);
+                                        }
                                     }
                                     Err(e) => eprintln!("❌ Failed to read {}: {}", dir, e),
                                 }
-                            } else {
-                                println!("{}observed_dir not configured. Set [encryption.trust_policy.paths].observed_dir", ICON_PLACEHOLDER);
                             }
-                            continue;
-                        }
-                        (Some("trusted"), Some("list"), _) => {
-                            if let Some(dir) = trusted_dir {
-                                match std::fs::read_dir(dir) {
-                                    Ok(entries) => {
-                                        println!("Trusted certs in {}:", dir);
-                                        let mut any = false;
-                                        for e in entries.flatten() {
-                                            if let Some(name) = e.file_name().to_str() {
-                                                if name.ends_with(".pem") {
-                                                    println!("  {}", name);
-                                                    any = true;
-                                                }
-                                            }
-                                        }
-                                        if !any {
-                                            println!("  <none>");
-                                        }
-                                    }
-                                    Err(e) => eprintln!("❌ Failed to read {}: {}", dir, e),
-                                }
-                            } else {
-                                println!("{}trusted_cert_dir not configured. Set [encryption.paths].trusted_cert_dir", ICON_PLACEHOLDER);
+                            if !configured {
+                                println!(
+                                    "{}No {} directory configured. Set it in [encryption.tls.paths] or [encryption.noise.paths]",
+                                    ICON_PLACEHOLDER, which
+                                );
                             }
                             continue;
                         }
                         (Some("promote"), Some(fp), _) => {
-                            if fp.len() < 6 {
-                                eprintln!("❌ Fingerprint looks too short");
-                                continue;
-                            }
-                            if let (Some(obs), Some(tru)) = (observed_dir, trusted_dir) {
-                                match crate::security::trust::promote_observed_to_trusted(
-                                    obs, tru, fp,
-                                ) {
+                            let mut outcome = Ok(None);
+                            for store in &stores {
+                                match crate::security::trust::promote_rejected_to_trusted(store, fp)
+                                {
                                     Ok(true) => {
-                                        println!("✅ Promoted {} to trusted", fp);
-                                        if let (Some(pm), Some(store)) =
-                                            (peer_manager.clone(), peer_store.clone())
-                                        {
-                                            // Spawn reconnects in the background so the prompt
-                                            // remains responsive after a promotion.
-                                            let pm_clone = pm.clone();
-                                            let plugin_manager_clone = plugin_manager.clone();
-                                            let store_clone = store.clone();
-                                            let config_clone = config.clone();
-                                            println!(
-                                                "{}Reconnecting to known peers in background...",
-                                                ICON_PLACEHOLDER
-                                            );
-                                            tokio::spawn(async move {
-                                                pm_clone
-                                                    .reconnect_known_peers(
-                                                        plugin_manager_clone,
-                                                        store_clone,
-                                                        &config_clone,
-                                                    )
-                                                    .await;
-                                            });
-                                        } else {
-                                            println!(
-                                                "{} Peer reconnect skipped (state unavailable).",
-                                                ICON_PLACEHOLDER
-                                            );
-                                        }
+                                        outcome = Ok(Some(store.backend));
+                                        break;
                                     }
-                                    Ok(false) => println!(
-                                        "ℹ️ Nothing to do (missing in observed or already trusted)"
-                                    ),
-                                    Err(e) => eprintln!("❌ Promotion failed: {}", e),
+                                    Ok(false) => {}
+                                    Err(e) => {
+                                        outcome = Err(e);
+                                        break;
+                                    }
                                 }
-                            } else {
-                                println!(
-                                    "{}Both observed_dir and trusted_cert_dir must be configured.",
-                                    ICON_PLACEHOLDER
-                                );
+                            }
+                            match outcome {
+                                Ok(Some(backend)) => {
+                                    println!("✅ Promoted {} to trusted ({})", fp, backend);
+                                    if let (Some(pm), Some(store)) =
+                                        (peer_manager.clone(), peer_store.clone())
+                                    {
+                                        // Spawn reconnects in the background so the prompt
+                                        // remains responsive after a promotion.
+                                        let pm_clone = pm.clone();
+                                        let plugin_manager_clone = plugin_manager.clone();
+                                        let store_clone = store.clone();
+                                        let config_clone = config.clone();
+                                        println!(
+                                            "{}Reconnecting to known peers in background...",
+                                            ICON_PLACEHOLDER
+                                        );
+                                        tokio::spawn(async move {
+                                            pm_clone
+                                                .reconnect_known_peers(
+                                                    plugin_manager_clone,
+                                                    store_clone,
+                                                    &config_clone,
+                                                )
+                                                .await;
+                                        });
+                                    } else {
+                                        println!(
+                                            "{} Peer reconnect skipped (state unavailable).",
+                                            ICON_PLACEHOLDER
+                                        );
+                                    }
+                                }
+                                Ok(None) => println!(
+                                    "ℹ️ Nothing to do ({} is in no rejected directory, or a trusted directory is missing)",
+                                    fp
+                                ),
+                                Err(e) => eprintln!("❌ Promotion failed: {}", e),
                             }
                             continue;
                         }
@@ -497,25 +474,28 @@ pub async fn run_prompt_mode_with_shells(
                                         );
                                     }
                                 } else {
-                                    println!("{}own_certificate path not configured. Set [encryption.paths].own_certificate", ICON_PLACEHOLDER);
+                                    println!("{}own_certificate path not configured. Set [encryption.tls.paths].own_certificate", ICON_PLACEHOLDER);
                                 }
                             } else {
-                                println!("{}encryption.paths not configured.", ICON_PLACEHOLDER);
+                                println!(
+                                    "{}encryption.tls.paths not configured.",
+                                    ICON_PLACEHOLDER
+                                );
                             }
                             continue;
                         }
                         _ => {
-                            println!("{}Usage:\n      trust observed list\n      trust trusted list\n      trust promote <spki_sha256_fingerprint>\n      trust own list", ICON_PLACEHOLDER);
+                            println!("{}Usage:\n      trust rejected list\n      trust trusted list\n      trust promote <sha256_fingerprint>\n      trust own list", ICON_PLACEHOLDER);
                             continue;
                         }
                     }
                 }
                 _ => {}
             }
-            if let Some((plugin, plugin_ctx)) = plugin_manager.get_prompt_plugin(input) {
+            if let Some(target) = plugin_manager.resolve_prompt(input) {
                 println!("{}Entering plugin: {}", ICON_PLACEHOLDER, input);
                 current_prefix = Some(input.to_string());
-                current_plugin = Some((plugin, plugin_ctx));
+                current_plugin = Some(target);
                 if let Some(h) = rl.helper_mut() {
                     h.in_plugin = true;
                 }
@@ -530,10 +510,13 @@ pub async fn run_prompt_mode_with_shells(
             }
         }
 
-        if let Some((ref plugin, ref plugin_ctx)) = current_plugin {
-            match plugin.on_prompt(input, plugin_ctx).await {
-                Some(reply) => println!("{}", reply),
-                None => println!("⚠️ Unhandled input: '{}'", input),
+        if let Some(target) = &current_plugin {
+            // Every call goes through managed admission; a retained selection
+            // cannot invoke a plugin that is stopping or has failed.
+            match plugin_manager.dispatch_prompt(target, input).await {
+                Ok(Some(reply)) => println!("{}", reply),
+                Ok(None) => println!("⚠️ Unhandled input: '{}'", input),
+                Err(error) => println!("⚠️ Plugin '{}' {}", target.plugin_id(), error),
             }
         }
     }
@@ -614,8 +597,8 @@ impl rustyline::completion::Completer for PromptCompleter {
         let parts: Vec<&str> = before.split_whitespace().collect();
         if !self.in_plugin && parts.first().copied() == Some("trust") {
             match parts.get(1).copied().unwrap_or("") {
-                sub if sub.is_empty() || "observed".starts_with(sub) || sub.starts_with("o") => {
-                    let opts = ["observed list"];
+                sub if sub.is_empty() || "rejected".starts_with(sub) || sub.starts_with("r") => {
+                    let opts = ["rejected list"];
                     for o in opts {
                         if o.starts_with(sub) {
                             out.push(rustyline::completion::Pair {
@@ -649,25 +632,22 @@ impl rustyline::completion::Completer for PromptCompleter {
                     }
                     // If user typed 'trust promote <partial>', offer fingerprints
                     if let Some(fp_prefix) = parts.get(2).copied() {
-                        let enc = self.config.encryption.as_ref();
-                        let tp = enc.and_then(|e| e.trust_policy.as_ref());
-                        let observed_dir = tp
-                            .and_then(|t| t.paths.as_ref())
-                            .and_then(|p| p.observed_dir.as_deref());
-                        if let Some(dir) = observed_dir {
-                            if let Ok(entries) = std::fs::read_dir(dir) {
-                                for e in entries.flatten() {
-                                    if let Some(name) = e.file_name().to_str() {
-                                        if name.ends_with(".pem") {
-                                            let fp = name.trim_end_matches(".pem");
-                                            if fp.starts_with(fp_prefix) {
-                                                out.push(rustyline::completion::Pair {
-                                                    display: fp.into(),
-                                                    replacement: fp.into(),
-                                                });
-                                            }
-                                        }
-                                    }
+                        for store in crate::security::trust::key_stores(&self.config) {
+                            let Some(dir) = store.rejected_dir.as_deref() else {
+                                continue;
+                            };
+                            let names =
+                                crate::security::trust::list_key_files(dir, store.extension)
+                                    .unwrap_or_default();
+                            for name in names {
+                                let fp = name
+                                    .strip_suffix(&format!(".{}", store.extension))
+                                    .unwrap_or(&name);
+                                if fp.starts_with(fp_prefix) {
+                                    out.push(rustyline::completion::Pair {
+                                        display: fp.into(),
+                                        replacement: fp.into(),
+                                    });
                                 }
                             }
                         }

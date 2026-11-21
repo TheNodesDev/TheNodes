@@ -32,7 +32,7 @@ cargo build --release
 ## Run
 ```bash
 # Generate dev certificates (optional helper from TheNodes root; adjust path as needed)
-cargo run --bin thenodes-cert -- --realm {{APP_REALM}} --copy-to-trusted
+cargo run --bin thenodes-cert -- --realm-code <realm-code> --node-id <node-id> --copy-to-trusted
 
 # Start the daemon
 ./target/release/{{APP_NAME}} --config config.toml --prompt

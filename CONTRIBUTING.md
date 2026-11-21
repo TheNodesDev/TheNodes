@@ -127,7 +127,8 @@ the naming, structure, and release process in `docs/releases/README.md`.
 ## Testing Guidelines
 - Fast unit tests should live near code or in `tests/`.
 - Multi-node interaction tests: use temporary directories for `state_dir` and distinct ports.
-- Determinism: avoid real-time sleeps where possible; prefer timeouts with generous margins.
+- Determinism: decide outcomes from observed events and notifications, not real-time sleeps. Use timeouts only as hang guards with generous margins.
+- Native plugin tests: `tests/plugin_lifecycle.rs` builds the fixtures in `tests/fixtures/` with the same Cargo, lockfile, profile, and features as the test binary, and runs each native scenario in a child process under a harness watchdog.
 - For discovery logic, sample peer store carefully (avoid flaky random tests by seeding `SmallRng` if necessary).
  
 Run all tests (CI-equivalent):
@@ -137,10 +138,10 @@ cargo test --workspace --all-features -- --nocapture
 
 ## Plugin Development
 1. Use the example at `examples/kvstore_plugin`.
-2. Implement `Plugin` trait methods you need (`on_message`, optionally `on_prompt`).
+2. Implement `Plugin` trait methods you need (`on_message`, optionally `on_start`, `on_stop`, and `on_prompt`) and export native entry points with `thenodes::export_plugin!`.
 3. Provide lightweight extension messages via `MessageType::Extension { kind }` plus JSON payload.
 4. Use `early_config_defaults()` if you want to supply realm / port / config defaults (they only apply if operator did not set them).
-5. Avoid blocking calls—remain async-aware and offload heavy work to tasks.
+5. Avoid blocking calls—remain async-aware and offload long-running work to managed tasks (`PluginContext::spawn_task`). TheNodes imposes no time limits on plugins, so a blocked plugin stalls its own runtime until the host escalates.
 
 See `docs/PLUGIN_AUTHORING.md` for a full walkthrough. At runtime, you can enter a plugin’s prompt by typing its prefix; type `exit` to leave.
 

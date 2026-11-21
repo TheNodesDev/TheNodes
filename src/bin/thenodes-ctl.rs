@@ -32,15 +32,29 @@ enum Commands {
         #[command(subcommand)]
         cmd: CertCmd,
     },
+    /// Node identity bindings ([encryption.node_identity].bindings_file)
+    NodeBinding {
+        #[command(subcommand)]
+        cmd: NodeBindingCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum NodeBindingCmd {
+    /// List persisted TOFU bindings
+    List,
+    /// Forget every binding for a node ID, e.g. after it rotated its key.
+    /// A running node keeps its in-memory bindings until it restarts.
+    Forget { node_id: String },
 }
 
 #[derive(Subcommand, Debug)]
 enum TrustCmd {
-    /// List observed certificate fingerprints (from observed_dir)
-    ObservedList,
-    /// List trusted certificate filenames (from trusted_cert_dir)
+    /// List rejected keys (TLS rejected_dir, Noise rejected_dir)
+    RejectedList,
+    /// List trusted keys (TLS trusted_cert_dir, Noise trusted_dir)
     TrustedList,
-    /// Promote an observed fingerprint to trusted
+    /// Move a rejected key, by fingerprint, into the trusted directory
     Promote { fingerprint: String },
 }
 
@@ -48,7 +62,7 @@ enum TrustCmd {
 enum CertCmd {
     /// Show the SPKI SHA-256 fingerprint of the node's own certificate
     Fingerprint {
-        /// Override certificate path (defaults to [encryption.paths].own_certificate or pki/own/cert.pem)
+        /// Override certificate path (defaults to [encryption.tls.paths].own_certificate or pki/own/cert.pem)
         #[arg(long)]
         cert: Option<PathBuf>,
     },
@@ -56,7 +70,7 @@ enum CertCmd {
 
 fn load_config(path: &PathBuf) -> thenodes::config::Config {
     match std::fs::read_to_string(path) {
-        Ok(content) => match toml::from_str::<thenodes::config::Config>(&content) {
+        Ok(content) => match thenodes::config::Config::from_toml_str(&content) {
             Ok(cfg) => cfg,
             Err(err) => {
                 eprintln!(
@@ -84,31 +98,29 @@ fn main() {
 
     match cli.command {
         Commands::Trust { cmd } => {
-            // Resolve dirs from config
-            let enc = config.encryption.as_ref();
-            let tp = enc.and_then(|e| e.trust_policy.as_ref());
-            let paths = enc.and_then(|e| e.paths.as_ref());
-            let observed_dir = tp
-                .and_then(|t| t.paths.as_ref())
-                .and_then(|p| p.observed_dir.as_deref());
-            let trusted_dir = paths.and_then(|p| p.trusted_cert_dir.as_deref());
-
+            use thenodes::security::trust::{
+                key_stores, list_key_files, promote_rejected_to_trusted,
+            };
+            let stores = key_stores(&config);
             match cmd {
-                TrustCmd::ObservedList => {
-                    if let Some(dir) = observed_dir {
-                        match std::fs::read_dir(dir) {
-                            Ok(entries) => {
-                                let mut count = 0u32;
-                                for e in entries.flatten() {
-                                    if let Some(name) = e.file_name().to_str() {
-                                        if name.ends_with(".pem") {
-                                            println!("{}", name.trim_end_matches(".pem"));
-                                            count += 1;
-                                        }
-                                    }
-                                }
-                                if count == 0 {
-                                    println!("<none>");
+                TrustCmd::RejectedList | TrustCmd::TrustedList => {
+                    let rejected = matches!(cmd, TrustCmd::RejectedList);
+                    let mut configured = false;
+                    for store in &stores {
+                        let dir = if rejected {
+                            &store.rejected_dir
+                        } else {
+                            &store.trusted_dir
+                        };
+                        let Some(dir) = dir else { continue };
+                        configured = true;
+                        match list_key_files(dir, store.extension) {
+                            Ok(names) if names.is_empty() => {
+                                println!("{} <none> ({dir})", store.backend)
+                            }
+                            Ok(names) => {
+                                for name in names {
+                                    println!("{} {name}", store.backend);
                                 }
                             }
                             Err(e) => {
@@ -116,66 +128,87 @@ fn main() {
                                 std::process::exit(1);
                             }
                         }
-                    } else {
-                        eprintln!("observed_dir not configured. Set [encryption.trust_policy.paths].observed_dir in {}", cli.config.display());
-                        std::process::exit(2);
                     }
-                }
-                TrustCmd::TrustedList => {
-                    if let Some(dir) = trusted_dir {
-                        match std::fs::read_dir(dir) {
-                            Ok(entries) => {
-                                let mut any = false;
-                                for e in entries.flatten() {
-                                    if let Some(name) = e.file_name().to_str() {
-                                        if name.ends_with(".pem") {
-                                            println!("{}", name);
-                                            any = true;
-                                        }
-                                    }
-                                }
-                                if !any {
-                                    println!("<none>");
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!("❌ Failed to read {}: {}", dir, e);
-                                std::process::exit(1);
-                            }
-                        }
-                    } else {
-                        eprintln!("trusted_cert_dir not configured. Set [encryption.paths].trusted_cert_dir in {}", cli.config.display());
+                    if !configured {
+                        let (tls, noise) = if rejected {
+                            ("rejected_dir", "rejected_dir")
+                        } else {
+                            ("trusted_cert_dir", "trusted_dir")
+                        };
+                        eprintln!(
+                            "No directory configured. Set [encryption.tls.paths] {tls} or [encryption.noise.paths] {noise} in {}",
+                            cli.config.display()
+                        );
                         std::process::exit(2);
                     }
                 }
                 TrustCmd::Promote { fingerprint } => {
-                    if fingerprint.len() < 6 {
-                        eprintln!("❌ Fingerprint looks too short");
-                        std::process::exit(2);
-                    }
-                    if let (Some(obs), Some(tru)) = (observed_dir, trusted_dir) {
-                        match thenodes::security::trust::promote_observed_to_trusted(
-                            obs,
-                            tru,
-                            &fingerprint,
-                        ) {
+                    let mut promoted = None;
+                    for store in &stores {
+                        match promote_rejected_to_trusted(store, &fingerprint) {
                             Ok(true) => {
-                                println!("Promoted {} to trusted", fingerprint);
+                                promoted = Some(store.backend);
+                                break;
                             }
-                            Ok(false) => {
-                                println!("No-op: missing in observed or already trusted");
-                            }
+                            Ok(false) => {}
                             Err(e) => {
                                 eprintln!("❌ Promotion failed: {}", e);
                                 std::process::exit(1);
                             }
                         }
-                    } else {
-                        eprintln!(
-                            "Both observed_dir and trusted_cert_dir must be configured in {}",
-                            cli.config.display()
-                        );
-                        std::process::exit(2);
+                    }
+                    match promoted {
+                        Some(backend) => println!("Promoted {fingerprint} to trusted ({backend})"),
+                        None => println!(
+                            "No-op: {fingerprint} is in no rejected directory (both rejected and trusted directories must be configured)"
+                        ),
+                    }
+                }
+            }
+        }
+        Commands::NodeBinding { cmd } => {
+            let Some(path) = config
+                .encryption
+                .as_ref()
+                .and_then(|enc| enc.node_identity.as_ref())
+                .and_then(|identity| identity.bindings_file.as_ref())
+                .map(PathBuf::from)
+            else {
+                eprintln!(
+                    "bindings_file not configured. Set [encryption.node_identity].bindings_file in {}",
+                    cli.config.display()
+                );
+                std::process::exit(2);
+            };
+            match cmd {
+                NodeBindingCmd::List => {
+                    match thenodes::security::node_identity::load_bindings_file(&path) {
+                        Ok(bindings) if bindings.is_empty() => println!("<none>"),
+                        Ok(bindings) => {
+                            for binding in bindings {
+                                println!(
+                                    "{} {:?} {}",
+                                    binding.node_id, binding.kind, binding.fingerprint
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("❌ Failed to read {}: {}", path.display(), e);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                NodeBindingCmd::Forget { node_id } => {
+                    match thenodes::security::node_identity::forget_node_bindings(&path, &node_id) {
+                        Ok(0) => println!("No-op: no binding for {}", node_id),
+                        Ok(removed) => println!(
+                            "Forgot {} binding(s) for {}; restart the node to apply",
+                            removed, node_id
+                        ),
+                        Err(e) => {
+                            eprintln!("❌ Failed to update {}: {}", path.display(), e);
+                            std::process::exit(1);
+                        }
                     }
                 }
             }
@@ -183,9 +216,8 @@ fn main() {
         Commands::Cert { cmd } => match cmd {
             CertCmd::Fingerprint { cert } => {
                 let configured_path = config
-                    .encryption
-                    .as_ref()
-                    .and_then(|enc| enc.paths.as_ref())
+                    .tls()
+                    .and_then(|tls| tls.paths.as_ref())
                     .and_then(|paths| paths.own_certificate.as_ref())
                     .map(PathBuf::from);
                 let cert_path = cert

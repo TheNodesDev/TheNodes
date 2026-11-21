@@ -6,9 +6,11 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::config::{Config, DeliveryConfig};
+use crate::events::model::LogLevel;
+use crate::network::events::emit_network_event;
 use crate::network::message::{
     decode_relay_opaque_payload_utf8, encode_relay_opaque_payload, DeliveryMetadata, Message,
-    MessageType, Payload,
+    MessageOrigin, MessageType, Payload,
 };
 use crate::network::peer::Peer;
 use crate::network::peer_manager::PeerManager;
@@ -44,6 +46,12 @@ pub enum DeliveryFailureReason {
     PolicyDenied,
     RetryBudgetExhausted,
     PathLostDuringDelivery,
+    /// The sending plugin or host has not been activated yet.
+    NotReady,
+    /// The host is stopping and no longer accepts plugin sends.
+    Stopping,
+    /// The sending plugin failed or the host no longer exists.
+    Unavailable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,8 +130,26 @@ impl DeliveryOptions {
                 }
             }
         }
+        check_ordering_key_len(self.ordering_key.as_deref())
+    }
+}
 
-        Ok(())
+/// Longest `message_id` a node accepts, in bytes. Generated IDs are 36-byte
+/// UUIDs. Receivers keep IDs for duplicate suppression, so the limit bounds
+/// that state.
+pub const MAX_MESSAGE_ID_LEN: usize = 128;
+
+/// Longest `ordering_key` a node accepts, in bytes. Receivers keep a key for
+/// every ordered scope.
+pub const MAX_ORDERING_KEY_LEN: usize = 256;
+
+pub(crate) fn check_ordering_key_len(ordering_key: Option<&str>) -> Result<(), String> {
+    match ordering_key {
+        Some(key) if key.len() > MAX_ORDERING_KEY_LEN => Err(format!(
+            "ordering_key is {} bytes, at most {MAX_ORDERING_KEY_LEN} are allowed",
+            key.len()
+        )),
+        _ => Ok(()),
     }
 }
 
@@ -184,9 +210,12 @@ impl DeliveryRuntime {
 
     pub async fn deliver_message(
         &self,
-        message: Message,
+        mut message: Message,
         options: DeliveryOptions,
     ) -> DeliveryOutcome {
+        // This node is the origin of everything it delivers; ordering and
+        // relay sequences are keyed on it.
+        message.from.clone_from(&self.local_node_id);
         if options.validate().is_err() {
             return DeliveryOutcome::DeliveryFailed {
                 reason: DeliveryFailureReason::PolicyDenied,
@@ -210,7 +239,7 @@ impl DeliveryRuntime {
         };
 
         self.peer_manager
-            .record_delivery_attempt(&delivery.message_id, delivery.class, deadline)
+            .record_delivery_attempt(&delivery.message_id, delivery.class, &message.to, deadline)
             .await;
 
         let relay_sequence = if matches!(
@@ -336,7 +365,7 @@ impl DeliveryRuntime {
         let result = match route {
             DeliveryRoute::Connected => self
                 .peer_manager
-                .send_to_node_id(&message.to, message.as_json())
+                .send_to_node_id(&message.to, message.clone())
                 .await
                 .map_err(|_| DeliveryOutcome::DeliveryFailed {
                     reason: DeliveryFailureReason::PathLostDuringDelivery,
@@ -344,7 +373,7 @@ impl DeliveryRuntime {
             DeliveryRoute::DirectTcp { addr } => {
                 self.ensure_direct_connection(&message.to, addr).await?;
                 self.peer_manager
-                    .send_to_node_id(&message.to, message.as_json())
+                    .send_to_node_id(&message.to, message.clone())
                     .await
                     .map_err(|_| DeliveryOutcome::DeliveryFailed {
                         reason: DeliveryFailureReason::PathLostDuringDelivery,
@@ -353,7 +382,7 @@ impl DeliveryRuntime {
             DeliveryRoute::Udp => {
                 self.ensure_udp_session(&message.to).await?;
                 self.peer_manager
-                    .send_udp_message_to_node(&message.to, message.as_json().as_bytes())
+                    .send_udp_message_to_node(&message.to, message.clone())
                     .await
                     .map_err(|_| DeliveryOutcome::DeliveryFailed {
                         reason: DeliveryFailureReason::PathLostDuringDelivery,
@@ -551,10 +580,11 @@ impl DeliveryRuntime {
     async fn relay_node_id(&self) -> Option<String> {
         let node_ids = self.peer_manager.list_node_ids().await;
         for node_id in node_ids {
-            if self
-                .peer_manager
-                .peer_has_capability(&node_id, "relay")
-                .await
+            if self.config.relay_allowed(&node_id)
+                && self
+                    .peer_manager
+                    .peer_has_capability(&node_id, "relay")
+                    .await
             {
                 return Some(node_id);
             }
@@ -577,9 +607,7 @@ impl DeliveryRuntime {
         };
         let want_store_forward = !matches!(options.class, DeliveryClass::FireAndForget);
 
-        let bind = Message::new(
-            &message.from,
-            relay_node_id,
+        let bind = Message::outbound(
             MessageType::RelayBind {
                 target: message.to.clone(),
                 want_store_forward: Some(want_store_forward),
@@ -591,26 +619,28 @@ impl DeliveryRuntime {
             message.realm.clone(),
         );
         self.peer_manager
-            .send_to_node_id(relay_node_id, bind.as_json())
+            .send_to_node_id(relay_node_id, bind)
             .await
             .map_err(|_| DeliveryOutcome::DeliveryFailed {
                 reason: DeliveryFailureReason::PathLostDuringDelivery,
             })?;
 
-        let outer = Message::new(
-            &message.from,
-            relay_node_id,
+        // The tunnel carries the message as a frame from this node to its
+        // final destination; the relay hop is addressed by the connection.
+        let outer = Message::outbound(
             MessageType::RelayForward {
                 to: message.to.clone(),
-                from: message.from.clone(),
+                from: self.local_node_id.clone(),
                 sequence: relay_sequence,
-                opaque_payload_b64: encode_relay_opaque_payload(message.as_json()),
+                opaque_payload_b64: encode_relay_opaque_payload(
+                    message.clone().into_frame(&self.local_node_id, &message.to),
+                ),
             },
             None,
             message.realm.clone(),
         );
         self.peer_manager
-            .send_to_node_id(relay_node_id, outer.as_json())
+            .send_to_node_id(relay_node_id, outer)
             .await
             .map_err(|_| DeliveryOutcome::DeliveryFailed {
                 reason: DeliveryFailureReason::PathLostDuringDelivery,
@@ -624,9 +654,26 @@ impl DeliveryRuntime {
         timeout: Duration,
     ) -> Result<(), DeliveryOutcome> {
         let attempt_id = MessageId::generate().as_str().to_string();
-        let coordinate = Message::new(
-            &self.local_node_id,
-            relay_node_id,
+        // Only a PUNCH_GO from this rendezvous for this attempt is followed
+        // (ADR-0015).
+        let agreed = self
+            .peer_manager
+            .expect_punch(
+                &attempt_id,
+                crate::network::peer_manager::ExpectedPunch {
+                    rendezvous_node_id: relay_node_id.to_string(),
+                    initiator_node_id: self.local_node_id.clone(),
+                    responder_node_id: message.to.clone(),
+                    expires_at: Instant::now() + timeout,
+                },
+            )
+            .await;
+        if !agreed {
+            return Err(DeliveryOutcome::DeliveryFailed {
+                reason: DeliveryFailureReason::NoRoute,
+            });
+        }
+        let coordinate = Message::outbound(
             MessageType::PunchCoordinate {
                 attempt_id: attempt_id.clone(),
                 target: message.to.clone(),
@@ -636,7 +683,7 @@ impl DeliveryRuntime {
             message.realm.clone(),
         );
         self.peer_manager
-            .send_to_node_id(relay_node_id, coordinate.as_json())
+            .send_to_node_id(relay_node_id, coordinate)
             .await
             .map_err(|_| DeliveryOutcome::DeliveryFailed {
                 reason: DeliveryFailureReason::PathLostDuringDelivery,
@@ -652,7 +699,7 @@ impl DeliveryRuntime {
             {
                 return self
                     .peer_manager
-                    .send_udp_message_to_node(&message.to, message.as_json().as_bytes())
+                    .send_udp_message_to_node(&message.to, message.clone())
                     .await
                     .map_err(|_| DeliveryOutcome::DeliveryFailed {
                         reason: DeliveryFailureReason::PathLostDuringDelivery,
@@ -674,37 +721,111 @@ pub enum IncomingMessageDisposition {
     Dispatch(Vec<Message>),
 }
 
-pub fn unwrap_tunneled_message(message: &Message, local_node_id: &str) -> Option<Message> {
+/// Application messages: the types plugins act on, and the only types a relay
+/// tunnel may carry to this node. Control-plane messages (HELLO, peer lists,
+/// relay and punch signalling, heartbeats, nested tunnels) are accepted only
+/// from the peer that sends them, never through a relay.
+fn is_application_message(msg_type: &MessageType) -> bool {
+    matches!(
+        msg_type,
+        MessageType::Text(_)
+            | MessageType::DataRequest
+            | MessageType::DataResponse
+            | MessageType::Extension { .. }
+            | MessageType::DeliveryAck { .. }
+    )
+}
+
+/// Attribute a received frame to the peer that delivered it (ADR-0012).
+///
+/// Every frame names the two ends of the connection or session that carried
+/// it: `from` must be `delivered_by.peer` and `to` must be this node. A
+/// `RELAY_FWD` addressed to this node is unwrapped when its payload is a
+/// message: the inner message keeps the origin it claims, is marked with
+/// `relayed_from`, and must be an application message whose `from` and `to`
+/// match the tunnel. A tunnel with an opaque payload is delivered as the
+/// `RELAY_FWD` itself. Returns a rejection reason for frames that break
+/// these rules.
+pub fn attribute_incoming_message(
+    mut message: Message,
+    delivered_by: MessageOrigin,
+    local_node_id: &str,
+) -> Result<Message, &'static str> {
+    if message.from != delivered_by.peer {
+        return Err("sender-mismatch");
+    }
+    if message.to != local_node_id {
+        return Err("destination-mismatch");
+    }
     if let MessageType::RelayForward {
         to,
+        from,
         opaque_payload_b64,
         ..
     } = &message.msg_type
     {
         if to == local_node_id {
-            return decode_relay_opaque_payload_utf8(opaque_payload_b64)
+            let origin = MessageOrigin {
+                relayed_from: Some(from.clone()),
+                ..delivered_by
+            };
+            let inner = decode_relay_opaque_payload_utf8(opaque_payload_b64)
                 .and_then(|inner| Message::from_json(&inner));
+            let Some(mut inner) = inner else {
+                message.set_origin(origin);
+                return Ok(message);
+            };
+            if !is_application_message(&inner.msg_type) {
+                return Err("tunnel-message-type-not-allowed");
+            }
+            if Some(&inner.from) != origin.relayed_from.as_ref() {
+                return Err("tunnel-origin-mismatch");
+            }
+            if inner.to != local_node_id {
+                return Err("tunnel-destination-mismatch");
+            }
+            inner.set_origin(origin);
+            return Ok(inner);
         }
     }
-    None
+    message.set_origin(delivered_by);
+    Ok(message)
 }
 
 pub async fn process_incoming_message(
     peer_manager: &PeerManager,
     local_node_id: &str,
-    // The node_id actually bound to the connection/session this message arrived on
-    // (TCP: `PeerManager::node_id_for_addr`; UDP: the Noise session's verified peer),
-    // as opposed to `message.from`, which is attacker-controlled application payload.
-    // `None` for paths that cannot establish a verified identity (e.g. handshake-only).
-    verified_sender: Option<&str>,
+    // The node bound to the connection or session this frame arrived on (TCP:
+    // `PeerManager::origin_for_addr`; UDP: the Noise session's node). The
+    // frame's own `from` must name the same node.
+    delivered_by: MessageOrigin,
     message: Message,
 ) -> IncomingMessageDisposition {
+    let delivering_peer = delivered_by.peer.clone();
+    let message = match attribute_incoming_message(message, delivered_by, local_node_id) {
+        Ok(message) => message,
+        Err(reason) => {
+            emit_network_event(
+                "delivery",
+                LogLevel::Warn,
+                "message_rejected",
+                None,
+                Some(format!("peer={delivering_peer} reason={reason}")),
+                false,
+            );
+            return IncomingMessageDisposition::Consumed;
+        }
+    };
+    let Some(origin) = message.origin().cloned() else {
+        return IncomingMessageDisposition::Consumed;
+    };
+
     // Only credit liveness/health for the connection that actually delivered the
-    // message. Trusting `message.from` unconditionally would let any connected peer
-    // (or a multi-hop relayed message) spoof another peer's `from` field and keep that
-    // peer's liveness deadline refreshed indefinitely, masking a real disconnect and
-    // defeating the ADR-0007 liveness monitor.
-    let sender_verified = verified_sender == Some(message.from.as_str());
+    // message. Trusting a relayed origin would let any connected peer (or a
+    // multi-hop relayed message) keep another peer's liveness deadline refreshed
+    // indefinitely, masking a real disconnect and defeating the ADR-0007
+    // liveness monitor.
+    let sender_verified = origin.relayed_from.is_none();
     if sender_verified {
         peer_manager
             .record_peer_activity_on_preferred_route(&message.from)
@@ -715,24 +836,20 @@ pub async fn process_incoming_message(
         match &message.payload {
             Some(Payload::Text(kind)) if kind == "liveness_probe_v1" => {
                 if sender_verified {
-                    let response = Message::new(
-                        local_node_id,
-                        &message.from,
+                    let response = Message::outbound(
                         MessageType::Heartbeat,
                         Some(Payload::Text("liveness_response_v1".to_string())),
                         message.realm.clone(),
                     );
                     if peer_manager.has_node_id(&message.from).await {
-                        let _ = peer_manager
-                            .send_to_node_id(&message.from, response.as_json())
-                            .await;
+                        let _ = peer_manager.send_to_node_id(&message.from, response).await;
                     } else if peer_manager
                         .udp_session_id_for(&message.from)
                         .await
                         .is_some()
                     {
                         let _ = peer_manager
-                            .send_udp_message_to_node(&message.from, response.as_json().as_bytes())
+                            .send_udp_message_to_node(&message.from, response)
                             .await;
                     }
                 }
@@ -746,10 +863,27 @@ pub async fn process_incoming_message(
     }
 
     if let MessageType::DeliveryAck { message_id, .. } = &message.msg_type {
+        // `from` is the delivering peer, or for a tunnel the origin the relay
+        // accepted from its own peer.
         let message_id = MessageId::from(message_id.clone());
-        peer_manager
-            .set_delivery_outcome(&message_id, DeliveryOutcome::AcknowledgedByPeer)
-            .await;
+        if let Err(reason @ "not-destination") = peer_manager
+            .acknowledge_delivery(&message_id, &message.from)
+            .await
+        {
+            emit_network_event(
+                "delivery",
+                LogLevel::Warn,
+                "delivery_ack_rejected",
+                None,
+                Some(format!(
+                    "peer={} acked_by={} message_id={} reason={reason}",
+                    origin.peer,
+                    message.from,
+                    message_id.as_str()
+                )),
+                false,
+            );
+        }
         return IncomingMessageDisposition::Consumed;
     }
 
@@ -765,18 +899,17 @@ pub async fn process_incoming_message(
     peer_manager.prune_delivery_dedup(dedup_window).await;
     peer_manager.prune_ordered_inbound(dedup_window).await;
 
-    let is_new = peer_manager
-        .record_delivery_receipt(&message.from, &delivery.message_id)
-        .await;
-    let ack_status = if is_new { "ok" } else { "duplicate" };
-    let _ = send_framework_ack(peer_manager, local_node_id, &message, ack_status).await;
-
-    if !is_new {
+    if peer_manager
+        .delivery_seen(&message.from, &delivery.message_id)
+        .await
+    {
+        let _ = send_framework_ack(peer_manager, local_node_id, &message, "duplicate").await;
         return IncomingMessageDisposition::Consumed;
     }
 
-    match delivery.class {
-        DeliveryClass::Reliable => IncomingMessageDisposition::Dispatch(vec![message]),
+    // A message is acknowledged only once this node has taken it: an ordered
+    // message that cannot be buffered is left for its sender to retry.
+    let ordered_ready = match delivery.class {
         DeliveryClass::OrderedReliable => {
             let Some(ordering_key) = delivery.ordering_key.clone() else {
                 return IncomingMessageDisposition::Consumed;
@@ -784,26 +917,45 @@ pub async fn process_incoming_message(
             let Some(ordering_sequence) = delivery.ordering_sequence else {
                 return IncomingMessageDisposition::Consumed;
             };
-            let origin_node_id = message.from.clone();
-            let destination_node_id = message.to.clone();
-
-            let ready = peer_manager
+            match peer_manager
                 .accept_ordered_incoming(
-                    &origin_node_id,
-                    &destination_node_id,
+                    &message.from,
+                    &message.to,
                     &ordering_key,
                     ordering_sequence,
-                    message,
+                    message.clone(),
                     peer_manager.delivery_ordered_buffer_limit(),
                 )
-                .await;
-            if ready.is_empty() {
-                IncomingMessageDisposition::Consumed
-            } else {
-                IncomingMessageDisposition::Dispatch(ready)
+                .await
+            {
+                Ok(ready) => Some(ready),
+                Err(reason) => {
+                    emit_network_event(
+                        "delivery",
+                        LogLevel::Warn,
+                        "ordered_delivery_deferred",
+                        None,
+                        Some(format!(
+                            "origin={} ordering_key={} sequence={} reason={reason}",
+                            message.from, ordering_key, ordering_sequence
+                        )),
+                        false,
+                    );
+                    return IncomingMessageDisposition::Consumed;
+                }
             }
         }
-        DeliveryClass::FireAndForget => IncomingMessageDisposition::Dispatch(vec![message]),
+        DeliveryClass::Reliable | DeliveryClass::FireAndForget => None,
+    };
+
+    peer_manager
+        .record_delivery_receipt(&message.from, &delivery.message_id)
+        .await;
+    let _ = send_framework_ack(peer_manager, local_node_id, &message, "ok").await;
+    match ordered_ready {
+        Some(ready) if ready.is_empty() => IncomingMessageDisposition::Consumed,
+        Some(ready) => IncomingMessageDisposition::Dispatch(ready),
+        None => IncomingMessageDisposition::Dispatch(vec![message]),
     }
 }
 
@@ -829,38 +981,15 @@ async fn send_framework_ack(
         original_message.realm.clone(),
     );
 
-    if peer_manager.has_node_id(&original_message.from).await {
-        return peer_manager
-            .send_to_node_id(&original_message.from, ack.as_json())
-            .await;
-    }
-
-    if peer_manager
-        .udp_session_id_for(&original_message.from)
-        .await
-        .is_some()
+    // Answer along the path the message took: a tunneled message through the
+    // relay that delivered it, a direct one to the peer itself. A sender this
+    // node cannot reach that way gets no acknowledgement.
+    if let Some(relay_node_id) = original_message
+        .origin()
+        .filter(|origin| origin.relayed_from.is_some())
+        .map(|origin| origin.peer.clone())
     {
-        return peer_manager
-            .send_udp_message_to_node(&original_message.from, ack.as_json().as_bytes())
-            .await;
-    }
-
-    let relay_node_id = {
-        let node_ids = peer_manager.list_node_ids().await;
-        let mut relay = None;
-        for node_id in node_ids {
-            if peer_manager.peer_has_capability(&node_id, "relay").await {
-                relay = Some(node_id);
-                break;
-            }
-        }
-        relay
-    };
-
-    if let Some(relay_node_id) = relay_node_id {
-        let bind = Message::new(
-            local_node_id,
-            &relay_node_id,
+        let bind = Message::outbound(
             MessageType::RelayBind {
                 target: original_message.from.clone(),
                 want_store_forward: Some(false),
@@ -871,13 +1000,9 @@ async fn send_framework_ack(
             None,
             original_message.realm.clone(),
         );
-        peer_manager
-            .send_to_node_id(&relay_node_id, bind.as_json())
-            .await?;
+        peer_manager.send_to_node_id(&relay_node_id, bind).await?;
 
-        let outer = Message::new(
-            local_node_id,
-            &relay_node_id,
+        let outer = Message::outbound(
             MessageType::RelayForward {
                 to: original_message.from.clone(),
                 from: local_node_id.to_string(),
@@ -891,8 +1016,22 @@ async fn send_framework_ack(
             None,
             original_message.realm.clone(),
         );
+        return peer_manager.send_to_node_id(&relay_node_id, outer).await;
+    }
+
+    if peer_manager.has_node_id(&original_message.from).await {
         return peer_manager
-            .send_to_node_id(&relay_node_id, outer.as_json())
+            .send_to_node_id(&original_message.from, ack)
+            .await;
+    }
+
+    if peer_manager
+        .udp_session_id_for(&original_message.from)
+        .await
+        .is_some()
+    {
+        return peer_manager
+            .send_udp_message_to_node(&original_message.from, ack)
             .await;
     }
 
@@ -987,17 +1126,146 @@ enum DeliveryRoute {
 #[cfg(test)]
 mod tests {
     use super::{
-        process_incoming_message, DeliveryClass, DeliveryOptions, DeliveryOutcome,
-        DeliveryPathConstraints, DeliveryRuntime, DeliveryTransportPreference,
+        attribute_incoming_message, process_incoming_message, DeliveryClass, DeliveryOptions,
+        DeliveryOutcome, DeliveryPathConstraints, DeliveryRuntime, DeliveryTransportPreference,
         IncomingMessageDisposition, MessageId,
     };
     use crate::config::{Config, DeliveryConfig};
     use crate::network::message::{
-        decode_relay_opaque_payload_utf8, DeliveryMetadata, Message, MessageType,
+        decode_relay_opaque_payload_utf8, encode_relay_opaque_payload, DeliveryMetadata, Message,
+        MessageOrigin, MessageType,
     };
     use crate::network::peer_manager::PeerManager;
     use crate::plugin_host::manager::PluginManager;
     use std::sync::Arc;
+
+    fn direct(peer: &str) -> MessageOrigin {
+        MessageOrigin::direct(peer, None)
+    }
+
+    fn tunnel(relay_from: &str, inner: &Message) -> Message {
+        Message::new(
+            "relay-1",
+            "node-b",
+            MessageType::RelayForward {
+                to: "node-b".into(),
+                from: relay_from.into(),
+                sequence: None,
+                opaque_payload_b64: encode_relay_opaque_payload(inner.as_json()),
+            },
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn direct_message_must_name_both_ends_of_the_connection() {
+        let text = |from: &str, to: &str| {
+            Message::new(from, to, MessageType::Text("x".into()), None, None)
+        };
+        let delivered_by = MessageOrigin::direct("node-a", Some("ab".repeat(32)));
+        let message =
+            attribute_incoming_message(text("node-a", "node-b"), delivered_by.clone(), "node-b")
+                .unwrap();
+        assert_eq!(message.origin(), Some(&delivered_by));
+        assert_eq!(
+            message.origin().unwrap().authenticated_sender(),
+            Some("node-a")
+        );
+        // Without a bound transport identity nobody is authenticated.
+        let unbound = attribute_incoming_message(message, direct("node-a"), "node-b").unwrap();
+        assert_eq!(unbound.origin().unwrap().authenticated_sender(), None);
+
+        for (frame, reason) in [
+            (text("admin", "node-b"), "sender-mismatch"),
+            (text("node-a", "node-c"), "destination-mismatch"),
+            (text("node-a", ""), "destination-mismatch"),
+        ] {
+            assert_eq!(
+                attribute_incoming_message(frame, delivered_by.clone(), "node-b").unwrap_err(),
+                reason
+            );
+        }
+    }
+
+    #[test]
+    fn tunnel_delivers_application_messages_marked_as_relayed() {
+        let inner = Message::new("ceo", "node-b", MessageType::Text("hi".into()), None, None);
+        let message = attribute_incoming_message(
+            tunnel("ceo", &inner),
+            MessageOrigin::direct("relay-1", Some("cd".repeat(32))),
+            "node-b",
+        )
+        .unwrap();
+        assert!(matches!(message.msg_type, MessageType::Text(ref text) if text == "hi"));
+        assert_eq!(message.from, "ceo");
+        let origin = message.origin().unwrap();
+        assert_eq!(origin.peer, "relay-1");
+        assert_eq!(origin.relayed_from.as_deref(), Some("ceo"));
+        assert_eq!(origin.authenticated_sender(), None);
+    }
+
+    #[test]
+    fn tunnel_rejects_control_messages_nesting_and_mismatches() {
+        let peer_list = Message::new(
+            "ceo",
+            "node-b",
+            MessageType::PeerList {
+                peers: vec!["10.0.0.5:22".into()],
+            },
+            None,
+            None,
+        );
+        let mut nested = tunnel(
+            "ceo",
+            &Message::new("ceo", "node-b", MessageType::Text("x".into()), None, None),
+        );
+        nested.from = "ceo".into();
+        for (frame, reason) in [
+            (tunnel("ceo", &peer_list), "tunnel-message-type-not-allowed"),
+            (tunnel("ceo", &nested), "tunnel-message-type-not-allowed"),
+            (
+                tunnel(
+                    "someone-else",
+                    &Message::new("ceo", "node-b", MessageType::Text("x".into()), None, None),
+                ),
+                "tunnel-origin-mismatch",
+            ),
+            (
+                tunnel(
+                    "ceo",
+                    &Message::new("ceo", "node-c", MessageType::Text("x".into()), None, None),
+                ),
+                "tunnel-destination-mismatch",
+            ),
+        ] {
+            assert_eq!(
+                attribute_incoming_message(frame, direct("relay-1"), "node-b").unwrap_err(),
+                reason
+            );
+        }
+    }
+
+    #[test]
+    fn tunnel_with_opaque_payload_is_delivered_as_relay_frame() {
+        let mut frame = tunnel(
+            "ceo",
+            &Message::new("ceo", "node-b", MessageType::Text("x".into()), None, None),
+        );
+        if let MessageType::RelayForward {
+            opaque_payload_b64, ..
+        } = &mut frame.msg_type
+        {
+            *opaque_payload_b64 = encode_relay_opaque_payload(b"raw bytes");
+        }
+        let message = attribute_incoming_message(frame, direct("relay-1"), "node-b").unwrap();
+        assert!(matches!(message.msg_type, MessageType::RelayForward { .. }));
+        assert_eq!(message.from, "relay-1");
+        assert_eq!(
+            message.origin().unwrap().relayed_from.as_deref(),
+            Some("ceo")
+        );
+    }
 
     #[test]
     fn ordered_reliable_validation_requires_ordering_key() {
@@ -1029,10 +1297,10 @@ mod tests {
             .expect("valid delivery metadata");
 
         let first =
-            process_incoming_message(&peer_manager, "node-b", Some("node-a"), message.clone())
+            process_incoming_message(&peer_manager, "node-b", direct("node-a"), message.clone())
                 .await;
         let second =
-            process_incoming_message(&peer_manager, "node-b", Some("node-a"), message).await;
+            process_incoming_message(&peer_manager, "node-b", direct("node-a"), message).await;
 
         assert!(matches!(first, IncomingMessageDisposition::Dispatch(_)));
         assert!(matches!(second, IncomingMessageDisposition::Consumed));
@@ -1063,9 +1331,9 @@ mod tests {
         .expect("valid ordered metadata");
 
         let buffered =
-            process_incoming_message(&peer_manager, "node-b", Some("node-a"), second).await;
+            process_incoming_message(&peer_manager, "node-b", direct("node-a"), second).await;
         let released =
-            process_incoming_message(&peer_manager, "node-b", Some("node-a"), first).await;
+            process_incoming_message(&peer_manager, "node-b", direct("node-a"), first).await;
 
         assert!(matches!(buffered, IncomingMessageDisposition::Consumed));
         match released {
@@ -1086,7 +1354,7 @@ mod tests {
             None,
             false,
         );
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(4);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Message>(4);
         let addr: std::net::SocketAddr = "127.0.0.1:9001".parse().unwrap();
         peer_manager
             .add_peer(addr, tx, "node-b".to_string())
@@ -1095,8 +1363,7 @@ mod tests {
 
         let pm_for_ack = peer_manager.clone();
         tokio::spawn(async move {
-            if let Some(json) = rx.recv().await {
-                let outbound = Message::from_json(&json).expect("valid message");
+            if let Some(outbound) = rx.recv().await {
                 let message_id = outbound
                     .delivery
                     .as_ref()
@@ -1125,6 +1392,180 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delivery_ack_counts_only_from_the_destination() {
+        let peer_manager = PeerManager::new();
+        let runtime = DeliveryRuntime::new(
+            peer_manager.clone(),
+            Arc::new(PluginManager::new()),
+            Config::default(),
+            "node-a".to_string(),
+            None,
+            false,
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Message>(4);
+        let addr: std::net::SocketAddr = "127.0.0.1:9002".parse().unwrap();
+        peer_manager
+            .add_peer(addr, tx, "node-b".to_string())
+            .await
+            .expect("peer should register");
+
+        let pm_for_ack = peer_manager.clone();
+        let acks = tokio::spawn(async move {
+            let outbound = rx.recv().await.expect("message sent to node-b");
+            let message_id = outbound.delivery.as_ref().unwrap().message_id.clone();
+            let ack = |from: &str| {
+                Message::new(
+                    from,
+                    "node-a",
+                    MessageType::DeliveryAck {
+                        message_id: message_id.as_str().to_string(),
+                        status: Some("ok".into()),
+                    },
+                    None,
+                    None,
+                )
+            };
+            process_incoming_message(&pm_for_ack, "node-a", direct("node-c"), ack("node-c")).await;
+            let after_foreign_ack = pm_for_ack.delivery_outcome(&message_id).await;
+            process_incoming_message(&pm_for_ack, "node-a", direct("node-b"), ack("node-b")).await;
+            (outbound.from, after_foreign_ack)
+        });
+
+        let outcome = runtime
+            .deliver_message(
+                Message::new(
+                    "someone-else",
+                    "node-b",
+                    MessageType::Text("hi".into()),
+                    None,
+                    None,
+                ),
+                DeliveryOptions::new(DeliveryClass::Reliable),
+            )
+            .await;
+
+        let (sent_from, after_foreign_ack) = acks.await.unwrap();
+        // The runtime sends as this node, whatever `from` the caller wrote.
+        assert_eq!(sent_from, "node-a");
+        assert_ne!(after_foreign_ack, Some(DeliveryOutcome::AcknowledgedByPeer));
+        assert_eq!(outcome, DeliveryOutcome::AcknowledgedByPeer);
+    }
+
+    #[tokio::test]
+    async fn tunneled_message_is_acknowledged_through_the_delivering_relay() {
+        let peer_manager = PeerManager::new();
+        let (delivering_tx, mut delivering_rx) = tokio::sync::mpsc::channel::<Message>(4);
+        let (other_tx, mut other_rx) = tokio::sync::mpsc::channel::<Message>(4);
+        peer_manager
+            .add_peer(
+                "127.0.0.1:9020".parse().unwrap(),
+                delivering_tx,
+                "relay-2".to_string(),
+            )
+            .await
+            .unwrap();
+        peer_manager
+            .add_peer(
+                "127.0.0.1:9021".parse().unwrap(),
+                other_tx,
+                "relay-1".to_string(),
+            )
+            .await
+            .unwrap();
+        // The first relay this node knows is not the one that delivered.
+        peer_manager
+            .set_peer_capabilities("relay-1", Some(vec!["relay".to_string()]))
+            .await;
+
+        let inner = Message::new(
+            "node-a",
+            "node-b",
+            MessageType::Text("hi".into()),
+            None,
+            None,
+        )
+        .with_delivery(DeliveryMetadata::new(DeliveryClass::Reliable))
+        .unwrap();
+        let frame = Message::new(
+            "relay-2",
+            "node-b",
+            MessageType::RelayForward {
+                to: "node-b".into(),
+                from: "node-a".into(),
+                sequence: None,
+                opaque_payload_b64: encode_relay_opaque_payload(inner.as_json()),
+            },
+            None,
+            None,
+        );
+        let disposition =
+            process_incoming_message(&peer_manager, "node-b", direct("relay-2"), frame).await;
+        assert!(matches!(
+            disposition,
+            IncomingMessageDisposition::Dispatch(ref messages) if messages.len() == 1
+        ));
+
+        let bind = delivering_rx
+            .try_recv()
+            .expect("bind sent to the delivering relay");
+        assert!(matches!(
+            bind.msg_type,
+            MessageType::RelayBind { ref target, .. } if target == "node-a"
+        ));
+        let forward = delivering_rx
+            .try_recv()
+            .expect("ack tunneled through the delivering relay");
+        assert!(matches!(
+            forward.msg_type,
+            MessageType::RelayForward { ref to, .. } if to == "node-a"
+        ));
+        assert!(other_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn ordered_message_that_cannot_be_buffered_is_not_acknowledged() {
+        let peer_manager = PeerManager::new();
+        peer_manager.set_delivery_config(Some(DeliveryConfig {
+            ordered_max_buffered_messages: Some(1),
+            ..DeliveryConfig::default()
+        }));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Message>(4);
+        peer_manager
+            .add_peer("127.0.0.1:9030".parse().unwrap(), tx, "node-a".to_string())
+            .await
+            .unwrap();
+        let ordered = |sequence| {
+            Message::new(
+                "node-a",
+                "node-b",
+                MessageType::Text("x".into()),
+                None,
+                None,
+            )
+            .with_delivery(
+                DeliveryMetadata::new(DeliveryClass::OrderedReliable)
+                    .with_ordering_key("lane")
+                    .with_ordering_sequence(sequence),
+            )
+            .unwrap()
+        };
+        // Sequence 2 waits for 1 and is acknowledged; 3 does not fit.
+        for sequence in [2, 3] {
+            let disposition = process_incoming_message(
+                &peer_manager,
+                "node-b",
+                direct("node-a"),
+                ordered(sequence),
+            )
+            .await;
+            assert!(matches!(disposition, IncomingMessageDisposition::Consumed));
+        }
+        let acks: Vec<Message> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(acks.len(), 1);
+        assert!(matches!(acks[0].msg_type, MessageType::DeliveryAck { .. }));
+    }
+
+    #[tokio::test]
     async fn reliable_delivery_via_relay_acknowledges() {
         let peer_manager = PeerManager::new();
         let plugin_manager = Arc::new(PluginManager::new());
@@ -1136,7 +1577,7 @@ mod tests {
             None,
             false,
         );
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(8);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Message>(8);
         let addr: std::net::SocketAddr = "127.0.0.1:9010".parse().unwrap();
         peer_manager
             .add_peer(addr, tx, "relay-1".to_string())
@@ -1148,8 +1589,7 @@ mod tests {
 
         let pm_for_ack = peer_manager.clone();
         tokio::spawn(async move {
-            while let Some(json) = rx.recv().await {
-                let outbound = Message::from_json(&json).expect("valid relay frame");
+            while let Some(outbound) = rx.recv().await {
                 if let MessageType::RelayForward {
                     opaque_payload_b64, ..
                 } = &outbound.msg_type
@@ -1250,14 +1690,58 @@ mod tests {
             )
             .expect("valid ordered metadata");
 
-        let _ = process_incoming_message(&peer_manager, "node-b", Some("node-a"), third).await;
-        let _ = process_incoming_message(&peer_manager, "node-b", Some("node-a"), second).await;
+        let _ = process_incoming_message(&peer_manager, "node-b", direct("node-a"), third).await;
+        let _ = process_incoming_message(&peer_manager, "node-b", direct("node-a"), second).await;
         let released =
-            process_incoming_message(&peer_manager, "node-b", Some("node-a"), first).await;
+            process_incoming_message(&peer_manager, "node-b", direct("node-a"), first).await;
 
         match released {
             IncomingMessageDisposition::Dispatch(messages) => assert_eq!(messages.len(), 1),
             IncomingMessageDisposition::Consumed => panic!("expected buffered ordered release"),
         }
+    }
+
+    /// The relay used to be the first peer that announced `relay`; with
+    /// `[network.relay] allowed_relays` set, only the peers it names are used.
+    #[tokio::test]
+    async fn only_allowed_relays_carry_messages() {
+        let peer_manager = PeerManager::new();
+        let mut receivers = Vec::new();
+        for (port, node_id) in [(9030, "relay-a"), (9031, "relay-b")] {
+            let (tx, rx) = tokio::sync::mpsc::channel::<Message>(1);
+            receivers.push(rx);
+            let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            peer_manager
+                .add_peer(addr, tx, node_id.to_string())
+                .await
+                .unwrap();
+            peer_manager
+                .set_peer_capabilities(node_id, Some(vec!["relay".to_string()]))
+                .await;
+        }
+        let relay_for = |allowed: Option<Vec<String>>| {
+            let mut config = Config::default();
+            config.network.as_mut().unwrap().relay = Some(crate::config::RelayConfig {
+                allowed_relays: allowed,
+                ..Default::default()
+            });
+            let runtime = DeliveryRuntime::new(
+                peer_manager.clone(),
+                Arc::new(PluginManager::new()),
+                config,
+                "node-a".to_string(),
+                None,
+                false,
+            );
+            async move { runtime.relay_node_id().await }
+        };
+
+        assert!(relay_for(None).await.is_some());
+        assert_eq!(
+            relay_for(Some(vec!["relay-b".into()])).await.as_deref(),
+            Some("relay-b")
+        );
+        assert_eq!(relay_for(Some(vec!["relay-c".into()])).await, None);
+        assert_eq!(relay_for(Some(Vec::new())).await, None);
     }
 }

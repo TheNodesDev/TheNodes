@@ -28,3 +28,9 @@ log = "0.4"
 
 # Utilities
 uuid = { version = "1.10", features = ["v4"] }
+
+# Native plugins must be built with the same TheNodes features as their host.
+# Forward the host's feature set when building, for example `--features noise`.
+[features]
+noise = ["thenodes/noise"]
+upnp = ["thenodes/upnp"]

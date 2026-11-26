@@ -1,6 +1,8 @@
 // src/network/message.rs
 
-use crate::network::delivery::{DeliveryClass, MessageId};
+use crate::network::delivery::{
+    check_ordering_key_len, DeliveryClass, MessageId, MAX_MESSAGE_ID_LEN,
+};
 use crate::realms::RealmInfo;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
@@ -223,8 +225,50 @@ impl DeliveryMetadata {
                 }
             }
         }
+        if self.message_id.as_str().len() > MAX_MESSAGE_ID_LEN {
+            return Err(format!(
+                "message_id is {} bytes, at most {MAX_MESSAGE_ID_LEN} are allowed",
+                self.message_id.as_str().len()
+            ));
+        }
+        check_ordering_key_len(self.ordering_key.as_deref())
+    }
+}
 
-        Ok(())
+/// Who delivered a received message, as established by the host rather than
+/// by the message's own fields (ADR-0012).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageOrigin {
+    /// Node bound to the TCP connection or UDP session that delivered the
+    /// frame. A frame whose `from` differs is dropped before dispatch, so for a
+    /// direct message `Message::from` equals this value.
+    pub peer: String,
+    /// SHA-256 fingerprint of the TLS certificate key or Noise static key
+    /// bound to `peer` by node identity binding. `None` when the connection
+    /// carried no transport identity or binding is off.
+    pub peer_fingerprint: Option<String>,
+    /// For a message unwrapped from a relay tunnel: the origin node it names.
+    /// Relays do not authenticate origins end to end, so this value and
+    /// `Message::from` are claims made by whoever sent the frame to the relay.
+    pub relayed_from: Option<String>,
+}
+
+impl MessageOrigin {
+    pub fn direct(peer: impl Into<String>, peer_fingerprint: Option<String>) -> Self {
+        Self {
+            peer: peer.into(),
+            peer_fingerprint,
+            relayed_from: None,
+        }
+    }
+
+    /// The sender a plugin can rely on: the delivering peer of a direct
+    /// message whose node ID is bound to a transport identity.
+    pub fn authenticated_sender(&self) -> Option<&str> {
+        match (&self.relayed_from, &self.peer_fingerprint) {
+            (None, Some(_)) => Some(&self.peer),
+            _ => None,
+        }
     }
 }
 
@@ -237,6 +281,9 @@ pub struct Message {
     pub realm: Option<RealmInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivery: Option<DeliveryMetadata>,
+    /// Set by the host on receipt; never read from or written to the wire.
+    #[serde(skip)]
+    origin: Option<MessageOrigin>,
 }
 
 impl Message {
@@ -254,7 +301,37 @@ impl Message {
             payload,
             realm,
             delivery: None,
+            origin: None,
         }
+    }
+
+    /// A message for the transport to address. `from` and `to` are left empty:
+    /// every frame sent to a peer is stamped with the sending node and that
+    /// peer when it is written (ADR-0012).
+    pub fn outbound(
+        msg_type: MessageType,
+        payload: Option<Payload>,
+        realm: Option<RealmInfo>,
+    ) -> Self {
+        Self::new("", "", msg_type, payload, realm)
+    }
+
+    /// Serialize as a frame from node `from` to node `to`, the two ends of the
+    /// connection or UDP session that carries it.
+    pub(crate) fn into_frame(mut self, from: &str, to: &str) -> String {
+        from.clone_into(&mut self.from);
+        to.clone_into(&mut self.to);
+        self.as_json()
+    }
+
+    /// Who delivered this message: set on messages received from the network,
+    /// `None` on messages built locally.
+    pub fn origin(&self) -> Option<&MessageOrigin> {
+        self.origin.as_ref()
+    }
+
+    pub(crate) fn set_origin(&mut self, origin: MessageOrigin) {
+        self.origin = Some(origin);
     }
 
     pub fn with_delivery(mut self, delivery: DeliveryMetadata) -> Result<Self, String> {
@@ -456,5 +533,24 @@ mod tests {
         .as_json();
 
         assert!(Message::from_json(&encoded).is_none());
+    }
+
+    #[test]
+    fn received_delivery_metadata_is_bounded() {
+        use crate::network::delivery::{MAX_MESSAGE_ID_LEN, MAX_ORDERING_KEY_LEN};
+
+        let ordered = |id_len: usize, key_len: usize| {
+            let mut delivery = DeliveryMetadata::new(DeliveryClass::OrderedReliable)
+                .with_ordering_key("k".repeat(key_len))
+                .with_ordering_sequence(1);
+            delivery.message_id = "m".repeat(id_len).into();
+            // Built as a peer would send it, without local validation.
+            let mut message = Message::new("from", "to", MessageType::Heartbeat, None, None);
+            message.delivery = Some(delivery);
+            Message::from_json(&message.as_json())
+        };
+        assert!(ordered(MAX_MESSAGE_ID_LEN, MAX_ORDERING_KEY_LEN).is_some());
+        assert!(ordered(MAX_MESSAGE_ID_LEN + 1, 1).is_none());
+        assert!(ordered(1, MAX_ORDERING_KEY_LEN + 1).is_none());
     }
 }

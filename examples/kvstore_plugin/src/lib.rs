@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use serde_json::json;
 use thenodes::network::message::{Message, MessageType, Payload};
-use thenodes::plugin_host::{Plugin, PluginContext, PluginRegistrarApi};
+use thenodes::plugin_host::{
+    NativeRegistrar, Plugin, PluginContext, PluginError, PluginRegistrationError,
+};
 
 const PLUGIN_ID: &str = "kvstore_plugin";
 const PROMPT_PREFIX: &str = "kvstore";
@@ -40,18 +42,21 @@ impl KvStorePlugin {
         match parts.as_slice() {
             ["put", key, value] => match self.put(ctx, key, value).await {
                 Ok(()) => {
-                    let msg = Message::new(
-                        "plugin:kvstore",
-                        "*",
+                    let msg = Message::outbound(
                         MessageType::Extension {
                             kind: "kvstore.put".to_string(),
                         },
                         Some(Payload::Json(json!({"key": key, "value": value}))),
                         None,
                     );
-                    let json_msg = msg.as_json();
-                    ctx.peer_manager.broadcast(&json_msg).await;
-                    Some(format!("📝 Stored and broadcast: {} = {}", key, value))
+                    // Broadcasting goes through host services and runs on the host runtime.
+                    match ctx.broadcast(msg).await {
+                        Ok(()) => Some(format!("📝 Stored and broadcast: {} = {}", key, value)),
+                        Err(reason) => Some(format!(
+                            "📝 Stored: {} = {} (not broadcast: {reason})",
+                            key, value
+                        )),
+                    }
                 }
                 Err(err) => Some(format!("❌ Failed to store value: {err}")),
             },
@@ -141,6 +146,17 @@ impl Plugin for KvStorePlugin {
         PLUGIN_ID
     }
 
+    /// Verify that the durable store is readable before the node goes live. A
+    /// corrupt store fails startup instead of surfacing on the first request.
+    async fn on_start(&self, ctx: &PluginContext) -> Result<(), PluginError> {
+        let entries = self.list(ctx).await?;
+        println!(
+            "[kvstore_plugin] started with {} stored entries",
+            entries.len()
+        );
+        Ok(())
+    }
+
     async fn on_message(&self, message: &Message, ctx: &PluginContext) {
         println!(
             "[kvstore_plugin] on_message: self={:p} message={:?}",
@@ -204,23 +220,13 @@ impl Plugin for KvStorePlugin {
     }
 }
 
-/// # Safety
-///
-/// `api` must be a valid pointer to the host's plugin registrar API for ABI v3
-/// and remain valid for the duration of this call.
-#[no_mangle]
-pub unsafe extern "C" fn register_plugin(api: *const PluginRegistrarApi) {
-    let api = match PluginRegistrarApi::from_raw(api) {
-        Ok(api) => api,
-        Err(err) => {
-            eprintln!("[kvstore_plugin] invalid registrar API: {err}");
-            return;
-        }
-    };
-    if let Err(err) = api.register_plugin(Box::new(KvStorePlugin::new())) {
-        eprintln!("[kvstore_plugin] failed to register: {err}");
-    }
+fn register(registrar: &mut NativeRegistrar) -> Result<(), PluginRegistrationError> {
+    registrar.register(Box::new(KvStorePlugin::new()));
+    Ok(())
 }
+
+// Exports `thenodes_plugin_abi_version` and `register_plugin` for the host loader.
+thenodes::export_plugin!(register);
 
 #[cfg(test)]
 mod tests {
@@ -287,10 +293,12 @@ mod tests {
             .for_plugin(PLUGIN_ID)
             .expect("plugin context should bind plugin id");
 
+        // A context bound outside a running host has no host services, so the
+        // value is stored but not broadcast.
         let first = KvStorePlugin::new();
         assert_eq!(
             first.on_prompt("put color blue", &ctx).await,
-            Some("📝 Stored and broadcast: color = blue".to_string())
+            Some("📝 Stored: color = blue (not broadcast: unavailable)".to_string())
         );
 
         let restarted = KvStorePlugin::new();

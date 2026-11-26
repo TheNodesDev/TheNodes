@@ -1,36 +1,81 @@
+//! Plugin hosting: the `Plugin` trait, plugin contexts, lifecycle management,
+//! and native library loading.
+//!
+//! The plugin manager owns each plugin's lifecycle: `on_start`, host activation,
+//! bounded per-plugin inboxes, managed background tasks, `on_stop`, and one
+//! cleanup path. Native plugins run on their library's own runtime and reach
+//! host functionality only through host services; see `runtime` for the
+//! execution boundary.
+
+pub mod lifecycle;
 pub mod loader;
 pub mod manager;
+pub(crate) mod runtime;
 
-pub use loader::{PluginApiError, PluginLoader, PluginRegistrarApi, PLUGIN_ABI_VERSION};
-pub use manager::PluginManager;
+pub use lifecycle::{
+    ActivationError, DispatchReport, FailureCause, FailurePhase, HostPhase, LifecycleError,
+    PluginError, PluginFailure, PluginHostOptions, PluginRegistrationError, PluginStartOutcome,
+    PluginState, PluginStopReport, PromptError, QuiescePhase, Rejection, ShutdownMode,
+    ShutdownReport, SpawnError, StartPolicy, StartReport, StartResult, StopResult, TaskCancelled,
+    TaskExit, DEFAULT_INBOX_CAPACITY, DEFAULT_PROMPT_CAPACITY, DEFAULT_RUNTIME_WORKERS,
+    DEFAULT_TASK_LIMIT,
+};
+#[doc(hidden)]
+pub use loader::register_library;
+pub use loader::{
+    pinned_library_count, LoadedLibrary, NativeRegistrar, PluginLoadError, PluginLoader,
+    PluginRegistrarApi, RegistrationStatus, PLUGIN_ABI_VERSION,
+};
+pub use manager::{
+    PluginFailureSubscription, PluginManager, PluginRegistrar, PromptTarget, ShutdownHandle,
+};
+pub use runtime::{TaskContext, TaskHandle};
 
 use crate::config::Config;
-use crate::network::delivery::{DeliveryOptions, DeliveryOutcome, DeliveryRuntime};
-use crate::network::message::Message;
-
 use crate::events::dispatcher::EventHandle;
+use crate::network::delivery::{DeliveryFailureReason, DeliveryOptions, DeliveryOutcome};
+use crate::network::message::Message;
 use crate::network::peer_manager::PeerManager;
 use crate::network::PeerStore;
-/// Trait that all plugins must implement.
+use runtime::{HostServices, TaskScope};
+use std::future::Future;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::oneshot;
 
-/// Context passed to plugins for host interaction (e.g., broadcasting)
+/// Runtime-bound host objects. Only contexts that share the host's code copy
+/// carry them. Kept behind an `Arc` so the context layout does not depend on
+/// these types.
+struct HostObjects {
+    peer_manager: Arc<PeerManager>,
+    peer_store: PeerStore,
+}
+
+/// Context passed to plugins for host interaction.
+///
+/// A plugin-bound context carries data (node identity, final configuration,
+/// plugin ID) and host services. Official operations such as
+/// [`send_message`](Self::send_message) run in host code on the host runtime.
+///
+/// Low-level access to the `PeerManager` and `PeerStore` is available only in
+/// contexts that share the host's code copy: the host's base context and
+/// statically registered (CAL) plugins. Native plugin contexts return `None`.
 #[derive(Clone)]
 pub struct PluginContext {
-    pub peer_manager: Arc<PeerManager>,
-    pub peer_store: PeerStore,
     pub events: EventHandle,
     pub local_node_id: String,
     pub config: Config,
     pub allow_console: bool,
-    plugin_manager: Arc<RwLock<Option<Arc<PluginManager>>>>,
+    host_objects: Option<Arc<HostObjects>>,
     plugin_id: Option<String>,
+    pub(crate) services: Option<Arc<dyn HostServices>>,
+    pub(crate) scope: Option<Arc<TaskScope>>,
 }
 
 impl PluginContext {
+    /// Create the host's base context. The plugin manager derives one
+    /// plugin-bound context per plugin from it when startup begins.
     pub fn new(
         peer_manager: Arc<PeerManager>,
         peer_store: PeerStore,
@@ -40,26 +85,71 @@ impl PluginContext {
         allow_console: bool,
     ) -> Self {
         Self {
-            peer_manager,
-            peer_store,
             events,
             local_node_id,
             config,
             allow_console,
-            plugin_manager: Arc::new(RwLock::new(None)),
+            host_objects: Some(Arc::new(HostObjects {
+                peer_manager,
+                peer_store,
+            })),
             plugin_id: None,
+            services: None,
+            scope: None,
         }
     }
 
-    pub async fn set_plugin_manager(&self, plugin_manager: Arc<PluginManager>) {
-        *self.plugin_manager.write().await = Some(plugin_manager);
+    /// Low-level peer manager access. CAL-only: `None` in native plugin contexts.
+    pub fn peer_manager(&self) -> Option<&Arc<PeerManager>> {
+        self.host_objects
+            .as_ref()
+            .map(|objects| &objects.peer_manager)
     }
 
+    /// Low-level peer store access. CAL-only: `None` in native plugin contexts.
+    pub fn peer_store(&self) -> Option<&PeerStore> {
+        self.host_objects
+            .as_ref()
+            .map(|objects| &objects.peer_store)
+    }
+
+    /// Replace the peer store, for hosts that finalize it after plugin
+    /// registration.
+    pub fn set_peer_store(&mut self, peer_store: PeerStore) {
+        if let Some(objects) = self.host_objects.as_mut() {
+            *objects = Arc::new(HostObjects {
+                peer_manager: objects.peer_manager.clone(),
+                peer_store,
+            });
+        }
+    }
+
+    /// Bind a copy of this context to a validated plugin ID. The copy has no
+    /// host services; the plugin manager creates fully bound contexts itself.
     pub fn for_plugin(&self, plugin_id: &str) -> io::Result<Self> {
         Self::validate_plugin_id(plugin_id)?;
         let mut ctx = self.clone();
         ctx.plugin_id = Some(plugin_id.to_string());
+        ctx.services = None;
+        ctx.scope = None;
         Ok(ctx)
+    }
+
+    pub(crate) fn bind(
+        &self,
+        plugin_id: &str,
+        services: Arc<dyn HostServices>,
+        native: bool,
+    ) -> Self {
+        let mut ctx = self.clone();
+        ctx.plugin_id = Some(plugin_id.to_string());
+        ctx.services = Some(services.clone());
+        ctx.scope = None;
+        if native {
+            ctx.host_objects = None;
+            ctx.events = EventHandle::host_bound(services);
+        }
+        ctx
     }
 
     pub fn plugin_id(&self) -> Option<&str> {
@@ -107,28 +197,31 @@ impl PluginContext {
         Ok(())
     }
 
+    /// Deliver a message through the host's delivery runtime.
+    ///
+    /// The delivery, including reliable-delivery retries, runs on the host
+    /// runtime. Before host activation this returns a `NotReady` failure; after
+    /// shutdown has drained admitted messages it returns `Stopping`.
     pub async fn deliver_message(
         &self,
         message: Message,
         options: DeliveryOptions,
     ) -> DeliveryOutcome {
-        let plugin_manager = self.plugin_manager.read().await.clone();
-        let Some(plugin_manager) = plugin_manager else {
-            return DeliveryOutcome::DeliveryFailed {
-                reason: crate::network::delivery::DeliveryFailureReason::PolicyDenied,
-            };
+        let unavailable = DeliveryOutcome::DeliveryFailed {
+            reason: DeliveryFailureReason::Unavailable,
         };
-
-        DeliveryRuntime::new(
-            (*self.peer_manager).clone(),
-            plugin_manager,
-            self.config.clone(),
-            self.local_node_id.clone(),
-            Some(self.peer_store.clone()),
-            self.allow_console,
-        )
-        .deliver_message(message, options)
-        .await
+        let Some(services) = &self.services else {
+            return unavailable;
+        };
+        let (tx, rx) = oneshot::channel();
+        services.deliver(
+            message,
+            options,
+            Box::new(move |outcome| {
+                let _ = tx.send(outcome);
+            }),
+        );
+        rx.await.unwrap_or(unavailable)
     }
 
     pub async fn send_message(
@@ -142,13 +235,86 @@ impl PluginContext {
         outbound.to = to.to_string();
         self.deliver_message(outbound, options).await
     }
+
+    /// Send a message to every connected peer. Subject to the same lifecycle
+    /// checks as [`deliver_message`](Self::deliver_message).
+    pub async fn broadcast(&self, message: Message) -> Result<(), Rejection> {
+        let Some(services) = &self.services else {
+            return Err(Rejection::Unavailable);
+        };
+        let (tx, rx) = oneshot::channel();
+        services.broadcast(
+            message,
+            Box::new(move |result| {
+                let _ = tx.send(result);
+            }),
+        );
+        rx.await.unwrap_or(Err(Rejection::Unavailable))
+    }
+
+    /// Node IDs of currently connected peers.
+    pub async fn connected_peer_ids(&self) -> Result<Vec<String>, Rejection> {
+        let Some(services) = &self.services else {
+            return Err(Rejection::Unavailable);
+        };
+        let (tx, rx) = oneshot::channel();
+        services.connected_peer_ids(Box::new(move |result| {
+            let _ = tx.send(result);
+        }));
+        rx.await.unwrap_or(Err(Rejection::Unavailable))
+    }
+
+    /// Spawn a managed background task in this plugin's task scope.
+    ///
+    /// The task runs on the plugin's runtime, counts against the plugin's task
+    /// limit, and stays accounted for until its completion is observed. It
+    /// receives a [`TaskContext`] for cooperative cancellation and for waiting
+    /// on host activation. Returning an error or panicking reports a plugin
+    /// failure to the host. Only contexts passed to plugin callbacks carry a
+    /// task scope.
+    pub fn spawn_task<F, Fut>(&self, name: &str, task: F) -> Result<TaskHandle, SpawnError>
+    where
+        F: FnOnce(TaskContext) -> Fut,
+        Fut: Future<Output = Result<(), PluginError>> + Send + 'static,
+    {
+        let Some(scope) = &self.scope else {
+            return Err(SpawnError::NotReady);
+        };
+        scope.spawn(name, task)
+    }
 }
 
+/// Trait that all plugins implement.
+///
+/// The host calls `plugin_id`, `subscribed_extension_kinds`, `prompt_prefix`,
+/// `early_config_defaults`, and `max_managed_tasks` once, at registration.
+/// Keep them lightweight and pure. Async callbacks run as tasks on the
+/// plugin's runtime: the host runtime for statically linked plugins, and the
+/// library's own runtime for native plugins.
 #[async_trait::async_trait]
 pub trait Plugin: Send + Sync {
     fn plugin_id(&self) -> &'static str;
 
+    /// Finish bounded local initialization. Runs once, before host activation,
+    /// with the final plugin-bound context.
+    ///
+    /// Do not wait for plugin messages or activation-dependent sends here; spawn
+    /// a managed task that waits for [`TaskContext::activated`] instead.
+    async fn on_start(&self, _ctx: &PluginContext) -> Result<(), PluginError> {
+        Ok(())
+    }
+
+    /// Handle one admitted message. Messages for this plugin are handled one at
+    /// a time in admission order. Do not await a message that only this
+    /// plugin's own inbox can deliver; forward it to a managed task instead.
     async fn on_message(&self, message: &Message, ctx: &PluginContext);
+
+    /// Release plugin resources. Runs once if `on_start` was entered, including
+    /// after a failed or cancelled start, so it must tolerate incomplete
+    /// initialization.
+    async fn on_stop(&self, _ctx: &PluginContext) -> Result<(), PluginError> {
+        Ok(())
+    }
 
     /// Extension kinds this plugin wants to receive.
     ///
@@ -158,7 +324,7 @@ pub trait Plugin: Send + Sync {
         None
     }
 
-    /// Called when user enters a prompt for this plugin. Can return a response and optionally broadcast.
+    /// Called when the user enters a prompt for this plugin.
     async fn on_prompt(&self, _input: &str, _ctx: &PluginContext) -> Option<String> {
         None
     }
@@ -168,16 +334,19 @@ pub trait Plugin: Send + Sync {
     }
 
     /// Optional early configuration defaults hook.
-    /// Lets a plugin supply default values (realm / port / app name / other config fields)
-    /// before networking is initialized. Only used when the operator hasn't
-    /// specified those fields explicitly. Pure, side‑effect free.
-    /// Last plugin wins for the same field when multiple defaults are provided.
+    ///
+    /// Lets a plugin supply default values (realm, port, app name, and other
+    /// config fields) before networking is initialized. Only used when the
+    /// operator has not set those fields. Must be pure: do not create a
+    /// runtime, spawn tasks, or access the network here. Two plugins supplying
+    /// different values for the same single-valued field is a registration
+    /// error.
     fn early_config_defaults(&self) -> Option<crate::config::ConfigDefaults> {
         None
     }
-}
 
-/// Trait passed to plugins so they can register themselves.
-pub trait PluginRegistrar {
-    fn register_handler(&mut self, plugin: Box<dyn Plugin>);
+    /// Limit of live managed background tasks for this plugin.
+    fn max_managed_tasks(&self) -> usize {
+        DEFAULT_TASK_LIMIT
+    }
 }

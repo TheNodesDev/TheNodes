@@ -1,10 +1,36 @@
-use thenodes::network::delivery::{DeliveryClass, DeliveryOptions};
+use std::sync::{Arc, OnceLock};
+
+use async_trait::async_trait;
+use thenodes::network::delivery::{DeliveryClass, DeliveryFailureReason, DeliveryOptions};
 use thenodes::network::message::{DeliveryMetadata, Message, MessageType};
-use thenodes::plugin_host::{PluginContext, PluginManager};
+use thenodes::network::DeliveryOutcome;
+use thenodes::plugin_host::{
+    Plugin, PluginContext, PluginError, PluginManager, PluginRegistrar, ShutdownMode, StartPolicy,
+};
+
+/// Keeps the plugin-bound context it receives at startup so the test can use
+/// the official send path.
+struct ContextCapturingPlugin {
+    ctx: Arc<OnceLock<PluginContext>>,
+}
+
+#[async_trait]
+impl Plugin for ContextCapturingPlugin {
+    fn plugin_id(&self) -> &'static str {
+        "delivery-test-plugin"
+    }
+
+    async fn on_start(&self, ctx: &PluginContext) -> Result<(), PluginError> {
+        let _ = self.ctx.set(ctx.clone());
+        Ok(())
+    }
+
+    async fn on_message(&self, _message: &Message, _ctx: &PluginContext) {}
+}
 
 #[tokio::test]
 async fn plugin_context_delivery_api_sends_reliably_to_connected_peer() {
-    let peer_manager = std::sync::Arc::new(thenodes::network::PeerManager::new());
+    let peer_manager = Arc::new(thenodes::network::PeerManager::new());
     let peer_store = thenodes::network::PeerStore::new();
     let ctx = PluginContext::new(
         peer_manager.clone(),
@@ -14,10 +40,50 @@ async fn plugin_context_delivery_api_sends_reliably_to_connected_peer() {
         thenodes::config::Config::default(),
         false,
     );
-    let plugin_manager = std::sync::Arc::new(PluginManager::with_context(ctx.clone()));
-    ctx.set_plugin_manager(plugin_manager).await;
+    let captured = Arc::new(OnceLock::new());
+    let mut plugin_manager = PluginManager::with_context(ctx.clone());
+    plugin_manager
+        .register_handler(Box::new(ContextCapturingPlugin {
+            ctx: captured.clone(),
+        }))
+        .expect("plugin should register");
+    let plugin_manager = Arc::new(plugin_manager);
+    plugin_manager
+        .start_all(StartPolicy::StopOnFirstFailure)
+        .await
+        .expect("plugins should start");
+    let plugin_ctx = captured.get().expect("on_start received a context").clone();
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(4);
+    // The host base context has no host services and cannot send.
+    assert_eq!(
+        ctx.send_message(
+            "node-b",
+            Message::new("ignored", "ignored", MessageType::Heartbeat, None, None),
+            DeliveryOptions::new(DeliveryClass::FireAndForget),
+        )
+        .await,
+        DeliveryOutcome::DeliveryFailed {
+            reason: DeliveryFailureReason::Unavailable
+        }
+    );
+    // Plugin sends before activation are refused, not buffered.
+    assert_eq!(
+        plugin_ctx
+            .send_message(
+                "node-b",
+                Message::new("ignored", "ignored", MessageType::Heartbeat, None, None),
+                DeliveryOptions::new(DeliveryClass::FireAndForget),
+            )
+            .await,
+        DeliveryOutcome::DeliveryFailed {
+            reason: DeliveryFailureReason::NotReady
+        }
+    );
+    plugin_manager
+        .activate()
+        .expect("activation should succeed");
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Message>(4);
     let addr: std::net::SocketAddr = "127.0.0.1:9101".parse().unwrap();
     peer_manager
         .add_peer(addr, tx, "node-b".to_string())
@@ -26,23 +92,19 @@ async fn plugin_context_delivery_api_sends_reliably_to_connected_peer() {
 
     let pm_for_ack = peer_manager.clone();
     tokio::spawn(async move {
-        if let Some(json) = rx.recv().await {
-            let outbound = Message::from_json(&json).expect("valid outbound message");
+        if let Some(outbound) = rx.recv().await {
             let message_id = outbound
                 .delivery
                 .as_ref()
                 .map(|delivery| delivery.message_id.clone())
                 .expect("delivery metadata present");
             pm_for_ack
-                .set_delivery_outcome(
-                    &message_id,
-                    thenodes::network::DeliveryOutcome::AcknowledgedByPeer,
-                )
+                .set_delivery_outcome(&message_id, DeliveryOutcome::AcknowledgedByPeer)
                 .await;
         }
     });
 
-    let outcome = ctx
+    let outcome = plugin_ctx
         .send_message(
             "node-b",
             Message::new("ignored", "ignored", MessageType::Heartbeat, None, None),
@@ -50,9 +112,26 @@ async fn plugin_context_delivery_api_sends_reliably_to_connected_peer() {
         )
         .await;
 
+    assert_eq!(outcome, DeliveryOutcome::AcknowledgedByPeer);
+
+    let report = plugin_manager
+        .shutdown(ShutdownMode::Drain)
+        .await
+        .expect("shutdown should report");
+    assert!(report.is_clean(), "{report:?}");
+
+    // A retained context cannot send after shutdown.
     assert_eq!(
-        outcome,
-        thenodes::network::DeliveryOutcome::AcknowledgedByPeer
+        plugin_ctx
+            .send_message(
+                "node-b",
+                Message::new("ignored", "ignored", MessageType::Heartbeat, None, None),
+                DeliveryOptions::new(DeliveryClass::FireAndForget),
+            )
+            .await,
+        DeliveryOutcome::DeliveryFailed {
+            reason: DeliveryFailureReason::Stopping
+        }
     );
 }
 

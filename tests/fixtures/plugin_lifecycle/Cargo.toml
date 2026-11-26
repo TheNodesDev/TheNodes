@@ -1,0 +1,21 @@
+[package]
+name = "thenodes-plugin-lifecycle-fixture"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.83"
+publish = false
+description = "Native plugin fixture for TheNodes lifecycle integration tests"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+thenodes = { path = "../../.." }
+tokio = { version = "1.35", features = ["full"] }
+async-trait = "0.1"
+serde_json = "1.0"
+
+# Forwarded so the fixture is built with the same TheNodes features as the host.
+[features]
+noise = ["thenodes/noise"]
+upnp = ["thenodes/upnp"]

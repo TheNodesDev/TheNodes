@@ -4,11 +4,16 @@ use std::time::Duration;
 use thenodes::config::{Config, ConnectionPolicyConfig};
 use thenodes::network::delivery::{process_incoming_message, IncomingMessageDisposition};
 use thenodes::network::message::{MessageType, Payload};
-use thenodes::network::{Message, PeerManager, PeerStore, RouteHealth, RouteKind};
+use thenodes::network::{Message, MessageOrigin, PeerManager, PeerStore, RouteHealth, RouteKind};
 use thenodes::plugin_host::manager::PluginManager;
 
-#[tokio::test]
-async fn heartbeat_timeout_marks_silent_peer_unresponsive() {
+/// A peer manager whose liveness monitor probes every 10 ms and gives up on a
+/// peer silent for 30 ms, with one registered peer whose outbound frames land
+/// in the returned receiver.
+async fn monitored_peer(
+    node_id: &str,
+    port: u16,
+) -> (PeerManager, tokio::sync::mpsc::Receiver<Message>) {
     let mut config = Config::default();
     config
         .network
@@ -33,18 +38,26 @@ async fn heartbeat_timeout_marks_silent_peer_unresponsive() {
         )
         .await;
 
-    let addr = "127.0.0.1:42999".parse().unwrap();
-    let (sender, mut heartbeat_receiver) = tokio::sync::mpsc::channel(8);
+    let addr = format!("127.0.0.1:{port}").parse().unwrap();
+    let (sender, receiver) = tokio::sync::mpsc::channel(8);
     peer_manager
-        .add_peer(addr, sender, "silent-peer".to_string())
+        .add_peer(addr, sender, node_id.to_string())
         .await
         .unwrap();
+    (peer_manager, receiver)
+}
+
+// Paused time: the clock advances only when the runtime is idle, so machine
+// load cannot make the monitor's first tick late.
+#[tokio::test(start_paused = true)]
+async fn heartbeat_timeout_marks_silent_peer_unresponsive() {
+    let (peer_manager, mut heartbeat_receiver) = monitored_peer("silent-peer", 42999).await;
 
     let heartbeat = tokio::time::timeout(Duration::from_millis(30), heartbeat_receiver.recv())
         .await
         .expect("heartbeat should be scheduled")
         .expect("heartbeat channel should remain open");
-    assert!(heartbeat.contains("\"HEARTBEAT\""));
+    assert!(matches!(heartbeat.msg_type, MessageType::Heartbeat));
 
     tokio::time::timeout(Duration::from_millis(150), async {
         while peer_manager.has_node_id("silent-peer").await {
@@ -60,6 +73,35 @@ async fn heartbeat_timeout_marks_silent_peer_unresponsive() {
             .await,
         RouteHealth::Unresponsive
     );
+}
+
+/// Regression test: a node that was itself stalled for longer than the
+/// heartbeat timeout used to drop every peer on its first tick afterwards,
+/// before reading what they had sent. It now probes first.
+#[tokio::test(start_paused = true)]
+async fn stalled_node_probes_before_dropping_a_peer() {
+    let (peer_manager, mut heartbeat_receiver) = monitored_peer("answering-peer", 43021).await;
+    heartbeat_receiver.recv().await.expect("first probe");
+    peer_manager
+        .record_peer_activity_on_preferred_route("answering-peer")
+        .await;
+
+    // This node stalls for more than three heartbeat timeouts.
+    tokio::time::advance(Duration::from_millis(100)).await;
+
+    let probe = tokio::time::timeout(Duration::from_millis(5), heartbeat_receiver.recv())
+        .await
+        .expect("a probe right after the stall")
+        .expect("peer should still be connected");
+    assert!(matches!(probe.msg_type, MessageType::Heartbeat));
+    assert!(peer_manager.has_node_id("answering-peer").await);
+
+    // The peer answers once this node reads again, and stays.
+    peer_manager
+        .record_peer_activity_on_preferred_route("answering-peer")
+        .await;
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert!(peer_manager.has_node_id("answering-peer").await);
 }
 
 #[tokio::test]
@@ -112,8 +154,13 @@ async fn spoofed_heartbeat_sender_is_ignored() {
         Some(Payload::Text("liveness_probe_v1".to_string())),
         None,
     );
-    let disposition =
-        process_incoming_message(&peer_manager, "local-node", Some("peer-a"), spoofed).await;
+    let disposition = process_incoming_message(
+        &peer_manager,
+        "local-node",
+        MessageOrigin::direct("peer-a", None),
+        spoofed,
+    )
+    .await;
     assert!(matches!(disposition, IncomingMessageDisposition::Consumed));
 
     // peer-b never sent anything, so it must not receive a heartbeat reply.
@@ -127,8 +174,13 @@ async fn spoofed_heartbeat_sender_is_ignored() {
         Some(Payload::Text("liveness_probe_v1".to_string())),
         None,
     );
-    let disposition =
-        process_incoming_message(&peer_manager, "local-node", Some("peer-b"), genuine).await;
+    let disposition = process_incoming_message(
+        &peer_manager,
+        "local-node",
+        MessageOrigin::direct("peer-b", None),
+        genuine,
+    )
+    .await;
     assert!(matches!(disposition, IncomingMessageDisposition::Consumed));
     assert!(receiver_b.try_recv().is_ok());
 }
@@ -160,4 +212,39 @@ async fn unresponsive_route_is_not_downgraded_by_later_failure() {
         peer_manager.route_health("gone-peer", RouteKind::Tcp).await,
         RouteHealth::Healthy
     );
+}
+
+/// Regression test: `broadcast` used to await each send
+/// while holding the `peers` lock, so one peer that stopped reading froze every
+/// peer operation on the node.
+#[tokio::test]
+async fn broadcast_does_not_block_on_a_stalled_peer() {
+    let peer_manager = PeerManager::new();
+
+    let stalled_addr: std::net::SocketAddr = "127.0.0.1:43011".parse().unwrap();
+    let (stalled, _stalled_receiver) = tokio::sync::mpsc::channel(1);
+    peer_manager
+        .add_peer(stalled_addr, stalled.clone(), "stalled".to_string())
+        .await
+        .unwrap();
+    let probe = || Message::outbound(MessageType::Heartbeat, None, None);
+    stalled.try_send(probe()).unwrap();
+
+    let healthy_addr: std::net::SocketAddr = "127.0.0.1:43012".parse().unwrap();
+    let (healthy, mut healthy_receiver) = tokio::sync::mpsc::channel(8);
+    peer_manager
+        .add_peer(healthy_addr, healthy, "healthy".to_string())
+        .await
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(1), peer_manager.broadcast(&probe()))
+        .await
+        .expect("broadcast blocked on the stalled peer");
+    assert!(matches!(
+        healthy_receiver.try_recv().unwrap().msg_type,
+        MessageType::Heartbeat
+    ));
+    tokio::time::timeout(Duration::from_secs(1), peer_manager.list_peers())
+        .await
+        .expect("peers lock still held after broadcast");
 }

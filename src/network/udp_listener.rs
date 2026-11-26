@@ -26,9 +26,10 @@ use tokio::sync::Mutex;
 use crate::network::message::Message;
 use crate::network::peer_manager::{PeerManager, TransportKind};
 use crate::network::udp_session::{
-    build_session_frame, build_tncf_frame, has_reserved_tncf_prefix, is_tncf_frame,
-    load_or_generate_static_keypair, parse_tncf_frame, tncf_type, NoiseUdpSession,
-    MAX_APP_PAYLOAD_BYTES, MAX_DATAGRAM_BYTES, SESSION_ID_LEN,
+    build_handshake_body, build_session_frame, build_tncf_frame, has_reserved_tncf_prefix,
+    is_tncf_frame, load_or_generate_static_keypair, parse_handshake_body, parse_tncf_frame,
+    tncf_type, NoiseUdpSession, SessionFrameError, MAX_APP_PAYLOAD_BYTES, MAX_DATAGRAM_BYTES,
+    NONCE_LEN, SESSION_ID_LEN,
 };
 use crate::plugin_host::manager::PluginManager;
 
@@ -40,10 +41,18 @@ pub type UdpSessions = Arc<Mutex<HashMap<[u8; SESSION_ID_LEN], NoiseUdpSession>>
 // ─── Constants ─────────────────────────────────────────────────────────────────
 
 const MAX_CONCURRENT_HANDSHAKES: usize = 64;
+/// Handshakes in progress from which a responder asks for a cookie before it
+/// spends a Diffie-Hellman on msg1 (ADR-0013).
+const HANDSHAKE_COOKIE_THRESHOLD: usize = MAX_CONCURRENT_HANDSHAKES / 2;
 const HANDSHAKE_RATE_LIMIT_PER_IP: u32 = 8; // per second
 const HANDSHAKE_EXPIRY_SECS: u64 = 5;
+/// Cookie challenges an initiator answers per handshake.
+const MAX_COOKIE_RETRIES: u8 = 2;
+/// Validity of a handshake cookie; the previous window is accepted too.
+const HANDSHAKE_COOKIE_TTL_SECS: u64 = 30;
 const SESSION_IDLE_TIMEOUT_SECS: u64 = 120;
-const REAPER_INTERVAL_SECS: u64 = 30;
+/// No longer than a handshake lives, so expired handshakes free their slots.
+const REAPER_INTERVAL_SECS: u64 = HANDSHAKE_EXPIRY_SECS;
 
 // ─── Rate-limit state (per-IP) ─────────────────────────────────────────────────
 
@@ -66,6 +75,50 @@ impl IpRateEntry {
         } else {
             false
         }
+    }
+
+    /// Whether the next handshake from this IP would be within its rate.
+    fn has_room(&self) -> bool {
+        self.window_start.elapsed() >= Duration::from_secs(1)
+            || self.count < HANDSHAKE_RATE_LIMIT_PER_IP
+    }
+
+    fn is_stale(&self) -> bool {
+        self.window_start.elapsed() >= Duration::from_secs(1)
+    }
+}
+
+/// Stateless cookies proving that a handshake initiator receives at its
+/// source address (ADR-0013).
+struct HandshakeCookies {
+    secret: [u8; 32],
+}
+
+impl HandshakeCookies {
+    fn new() -> Self {
+        use rand::RngCore;
+        let mut secret = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut secret);
+        Self { secret }
+    }
+
+    fn cookie_for(&self, src: SocketAddr, session_id: &[u8; SESSION_ID_LEN]) -> [u8; 16] {
+        crate::network::nat_traversal::make_cookie(
+            &self.secret,
+            HANDSHAKE_COOKIE_TTL_SECS,
+            src,
+            session_id,
+        )
+    }
+
+    fn is_valid(&self, src: SocketAddr, session_id: &[u8; SESSION_ID_LEN], cookie: &[u8]) -> bool {
+        crate::network::nat_traversal::validate_cookie(
+            &self.secret,
+            HANDSHAKE_COOKIE_TTL_SECS,
+            src,
+            session_id,
+            cookie,
+        )
     }
 }
 
@@ -100,7 +153,12 @@ pub async fn spawn_udp_listener(
 
     // Register the socket handle in PeerManager for Phase 3 punch execution.
     peer_manager
-        .set_udp_handle(socket.clone(), sessions.clone(), static_private.clone())
+        .set_udp_handle(
+            socket.clone(),
+            sessions.clone(),
+            static_private.clone(),
+            local_node_id.clone(),
+        )
         .await;
 
     let sock_recv = socket.clone();
@@ -144,8 +202,15 @@ async fn run_recv_loop(
 ) {
     let mut buf = vec![0u8; MAX_DATAGRAM_BYTES + 64];
     let mut rate_limits: HashMap<IpAddr, IpRateEntry> = HashMap::new();
+    let mut rate_limits_pruned = Instant::now();
+    let cookies = HandshakeCookies::new();
 
     loop {
+        // Entries older than their one-second window carry nothing.
+        if rate_limits_pruned.elapsed() >= Duration::from_secs(1) {
+            rate_limits.retain(|_, entry| !entry.is_stale());
+            rate_limits_pruned = Instant::now();
+        }
         let (len, src) = match socket.recv_from(&mut buf).await {
             Ok(v) => v,
             Err(e) => {
@@ -186,6 +251,7 @@ async fn run_recv_loop(
                 &config,
                 &static_private,
                 &mut rate_limits,
+                &cookies,
                 nat_state.as_deref(),
             )
             .await;
@@ -216,6 +282,7 @@ async fn handle_tncf(
     config: &crate::config::Config,
     static_private: &[u8],
     rate_limits: &mut HashMap<IpAddr, IpRateEntry>,
+    cookies: &HandshakeCookies,
     nat_state: Option<&crate::network::nat_traversal::NatState>,
 ) {
     let (frame_type, body) = match parse_tncf_frame(datagram) {
@@ -225,17 +292,65 @@ async fn handle_tncf(
 
     match frame_type {
         tncf_type::KEEPALIVE => {
-            // Keepalive: update last_seen for any session matching the source addr.
-            // We must search by peer_addr because no session_id in a keepalive.
-            let mut map = sessions.lock().await;
-            for session in map.values_mut() {
-                if session.peer_addr == src {
-                    session.last_seen = Instant::now();
-                }
-            }
+            // Keepalives only open NAT mappings during hole punching. They carry
+            // no session and prove nothing, so they refresh nothing; sessions
+            // stay alive through authenticated frames.
         }
 
         tncf_type::HANDSHAKE_MSG1 => {
+            // Body: [SESSION_ID: 8][COOKIE_LEN: 1][COOKIE][NOISE_MSG1].
+            // Anti-amplification: we MUST NOT respond with a message larger than this datagram.
+            let Some((session_id, cookie, noise_msg1)) = parse_handshake_body(body) else {
+                return;
+            };
+            if has_reserved_tncf_prefix(&session_id) {
+                crate::network::events::emit_network_event(
+                    "udp_listener",
+                    crate::events::model::LogLevel::Warn,
+                    "udp_hs_reserved_session_id",
+                    Some(src.to_string()),
+                    Some(hex::encode(session_id)),
+                    false,
+                );
+                return;
+            }
+
+            // A session ID names one session for its lifetime: msg1 cannot
+            // replace an established or half-open session (ADR-0013).
+            let handshaking_count = {
+                let mut map = sessions.lock().await;
+                if map.contains_key(&session_id) {
+                    crate::network::events::emit_network_event(
+                        "udp_listener",
+                        crate::events::model::LogLevel::Warn,
+                        "udp_hs_session_id_in_use",
+                        Some(src.to_string()),
+                        Some(hex::encode(session_id)),
+                        false,
+                    );
+                    return;
+                }
+                let expiry = Duration::from_secs(HANDSHAKE_EXPIRY_SECS);
+                map.retain(|_, s| s.is_established() || s.created_at.elapsed() < expiry);
+                map.values().filter(|s| !s.is_established()).count()
+            };
+
+            // Under load, or past its rate, a source first proves it receives
+            // at its address; a cookie reply is smaller than msg1.
+            let verified = cookies.is_valid(src, &session_id, cookie);
+            let rate_room = rate_limits.get(&src.ip()).is_none_or(IpRateEntry::has_room);
+            if !verified && (handshaking_count >= HANDSHAKE_COOKIE_THRESHOLD || !rate_room) {
+                let challenge = cookies.cookie_for(src, &session_id);
+                let frame = build_tncf_frame(
+                    tncf_type::HANDSHAKE_COOKIE,
+                    &build_handshake_body(&session_id, &challenge, &[]),
+                );
+                if frame.len() <= datagram.len() {
+                    let _ = socket.send_to(&frame, src).await;
+                }
+                return;
+            }
+
             // ADR-0004 §2.5: DoS rate-limit check.
             let entry = rate_limits.entry(src.ip()).or_insert(IpRateEntry {
                 count: 0,
@@ -254,40 +369,17 @@ async fn handle_tncf(
             }
 
             // ADR-0004 §2.5: Concurrent handshake cap.
-            {
-                let map = sessions.lock().await;
-                let handshaking_count = map.values().filter(|s| !s.is_established()).count();
-                if handshaking_count >= MAX_CONCURRENT_HANDSHAKES {
-                    crate::network::events::emit_network_event(
-                        "udp_listener",
-                        crate::events::model::LogLevel::Warn,
-                        "udp_hs_cap_reached",
-                        Some(src.to_string()),
-                        None,
-                        false,
-                    );
-                    return;
-                }
-            }
-
-            // Body layout for HANDSHAKE_MSG1: [SESSION_ID: 8][NOISE_MSG1: variable].
-            // Anti-amplification: we MUST NOT respond with a message larger than this datagram.
-            if body.len() < SESSION_ID_LEN {
-                return;
-            }
-            let session_id: [u8; SESSION_ID_LEN] = body[..SESSION_ID_LEN].try_into().unwrap();
-            if has_reserved_tncf_prefix(&session_id) {
+            if handshaking_count >= MAX_CONCURRENT_HANDSHAKES {
                 crate::network::events::emit_network_event(
                     "udp_listener",
                     crate::events::model::LogLevel::Warn,
-                    "udp_hs_reserved_session_id",
+                    "udp_hs_cap_reached",
                     Some(src.to_string()),
-                    Some(hex::encode(session_id)),
+                    None,
                     false,
                 );
                 return;
             }
-            let noise_msg1 = &body[SESSION_ID_LEN..];
 
             // ADR-0004 §2.1: Responder MUST reuse the initiator's session_id.
             let result = NoiseUdpSession::new_responder(
@@ -326,6 +418,33 @@ async fn handle_tncf(
             }
         }
 
+        tncf_type::HANDSHAKE_COOKIE => {
+            // Initiator: the responder wants proof of our address before msg1.
+            let Some((session_id, cookie, _)) = parse_handshake_body(body) else {
+                return;
+            };
+            let retry = {
+                let mut map = sessions.lock().await;
+                let Some(session) = map.get_mut(&session_id) else {
+                    return;
+                };
+                // Only the peer this handshake was sent to, and only a few times.
+                if session.peer_addr != src || session.cookie_retries >= MAX_COOKIE_RETRIES {
+                    return;
+                }
+                let Some(msg1) = session.initiator_msg1() else {
+                    return;
+                };
+                let frame = build_tncf_frame(
+                    tncf_type::HANDSHAKE_MSG1,
+                    &build_handshake_body(&session_id, cookie, msg1),
+                );
+                session.cookie_retries += 1;
+                frame
+            };
+            let _ = socket.send_to(&retry, src).await;
+        }
+
         tncf_type::HANDSHAKE_MSG2 => {
             // Initiator receives msg2; body = [SESSION_ID][NOISE_MSG2].
             if body.len() < SESSION_ID_LEN {
@@ -357,6 +476,11 @@ async fn handle_tncf(
                 let Some(session) = map.get_mut(&session_id) else {
                     return;
                 };
+                // Only the address msg1 went to answers it, and an established
+                // session takes no further handshake messages.
+                if session.is_established() || session.peer_addr != src {
+                    return;
+                }
                 match session.advance_handshake(noise_msg2, Some(local_node_id)) {
                     Ok(Some(msg3_bytes)) => {
                         let established = session
@@ -369,7 +493,11 @@ async fn handle_tncf(
                     }
                     Ok(None) => Advance::NoResponse,
                     Err(e) => {
-                        map.remove(&session_id);
+                        // A forged msg2 is dropped; the handshake waits for the
+                        // genuine one.
+                        if !session.is_usable() {
+                            map.remove(&session_id);
+                        }
                         Advance::Failed(e.to_string())
                     }
                 }
@@ -443,6 +571,11 @@ async fn handle_tncf(
                 let Some(session) = map.get_mut(&session_id) else {
                     return;
                 };
+                // Only the sender of msg1 completes the handshake, and an
+                // established session takes no further handshake messages.
+                if session.is_established() || session.peer_addr != src {
+                    return;
+                }
                 match session.advance_handshake(noise_msg3, None) {
                     Ok(None) => {
                         if session.is_established() {
@@ -453,7 +586,9 @@ async fn handle_tncf(
                     }
                     Ok(Some(_)) => Advance::Unexpected,
                     Err(e) => {
-                        map.remove(&session_id);
+                        if !session.is_usable() {
+                            map.remove(&session_id);
+                        }
                         Advance::Failed(e.to_string())
                     }
                 }
@@ -538,6 +673,7 @@ async fn handle_session_frame(
             node_id: Option<String>,
             payload: Vec<u8>,
         },
+        Replay,
         Err(String),
     }
 
@@ -569,6 +705,7 @@ async fn handle_session_frame(
                     payload: plaintext,
                 }
             }
+            Err(SessionFrameError::Replay) => Decrypted::Replay,
             Err(e) => Decrypted::Err(e.to_string()),
         })
     });
@@ -583,10 +720,14 @@ async fn handle_session_frame(
             // (The peer_manager UDP receive API is defined in peer_manager.rs.)
             if let Ok(payload_text) = std::str::from_utf8(&payload) {
                 if let Some(message) = Message::from_json(payload_text) {
+                    let delivered_by = crate::network::message::MessageOrigin::direct(
+                        node_id.clone(),
+                        peer_manager.udp_bound_fingerprint(&node_id).await,
+                    );
                     let disposition = crate::network::delivery::process_incoming_message(
                         peer_manager,
                         local_node_id,
-                        Some(node_id.as_str()),
+                        delivered_by,
                         message,
                     )
                     .await;
@@ -597,7 +738,7 @@ async fn handle_session_frame(
                             messages,
                         ) => {
                             for message in messages {
-                                plugin_manager.dispatch_message(&message).await;
+                                plugin_manager.dispatch_message(&message);
                             }
                         }
                     }
@@ -608,6 +749,17 @@ async fn handle_session_frame(
             peer_manager.dispatch_udp_payload(&node_id, &payload).await;
         }
         Some(Decrypted::Ok { node_id: None, .. }) => {}
+        Some(Decrypted::Replay) => {
+            // Duplicates happen on any network; logged quietly.
+            crate::network::events::emit_network_event(
+                "udp_listener",
+                crate::events::model::LogLevel::Debug,
+                "udp_frame_replayed",
+                Some(src.to_string()),
+                Some(format!("session={}", hex::encode(session_id))),
+                false,
+            );
+        }
         Some(Decrypted::Err(e)) => {
             crate::network::events::emit_network_event(
                 "udp_listener",
@@ -673,6 +825,7 @@ async fn finalize_session(
     let realm = config.realm.clone().unwrap_or_default();
     let config_for_eval = config.clone();
     let node_id_for_eval = node_id.clone();
+    let fingerprint_for_binding = fingerprint.clone();
     let eval_result = tokio::task::spawn_blocking(move || {
         crate::security::secure_channel::evaluate_noise_fingerprint(
             &config_for_eval,
@@ -687,8 +840,8 @@ async fn finalize_session(
     })
     .await;
 
-    match eval_result {
-        Ok(Ok(_decision)) => {}
+    let pending_trust = match eval_result {
+        Ok(Ok(decision)) => decision.pending_trust,
         Ok(Err(err)) => {
             crate::network::events::emit_network_event(
                 "udp_listener",
@@ -711,6 +864,68 @@ async fn finalize_session(
             );
             return false;
         }
+    };
+
+    // Without this check, any key that passes the trust policy could claim an
+    // established node's ID and take over its UDP route (last session wins).
+    let node_identity = peer_manager.node_identity(config);
+    let identity_verdict = match node_identity.verify(
+        Some(crate::security::node_identity::PresentedIdentity::noise(
+            &fingerprint_for_binding,
+        )),
+        &node_id_for_eval,
+    ) {
+        Ok(verdict) => verdict,
+        Err(rejection) => {
+            crate::network::events::emit_network_event(
+                "udp_listener",
+                crate::events::model::LogLevel::Warn,
+                "udp_session_identity_rejected",
+                Some(peer_addr.to_string()),
+                Some(rejection.to_string()),
+                false,
+            );
+            return false;
+        }
+    };
+    // Record the binding before the session becomes the node's route; a
+    // binding another session took meanwhile, or a full store, refuses it.
+    if !node_identity.commit(&identity_verdict) {
+        crate::network::events::emit_network_event(
+            "udp_listener",
+            crate::events::model::LogLevel::Warn,
+            "udp_session_identity_rejected",
+            Some(peer_addr.to_string()),
+            Some(format!(
+                "node_id={node_id_for_eval} binding could not be recorded"
+            )),
+            false,
+        );
+        return false;
+    }
+    // A key `tofu` accepted for the first time becomes trusted only now that
+    // the session is admitted (ADR-0016).
+    if let Some(pending) = pending_trust {
+        let path = pending.path();
+        let persisted = tokio::task::spawn_blocking(move || pending.persist()).await;
+        if let Some(err) = match persisted {
+            Ok(Ok(())) => None,
+            Ok(Err(err)) => Some(err.to_string()),
+            Err(join_err) => Some(join_err.to_string()),
+        } {
+            crate::network::events::emit_network_event(
+                "udp_listener",
+                crate::events::model::LogLevel::Warn,
+                "tofu_trust_unwritable",
+                Some(peer_addr.to_string()),
+                Some(format!(
+                    "node_id={node_id_for_eval} path={} error={err}",
+                    path.display()
+                )),
+                false,
+            );
+            return false;
+        }
     }
 
     peer_manager
@@ -718,6 +933,12 @@ async fn finalize_session(
         .await;
     peer_manager
         .set_udp_session_id(&node_id_for_eval, session_id)
+        .await;
+    peer_manager
+        .set_udp_bound_fingerprint(
+            &node_id_for_eval,
+            identity_verdict.bound_fingerprint().map(str::to_string),
+        )
         .await;
     crate::network::events::emit_network_event(
         "udp_listener",
@@ -756,15 +977,26 @@ pub async fn connect_udp(
 
     let session_id = session.session_id;
 
-    // TNCF HANDSHAKE_MSG1 body: [SESSION_ID][NOISE_MSG1]
-    let mut tncf_body = Vec::with_capacity(SESSION_ID_LEN + msg1_bytes.len());
-    tncf_body.extend_from_slice(&session_id);
-    tncf_body.extend_from_slice(&msg1_bytes);
-    let frame = build_tncf_frame(tncf_type::HANDSHAKE_MSG1, &tncf_body);
+    // TNCF HANDSHAKE_MSG1 body: [SESSION_ID][COOKIE_LEN = 0][NOISE_MSG1]
+    let frame = build_tncf_frame(
+        tncf_type::HANDSHAKE_MSG1,
+        &build_handshake_body(&session_id, &[], &msg1_bytes),
+    );
 
-    socket.send_to(&frame, target_addr).await?;
-
-    sessions.lock().await.insert(session_id, session);
+    // Outgoing handshakes count toward the same cap as incoming ones, so a
+    // stream of punch requests cannot open unbounded half-open sessions.
+    {
+        let mut map = sessions.lock().await;
+        let handshaking = map.values().filter(|s| !s.is_established()).count();
+        if handshaking >= MAX_CONCURRENT_HANDSHAKES {
+            return Err(Box::new(std::io::Error::other("UDP handshake cap reached")));
+        }
+        map.insert(session_id, session);
+    }
+    if let Err(err) = socket.send_to(&frame, target_addr).await {
+        sessions.lock().await.remove(&session_id);
+        return Err(Box::new(err));
+    }
 
     Ok(session_id)
 }
@@ -792,7 +1024,7 @@ pub async fn send_udp(
     let mut map = sessions.lock().await;
     let session = map.get_mut(session_id).ok_or("session not found")?;
 
-    let mut ciphertext = vec![0u8; plaintext.len() + 64];
+    let mut ciphertext = vec![0u8; NONCE_LEN + plaintext.len() + 64];
     let n = session.encrypt(plaintext, &mut ciphertext).map_err(|e| {
         Box::new(std::io::Error::other(e.to_string())) as Box<dyn std::error::Error + Send + Sync>
     })?;
@@ -865,14 +1097,15 @@ async fn reap_sessions(sessions: &UdpSessions) {
 
 /// Resolve the Noise static keypair from the filesystem, generating it if absent.
 ///
-/// Uses `encryption.noise.static_key_path`, defaulting to `pki/noise/static.key`.
+/// Uses `[encryption.noise.paths] static_key`, defaulting to `pki/noise/static.key`.
 pub fn load_static_key(config: &crate::config::Config) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
     let key_path = config
         .encryption
         .as_ref()
         .and_then(|encryption| encryption.noise.as_ref())
-        .and_then(|noise| noise.static_key_path.as_deref())
-        .unwrap_or("pki/noise/static.key");
+        .map_or(crate::config::NoisePaths::DEFAULT_STATIC_KEY, |noise| {
+            noise.static_key_path()
+        });
     let key_path = std::path::Path::new(key_path);
     load_or_generate_static_keypair(key_path)
 }
@@ -997,17 +1230,274 @@ mod tests {
         );
     }
 
-    fn noise_tofu_config(observed_dir: &Path) -> crate::config::Config {
+    /// Regression test: a second Noise key that claims an already bound node
+    /// ID must not take over that node's UDP route.
+    #[tokio::test]
+    async fn udp_session_rejects_second_key_for_bound_node_id() {
+        let local_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let remote_node_id = "remote-peer";
+        let (owner, _) = establish_pair(
+            local_addr,
+            "127.0.0.1:2".parse().unwrap(),
+            remote_node_id,
+            "local-node",
+        );
+        let (squatter, _) = establish_pair(
+            local_addr,
+            "127.0.0.1:3".parse().unwrap(),
+            remote_node_id,
+            "local-node",
+        );
+        let peer_manager = PeerManager::new();
+        let config = crate::config::Config::default();
+        let owner_fingerprint = hex::encode(owner.remote_static_fingerprint().unwrap());
+
+        assert!(
+            finalize_session(
+                owner.session_id,
+                EstablishedSessionInfo::capture(&owner),
+                &peer_manager,
+                &config,
+                crate::events::model::ConnectionRole::Outbound,
+            )
+            .await
+        );
+        assert_eq!(
+            peer_manager.udp_bound_fingerprint(remote_node_id).await,
+            Some(owner_fingerprint)
+        );
+        assert!(
+            !finalize_session(
+                squatter.session_id,
+                EstablishedSessionInfo::capture(&squatter),
+                &peer_manager,
+                &config,
+                crate::events::model::ConnectionRole::Outbound,
+            )
+            .await
+        );
+        assert_eq!(
+            peer_manager.udp_session_id_for(remote_node_id).await,
+            Some(owner.session_id)
+        );
+    }
+
+    /// One UDP endpoint driven by hand, with the state the receive loop keeps.
+    struct Endpoint {
+        socket: Arc<UdpSocket>,
+        sessions: UdpSessions,
+        peer_manager: PeerManager,
+        key: Vec<u8>,
+        node_id: &'static str,
+        rate_limits: HashMap<IpAddr, IpRateEntry>,
+        cookies: HandshakeCookies,
+    }
+
+    impl Endpoint {
+        async fn new(node_id: &'static str) -> Self {
+            Self {
+                socket: Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+                sessions: Arc::new(Mutex::new(HashMap::new())),
+                peer_manager: PeerManager::new(),
+                key: generate_noise_private_key(),
+                node_id,
+                rate_limits: HashMap::new(),
+                cookies: HandshakeCookies::new(),
+            }
+        }
+
+        fn addr(&self) -> SocketAddr {
+            self.socket.local_addr().unwrap()
+        }
+
+        /// Receive one control frame and handle it as the receive loop does;
+        /// returns its TNCF type.
+        async fn handle_next(&mut self) -> u8 {
+            let mut buf = vec![0u8; MAX_DATAGRAM_BYTES];
+            let (len, src) =
+                tokio::time::timeout(Duration::from_secs(2), self.socket.recv_from(&mut buf))
+                    .await
+                    .expect("a datagram")
+                    .unwrap();
+            let datagram = &buf[..len];
+            let (frame_type, _) = parse_tncf_frame(datagram).expect("a TNCF frame");
+            handle_tncf(
+                datagram,
+                src,
+                &self.socket,
+                &self.sessions,
+                &self.peer_manager,
+                self.node_id,
+                &crate::config::Config::default(),
+                &self.key,
+                &mut self.rate_limits,
+                &self.cookies,
+                None,
+            )
+            .await;
+            frame_type
+        }
+    }
+
+    #[tokio::test]
+    async fn responder_under_load_completes_a_handshake_through_a_cookie() {
+        let mut initiator = Endpoint::new("node-a").await;
+        let mut responder = Endpoint::new("node-b").await;
+        // Half the responder's handshake slots are busy.
+        {
+            let mut map = responder.sessions.lock().await;
+            for _ in 0..HANDSHAKE_COOKIE_THRESHOLD {
+                let (pending, _) =
+                    NoiseUdpSession::new_initiator(initiator.addr(), &responder.key).unwrap();
+                map.insert(pending.session_id, pending);
+            }
+        }
+        let session_id = connect_udp(
+            responder.addr(),
+            &initiator.socket,
+            &initiator.sessions,
+            &initiator.key,
+            "node-a",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(responder.handle_next().await, tncf_type::HANDSHAKE_MSG1);
+        assert!(
+            !responder.sessions.lock().await.contains_key(&session_id),
+            "responder spent a DH before the initiator proved its address"
+        );
+        assert_eq!(initiator.handle_next().await, tncf_type::HANDSHAKE_COOKIE);
+        assert_eq!(responder.handle_next().await, tncf_type::HANDSHAKE_MSG1);
+        assert_eq!(initiator.handle_next().await, tncf_type::HANDSHAKE_MSG2);
+        assert_eq!(responder.handle_next().await, tncf_type::HANDSHAKE_MSG3);
+        assert!(initiator.sessions.lock().await[&session_id].is_established());
+        assert!(responder.sessions.lock().await[&session_id].is_established());
+
+        // The session ID is taken: another msg1 under it changes nothing.
+        let (_, msg1) =
+            NoiseUdpSession::new_initiator(responder.addr(), &generate_noise_private_key())
+                .unwrap();
+        let frame = build_tncf_frame(
+            tncf_type::HANDSHAKE_MSG1,
+            &build_handshake_body(&session_id, &[], &msg1),
+        );
+        initiator
+            .socket
+            .send_to(&frame, responder.addr())
+            .await
+            .unwrap();
+        assert_eq!(responder.handle_next().await, tncf_type::HANDSHAKE_MSG1);
+        assert!(responder.sessions.lock().await[&session_id].is_established());
+    }
+
+    #[tokio::test]
+    async fn forged_handshake_messages_leave_sessions_in_place() {
+        let mut initiator = Endpoint::new("node-a").await;
+        let mut responder = Endpoint::new("node-b").await;
+        let session_id = connect_udp(
+            responder.addr(),
+            &initiator.socket,
+            &initiator.sessions,
+            &initiator.key,
+            "node-a",
+        )
+        .await
+        .unwrap();
+
+        // While the initiator waits for msg2, a third party that knows the
+        // session ID cannot end the handshake.
+        let attacker = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut forged = session_id.to_vec();
+        forged.extend_from_slice(&[0u8; 16]);
+        let forged_msg2 = build_tncf_frame(tncf_type::HANDSHAKE_MSG2, &forged);
+        attacker
+            .send_to(&forged_msg2, initiator.addr())
+            .await
+            .unwrap();
+        assert_eq!(initiator.handle_next().await, tncf_type::HANDSHAKE_MSG2);
+        assert!(initiator.sessions.lock().await.contains_key(&session_id));
+
+        assert_eq!(responder.handle_next().await, tncf_type::HANDSHAKE_MSG1);
+        assert_eq!(initiator.handle_next().await, tncf_type::HANDSHAKE_MSG2);
+        assert_eq!(responder.handle_next().await, tncf_type::HANDSHAKE_MSG3);
+        assert!(initiator.sessions.lock().await[&session_id].is_established());
+        assert!(responder.sessions.lock().await[&session_id].is_established());
+
+        // Nor an established session, from any address.
+        let forged_msg3 = build_tncf_frame(tncf_type::HANDSHAKE_MSG3, &forged);
+        for sender in [&attacker, &*initiator.socket] {
+            sender
+                .send_to(&forged_msg3, responder.addr())
+                .await
+                .unwrap();
+            assert_eq!(responder.handle_next().await, tncf_type::HANDSHAKE_MSG3);
+            assert!(responder.sessions.lock().await[&session_id].is_established());
+        }
+        for sender in [&attacker, &*responder.socket] {
+            sender
+                .send_to(&forged_msg2, initiator.addr())
+                .await
+                .unwrap();
+            assert_eq!(initiator.handle_next().await, tncf_type::HANDSHAKE_MSG2);
+            assert!(initiator.sessions.lock().await[&session_id].is_established());
+        }
+    }
+
+    #[tokio::test]
+    async fn outgoing_handshakes_respect_the_handshake_cap() {
+        let node = Endpoint::new("node-a").await;
+        let target: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        {
+            let mut map = node.sessions.lock().await;
+            for _ in 0..MAX_CONCURRENT_HANDSHAKES {
+                let (pending, _) = NoiseUdpSession::new_initiator(target, &node.key).unwrap();
+                map.insert(pending.session_id, pending);
+            }
+        }
+        assert!(
+            connect_udp(target, &node.socket, &node.sessions, &node.key, "node-a")
+                .await
+                .is_err()
+        );
+        assert_eq!(node.sessions.lock().await.len(), MAX_CONCURRENT_HANDSHAKES);
+    }
+
+    #[tokio::test]
+    async fn keepalive_refreshes_no_session() {
+        let mut node = Endpoint::new("node-b").await;
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (mut session, _) =
+            NoiseUdpSession::new_initiator(sender.local_addr().unwrap(), &node.key).unwrap();
+        let idle_since = Instant::now()
+            .checked_sub(Duration::from_secs(100))
+            .unwrap();
+        session.last_seen = idle_since;
+        let session_id = session.session_id;
+        node.sessions.lock().await.insert(session_id, session);
+
+        sender
+            .send_to(&build_tncf_frame(tncf_type::KEEPALIVE, &[]), node.addr())
+            .await
+            .unwrap();
+        assert_eq!(node.handle_next().await, tncf_type::KEEPALIVE);
+        assert_eq!(
+            node.sessions.lock().await[&session_id].last_seen,
+            idle_since
+        );
+    }
+
+    fn noise_tofu_config(dir: &Path) -> crate::config::Config {
         crate::config::Config {
             encryption: Some(crate::config::EncryptionConfig {
                 noise: Some(crate::config::EncryptionNoiseConfig {
+                    paths: Some(crate::config::NoisePaths {
+                        trusted_dir: Some(dir.join("trusted").to_string_lossy().into_owned()),
+                        rejected_dir: Some(dir.join("rejected").to_string_lossy().into_owned()),
+                        ..Default::default()
+                    }),
                     trust_policy: Some(crate::config::NoiseTrustPolicyConfig {
                         mode: Some("tofu".to_string()),
-                        store_new: Some("observed".to_string()),
-                        paths: Some(crate::config::TrustPolicyPathsConfig {
-                            observed_dir: Some(observed_dir.to_string_lossy().into_owned()),
-                            allowlist_dir: None,
-                        }),
                         ..Default::default()
                     }),
                     ..Default::default()
@@ -1018,14 +1508,18 @@ mod tests {
         }
     }
 
-    /// Regression test for the disk-I/O-under-lock hazard: TOFU trust evaluation
-    /// reads/writes an on-disk observed-binding file (`evaluate_noise_fingerprint`
-    /// → `load_observed_fingerprint_binding`/`store_observed_fingerprint_binding`),
-    /// which is exactly the blocking path that must never run while the
-    /// `UdpSessions` lock is held. `finalize_session` takes owned data instead of a
-    /// session reference precisely so it cannot be called under that lock.
+    fn trusted_key_file(dir: &Path, session: &NoiseUdpSession) -> std::path::PathBuf {
+        let fingerprint = hex::encode(session.remote_static_fingerprint().unwrap());
+        dir.join("trusted").join(format!("{fingerprint}.noise"))
+    }
+
+    /// TOFU trusts a new key by writing it to the trusted directory, and only
+    /// once the session is admitted (ADR-0016). Trust evaluation reads that
+    /// directory, the blocking path that must never run while the
+    /// `UdpSessions` lock is held; `finalize_session` takes owned data instead
+    /// of a session reference precisely so it cannot be called under that lock.
     #[tokio::test]
-    async fn udp_session_finalize_applies_noise_tofu_with_directory_backed_binding() {
+    async fn udp_session_finalize_applies_noise_tofu_with_a_directory_backed_trust_store() {
         let temp = tempfile::tempdir().unwrap();
         let config = noise_tofu_config(temp.path());
 
@@ -1033,8 +1527,8 @@ mod tests {
         let remote_addr: SocketAddr = "127.0.0.1:2".parse().unwrap();
         let remote_node_id = "remote-peer";
 
-        // First handshake: TOFU has no prior binding, so it must be accepted and
-        // the binding persisted to disk.
+        // First handshake: the key is new, so TOFU accepts it, and it is
+        // trusted once the session is admitted.
         let (session_a, _) = establish_pair(local_addr, remote_addr, remote_node_id, "local-node");
         let peer_manager = PeerManager::new();
         assert!(
@@ -1051,26 +1545,27 @@ mod tests {
             peer_manager.udp_session_id_for(remote_node_id).await,
             Some(session_a.session_id)
         );
+        assert!(trusted_key_file(temp.path(), &session_a).exists());
 
-        // Second handshake from a different remote static key (impersonation
-        // attempt) under the same identity must be rejected because it no longer
-        // matches the persisted binding.
+        // Another key claiming the same node ID (impersonation attempt) is a
+        // first use for TOFU, but the node identity binding refuses it, so it
+        // is never trusted.
         let (session_b, _) = establish_pair(local_addr, remote_addr, remote_node_id, "local-node");
-        let rejected_manager = PeerManager::new();
         assert!(
             !finalize_session(
                 session_b.session_id,
                 EstablishedSessionInfo::capture(&session_b),
-                &rejected_manager,
+                &peer_manager,
                 &config,
                 crate::events::model::ConnectionRole::Outbound,
             )
             .await
         );
         assert_eq!(
-            rejected_manager.udp_session_id_for(remote_node_id).await,
-            None
+            peer_manager.udp_session_id_for(remote_node_id).await,
+            Some(session_a.session_id)
         );
+        assert!(!trusted_key_file(temp.path(), &session_b).exists());
     }
 
     /// Regression test for directory-backed Noise allowlists, another
@@ -1092,12 +1587,12 @@ mod tests {
         let config = crate::config::Config {
             encryption: Some(crate::config::EncryptionConfig {
                 noise: Some(crate::config::EncryptionNoiseConfig {
+                    paths: Some(crate::config::NoisePaths {
+                        trusted_dir: Some(temp.path().to_string_lossy().into_owned()),
+                        ..Default::default()
+                    }),
                     trust_policy: Some(crate::config::NoiseTrustPolicyConfig {
                         mode: Some("allowlist".to_string()),
-                        paths: Some(crate::config::TrustPolicyPathsConfig {
-                            observed_dir: None,
-                            allowlist_dir: Some(temp.path().to_string_lossy().into_owned()),
-                        }),
                         ..Default::default()
                     }),
                     ..Default::default()
@@ -1131,7 +1626,10 @@ mod tests {
         let config = crate::config::Config {
             encryption: Some(crate::config::EncryptionConfig {
                 noise: Some(crate::config::EncryptionNoiseConfig {
-                    static_key_path: Some(key_path.to_string_lossy().into_owned()),
+                    paths: Some(crate::config::NoisePaths {
+                        static_key: Some(key_path.to_string_lossy().into_owned()),
+                        ..Default::default()
+                    }),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -1149,6 +1647,7 @@ mod tests {
     /// re-entering `send_udp` on the same `sessions` map used by `handle_session_frame`.
     struct ReplyingPlugin {
         target_node_id: String,
+        replied: Arc<tokio::sync::Notify>,
     }
 
     #[async_trait]
@@ -1159,9 +1658,14 @@ mod tests {
 
         async fn on_message(&self, _message: &Message, ctx: &PluginContext) {
             let _ = ctx
-                .peer_manager
-                .send_udp_message_to_node(&self.target_node_id, b"pong")
+                .peer_manager()
+                .expect("statically registered plugins keep low-level access")
+                .send_udp_message_to_node(
+                    &self.target_node_id,
+                    Message::outbound(MessageType::Heartbeat, None, None),
+                )
                 .await;
+            self.replied.notify_one();
         }
     }
 
@@ -1201,7 +1705,12 @@ mod tests {
         let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let peer_manager = PeerManager::new();
         peer_manager
-            .set_udp_handle(socket, sessions.clone(), generate_noise_private_key())
+            .set_udp_handle(
+                socket,
+                sessions.clone(),
+                generate_noise_private_key(),
+                local_node_id.to_string(),
+            )
             .await;
         peer_manager
             .set_udp_session_id(remote_node_id, session_id)
@@ -1215,16 +1724,28 @@ mod tests {
             crate::config::Config::default(),
             false,
         );
+        let replied = Arc::new(tokio::sync::Notify::new());
         let mut plugin_manager = PluginManager::with_context(ctx);
-        plugin_manager.register_handler(Box::new(ReplyingPlugin {
-            target_node_id: remote_node_id.to_string(),
-        }));
+        plugin_manager
+            .register_handler(Box::new(ReplyingPlugin {
+                target_node_id: remote_node_id.to_string(),
+                replied: replied.clone(),
+            }))
+            .expect("plugin should register");
         let plugin_manager = Arc::new(plugin_manager);
+        let report = plugin_manager
+            .start_all(crate::plugin_host::StartPolicy::StopOnFirstFailure)
+            .await
+            .expect("plugins should start");
+        assert!(report.all_started());
+        plugin_manager
+            .activate()
+            .expect("activation should succeed");
 
         // Bound the regression test so a sessions-lock reentrancy bug fails promptly
-        // instead of hanging the test suite.
-        tokio::time::timeout(
-            Duration::from_secs(1),
+        // instead of hanging the test suite. Dispatch only admits the message, so the
+        // plugin's reply runs on its own task while the receive path continues.
+        tokio::time::timeout(Duration::from_secs(1), async {
             handle_session_frame(
                 &datagram,
                 remote_addr,
@@ -1232,12 +1753,19 @@ mod tests {
                 &peer_manager,
                 &plugin_manager,
                 local_node_id,
-            ),
-        )
+            )
+            .await;
+            replied.notified().await;
+        })
         .await
         .expect(
             "handle_session_frame must not deadlock when a plugin replies over UDP \
              from on_message",
         );
+        let report = plugin_manager
+            .shutdown(crate::plugin_host::ShutdownMode::Drain)
+            .await
+            .expect("shutdown should report");
+        assert!(report.is_clean(), "{report:?}");
     }
 }

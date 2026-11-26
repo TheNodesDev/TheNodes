@@ -334,9 +334,7 @@ impl CustomPluginHost {
         target: &str,
         ctx: &PluginContext,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let message = Message::new(
-            "",
-            target,
+        let message = Message::outbound(
             MessageType::Extension {
                 kind: msg_type.to_string(),
             },

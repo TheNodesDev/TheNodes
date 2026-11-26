@@ -12,6 +12,17 @@ documentation = "https://docs.rs/thenodes"
 keywords = ["p2p", "networking", "async", "plugins", "security"]
 categories = ["network-programming", "asynchronous", "cryptography"]
 
+# Native plugins must be built with the same lockfile, toolchain, and feature
+# set as their host. The example plugin and the test fixtures are workspace
+# members so they share this Cargo.lock.
+[workspace]
+members = [
+    ".",
+    "examples/kvstore_plugin",
+    "tests/fixtures/plugin_lifecycle",
+    "tests/fixtures/plugin_legacy",
+]
+
 [lib]
 name = "thenodes"
 crate-type = ["cdylib", "rlib"]  # Supports both CAL (rlib) and NEP (cdylib)
@@ -53,6 +64,14 @@ deunicode = "1"
 snow = { version = "0.9", optional = true }
 igd-next = { version = "=0.16.1", optional = true, features = ["aio_tokio"] }
 
+# Owner and group lookups for the plugin path check (already locked through rustyline).
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.26", default-features = false, features = ["user"] }
+
+# POSIX ACL detection for the plugin path check (already locked through tokio).
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [features]
 default = []
 noise = ["snow"]
@@ -60,3 +79,5 @@ upnp = ["dep:igd-next"]
 
 [dev-dependencies]
 tempfile = "3.10"
+# Paused clock for deterministic timing tests.
+tokio = { version = "1.35", features = ["test-util"] }

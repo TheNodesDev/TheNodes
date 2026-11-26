@@ -98,9 +98,9 @@ When running with `--prompt`, enter `app` to open the application command prompt
 - `session list`: List active sessions
 
 ### Trust Management
-- `trust observed list`: List observed certificate fingerprints
-- `trust trusted list`: List trusted certificate filenames
-- `trust promote <fingerprint>`: Promote an observed fingerprint to trusted
+- `trust rejected list`: List rejected certificates and keys
+- `trust trusted list`: List trusted certificates and keys
+- `trust promote <fingerprint>`: Move a rejected certificate or key to trusted
 
 ## Creating Custom Plugins
 

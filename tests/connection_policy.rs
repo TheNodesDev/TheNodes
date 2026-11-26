@@ -26,6 +26,7 @@ fn minimal_config() -> thenodes::config::Config {
         discovery: None,
         realm_access: None,
         network: Some(NetworkConfig {
+            bind_ip: None,
             persistence: None,
             relay: None,
             nat: None,
@@ -33,6 +34,7 @@ fn minimal_config() -> thenodes::config::Config {
             connection_policy: None,
             nat_traversal: None,
             delivery: None,
+            limits: None,
         }),
     }
 }
@@ -45,7 +47,7 @@ fn punch_enabled_config(refresh_secs: u64) -> thenodes::config::Config {
             enabled: Some(true),
             listen_port: Some(41000),
             max_datagram_bytes: Some(1200),
-            max_app_payload_bytes: Some(1176),
+            max_app_payload_bytes: Some(1168),
         });
         network.nat_traversal = Some(thenodes::config::NatTraversalConfig {
             enabled: Some(true),
@@ -54,6 +56,7 @@ fn punch_enabled_config(refresh_secs: u64) -> thenodes::config::Config {
             cookie_ttl_secs: Some(30),
             probe_count: Some(6),
             probe_interval_ms: Some(100),
+            allowed_rendezvous: None,
         });
     }
     cfg
@@ -219,5 +222,96 @@ async fn punch_strategy_falls_back_when_observed_addr_is_stale() {
     assert!(matches!(
         outcome,
         ConnectionOutcome::ViaRelay { relay_node_id } if relay_node_id == "relay-node"
+    ));
+}
+
+/// Any peer that announced `relay` could be chosen as relay; with
+/// `[network.relay] allowed_relays` set, only the peers it names are.
+#[tokio::test]
+async fn only_allowed_relays_are_chosen() {
+    let pm = PeerManager::new();
+    let mut receivers = Vec::new();
+    for (port, node_id) in [(42011, "relay-a"), (42012, "relay-b")] {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        receivers.push(rx);
+        pm.add_peer(
+            format!("127.0.0.1:{port}").parse().unwrap(),
+            tx,
+            node_id.to_string(),
+        )
+        .await
+        .unwrap();
+        pm.set_peer_capabilities(node_id, Some(vec!["relay".to_string()]))
+            .await;
+    }
+    let route = |allowed: Option<Vec<String>>| {
+        let mut cfg = minimal_config();
+        cfg.network.as_mut().unwrap().relay = Some(thenodes::config::RelayConfig {
+            allowed_relays: allowed,
+            ..Default::default()
+        });
+        let pm = pm.clone();
+        async move { connect_with_policy("target-node", &make_policy("relay_only"), &pm, &cfg).await }
+    };
+
+    assert!(matches!(
+        route(None).await,
+        ConnectionOutcome::ViaRelay { .. }
+    ));
+    assert!(matches!(
+        route(Some(vec!["relay-b".into()])).await,
+        ConnectionOutcome::ViaRelay { relay_node_id } if relay_node_id == "relay-b"
+    ));
+    assert!(matches!(
+        route(Some(Vec::new())).await,
+        ConnectionOutcome::NoRoute { .. }
+    ));
+}
+
+/// A rendezvous outside `[network.nat_traversal] allowed_rendezvous` is
+/// not used for hole punching.
+#[cfg(feature = "noise")]
+#[tokio::test]
+async fn only_an_allowed_rendezvous_coordinates_a_punch() {
+    let pm = PeerManager::new();
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    pm.add_peer(
+        "127.0.0.1:41003".parse().unwrap(),
+        tx,
+        "rendezvous-node".to_string(),
+    )
+    .await
+    .unwrap();
+    pm.set_peer_capabilities(
+        "rendezvous-node",
+        Some(vec!["relay".to_string(), "punch_rendezvous".to_string()]),
+    )
+    .await;
+    pm.set_peer_capabilities("target-node", Some(vec!["punch".to_string()]))
+        .await;
+    pm.add_udp_observed_addr("target-node", "203.0.113.12:5003", Some("observer-1"), None)
+        .await;
+    pm.mark_route_unresponsive("target-node", RouteKind::Udp)
+        .await;
+
+    let mut cfg = punch_enabled_config(300);
+    let nat = cfg
+        .network
+        .as_mut()
+        .unwrap()
+        .nat_traversal
+        .as_mut()
+        .unwrap();
+    nat.allowed_rendezvous = Some(vec!["other-node".to_string()]);
+    let outcome = connect_with_policy(
+        "target-node",
+        &make_policy("direct_then_punch_then_relay"),
+        &pm,
+        &cfg,
+    )
+    .await;
+    assert!(matches!(
+        outcome,
+        ConnectionOutcome::ViaRelay { relay_node_id } if relay_node_id == "rendezvous-node"
     ));
 }

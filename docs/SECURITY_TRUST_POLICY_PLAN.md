@@ -2,12 +2,14 @@
 
 This document captures the design and phased implementation approach for flexible certificate trust policies. It relocates `accept_self_signed` under a new `[encryption.trust_policy]` section and introduces richer policy controls.
 
+> Since 0.5.0 ([ADR-0016](adr/0016-secure-channel-configuration-and-certificate-store.md)) the TLS settings in this plan live under `[encryption.tls]`: `[encryption.tls.paths]`, `[encryption.tls.trust_policy]` and `[encryption.tls] mtls`. The observed store (`observed_dir`, `store_new_certs`, TOFU bindings) was replaced: rejected certificates are kept in `rejected_dir`, and `tofu` adds the certificates it accepts to `trusted_cert_dir`. The snippets below show the layout at the time of each phase.
+
 > Security-by-default alignment: Production templates in TheNodes enable TLS (`encryption.enabled = true`) and recommend `mtls = true` with a restrictive trust policy (e.g., `mode = "allowlist"`, optional pinning) out of the box. Development usage may explicitly disable encryption for local testing. The schema and phases below remain the same; the difference is the default posture in distributed templates.
 
 Operational helpers:
 - Use `thenodes-cert` to bootstrap test credentials and obtain SPKI fingerprints:
   ```bash
-  cargo run --bin thenodes-cert -- --realm <realm> --copy-to-trusted
+  cargo run --bin thenodes-cert -- --realm-code <realm-code> --node-id <node-id> --copy-to-trusted
   ```
   Place outputs under `pki/` and optionally pin the printed fingerprint in `[encryption.trust_policy]`.
 - When running with the interactive prompt, operators can manage trust state at runtime:
@@ -59,7 +61,7 @@ enabled = true
   pin_subjects = []           # Phase 3
   pin_fp_algo = "sha256"     # Phase 3
   pin_fingerprints = []       # Phase 3 (DELIVERED)
-  realm_subject_binding = false # Phase 3 (DELIVERED)
+  require_realm_node_name = false # Phase 3; replaced realm_subject_binding in 0.5.0
 
   [encryption.trust_policy.paths]
   observed_dir = "pki/observed/certs"   # created if needed
@@ -137,12 +139,12 @@ Delivered in code:
   - `pin_subjects = []` (list of exact subjects or substring matches when prefixed with `~`).
   - `pin_fingerprints = []` (list of SPKI SHA-256 hex strings; comparison is case-sensitive exact).
   - `pin_fp_algo = "sha256"` (currently only `sha256` accepted; future algorithms may include `sha512`).
-  - `realm_subject_binding = false` (when true, the active realm name must appear as a substring inside the certificate subject; enforced before mode logic).
+  - `require_realm_node_name = false` (when true, the leaf must name a node in this node's realm with a `URI:node://<realm>/<node_id>` SAN; enforced before mode logic). It replaced `realm_subject_binding`, a substring check on the subject, in 0.5.0.
 2. Enforcement ordering (hard reject at first unmet constraint):
   1. Cryptographic chain and time flags (`enforce_ca_chain`, `reject_expired`, `reject_before_valid`).
   2. Fingerprint pin set (if non-empty) – peer fingerprint MUST be present.
   3. Subject pin set – peer subject MUST match an entry (exact or substring rule).
-  4. Realm binding (if enabled) – realm name substring check against subject.
+  4. Realm node name (if enabled) – the leaf names a node in this realm.
   5. Mode-specific evaluation (`open | allowlist | observe | tofu`).
 3. Promotion helper: `promote_observed_to_trusted(observed_dir, trusted_dir, fingerprint)` copies `<observed_dir>/<fp>.pem` to trusted store (idempotent; returns `Ok(true)` if newly promoted, `Ok(false)` otherwise).
 4. Tests: `tests/pins.rs` covers positive and negative paths for fingerprint and subject pin matching.
@@ -152,7 +154,7 @@ Delivered in code:
 Operational guidance:
 - Use pinning to freeze expected identities after an initial TOFU observation period. Populate `pin_fingerprints` from logged fingerprints or observed directory filenames.
 - Subject pins are useful when operating a private CA issuing predictable CN/OU patterns. Use `~substring` form for coarse pattern binding without regex overhead (e.g., `~MyOrg-Nodes`).
-- Enable `realm_subject_binding` to ensure cross-realm certificates (misconfiguration or malicious) are rejected early.
+- Enable `require_realm_node_name` to ensure cross-realm certificates (misconfiguration or malicious) are rejected early, even from a CA shared by several realms.
 - Always keep at least one path (pins or allowlist) consistent across rolling certificate rotations; update pins before deploying new certs to avoid outages.
 
 Limitations / Deferred items:

@@ -7,40 +7,14 @@ use crate::network::message::{encode_relay_opaque_payload, Message, MessageType,
 use crate::network::peer_manager::PeerManager;
 use crate::realms::RealmInfo;
 
+/// Bindings one client may hold on this relay.
+pub const MAX_BINDINGS_PER_CLIENT: usize = 64;
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
-}
-
-/// Deterministic relay selection via Rendezvous (HRW) hashing
-async fn rendezvous_select(
-    pm: &PeerManager,
-    key: &str,
-    require_store_forward: bool,
-) -> Option<String> {
-    use std::hash::{Hash, Hasher};
-    let candidates = pm.list_node_ids().await;
-    let mut best_id: Option<String> = None;
-    let mut best_score: u64 = 0;
-    for nid in candidates {
-        // Capability gating: must have relay, and optionally relay_store_forward
-        if !pm.peer_has_capability(&nid, "relay").await {
-            continue;
-        }
-        if require_store_forward && !pm.peer_has_capability(&nid, "relay_store_forward").await {
-            continue;
-        }
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        (key, &nid).hash(&mut hasher);
-        let score = hasher.finish();
-        if score > best_score {
-            best_score = score;
-            best_id = Some(nid);
-        }
-    }
-    best_id
 }
 
 pub async fn handle_bind(
@@ -76,9 +50,25 @@ pub async fn handle_bind(
                 }
             }
         }
-        if ok && peer_manager.is_bound(&msg.from, target).await {
+        // An expired binding no longer forwards (see `handle_forward`), so it
+        // may be replaced.
+        let binding_live = peer_manager.is_bound(&msg.from, target).await
+            && !peer_manager
+                .binding_expires_at(&msg.from, target)
+                .await
+                .is_some_and(|exp| exp <= now_secs());
+        if ok && binding_live {
             ok = false;
             reason = Some(Reason::AlreadyBound);
+        }
+        // Targets are arbitrary strings, so each client's bindings are capped.
+        // Replacing an expired binding does not add one.
+        if ok
+            && !peer_manager.is_bound(&msg.from, target).await
+            && peer_manager.binding_count_from(&msg.from).await >= MAX_BINDINGS_PER_CLIENT
+        {
+            ok = false;
+            reason = Some(Reason::Overload);
         }
         if ok {
             let t = target.trim();
@@ -96,33 +86,23 @@ pub async fn handle_bind(
         }
         let present = peer_manager.has_node_id(target).await;
         let reason_snapshot = reason.clone();
-        let ack = Message::new(
-            &addr.to_string(),
-            &addr.to_string(),
+        // Random, so a binding cannot be named by anyone who did not see the
+        // acknowledgement; `handle_unbind` also checks the owner.
+        let binding_id = ok.then(|| format!("bind:{}", uuid::Uuid::new_v4().simple()));
+        let ack = Message::outbound(
             MessageType::RelayBindAck {
                 ok,
                 reason,
-                binding_id: if ok {
-                    Some(format!(
-                        "bind:{}:{}:{}",
-                        msg.from,
-                        target,
-                        nonce.unwrap_or(0)
-                    ))
-                } else {
-                    None
-                },
+                binding_id: binding_id.clone(),
                 peer_present: Some(present),
                 nonce: *nonce,
             },
             None,
             msg.realm.clone(),
         );
-        let _ = peer_manager.send_to_addr(addr, ack.as_json()).await;
+        let _ = peer_manager.send_to_addr(addr, ack).await;
         if !ok && matches!(reason_snapshot, Some(Reason::Overload)) {
-            let notify = Message::new(
-                &addr.to_string(),
-                &addr.to_string(),
+            let notify = Message::outbound(
                 MessageType::RelayNotify {
                     notif_type: Reason::Overload,
                     binding_id: None,
@@ -131,7 +111,7 @@ pub async fn handle_bind(
                 None,
                 msg.realm.clone(),
             );
-            let _ = peer_manager.send_to_addr(addr, notify.as_json()).await;
+            let _ = peer_manager.send_to_addr(addr, notify).await;
         }
         if ok {
             let store_fwd = relay_store_forward_enabled
@@ -140,8 +120,10 @@ pub async fn handle_bind(
             peer_manager
                 .set_binding(&msg.from, target, store_fwd, exp, qos.clone())
                 .await;
-            if let Some(bid) = nonce.map(|n| format!("bind:{}:{}:{}", msg.from, target, n)) {
-                peer_manager.add_binding_id(&bid, &msg.from, target).await;
+            if let Some(binding_id) = &binding_id {
+                peer_manager
+                    .add_binding_id(binding_id, &msg.from, target)
+                    .await;
             }
         }
         // Emit simple system event for traceability
@@ -193,9 +175,7 @@ impl RelayBindBuilder {
     ) {
         let nonce = Some(now_secs());
         let expires_at = self.ttl_secs.map(|t| now_secs() + t);
-        let msg = Message::new(
-            &addr.to_string(),
-            &addr.to_string(),
+        let msg = Message::outbound(
             MessageType::RelayBind {
                 target: self.to.clone(),
                 want_store_forward: self.want_store_forward,
@@ -206,7 +186,7 @@ impl RelayBindBuilder {
             None,
             realm,
         );
-        let _ = peer_manager.send_to_addr(addr, msg.as_json()).await;
+        let _ = peer_manager.send_to_addr(addr, msg).await;
     }
 }
 
@@ -248,9 +228,7 @@ impl RelayForwardBuilder {
         addr: &SocketAddr,
         realm: Option<RealmInfo>,
     ) {
-        let msg = Message::new(
-            &addr.to_string(),
-            &addr.to_string(),
+        let msg = Message::outbound(
             MessageType::RelayForward {
                 to: self.to.clone(),
                 from: self.from.clone(),
@@ -260,17 +238,53 @@ impl RelayForwardBuilder {
             None,
             realm,
         );
-        let _ = peer_manager.send_to_addr(addr, msg.as_json()).await;
+        let _ = peer_manager.send_to_addr(addr, msg).await;
     }
 }
 
+/// Why a relay refuses to forward a frame, as a notification reason and an
+/// event reason.
+fn forward_refusal(
+    msg: &Message,
+    from: &str,
+    bound: bool,
+    expires_at: Option<u64>,
+) -> Option<(Reason, &'static str)> {
+    // `msg.from` is the peer on this connection (ADR-0012); the tunnel may
+    // name only that peer as its origin.
+    if from != msg.from {
+        return Some((Reason::PolicyDenied, "origin-mismatch"));
+    }
+    if !bound {
+        return Some((Reason::PolicyDenied, "not-bound"));
+    }
+    if expires_at.is_some_and(|expires_at| expires_at <= now_secs()) {
+        return Some((Reason::Timeout, "binding-expired"));
+    }
+    None
+}
+
+fn relay_notify(notif_type: Reason, detail: String, msg: &Message) -> Message {
+    Message::outbound(
+        MessageType::RelayNotify {
+            notif_type,
+            binding_id: None,
+            detail: Some(detail),
+        },
+        None,
+        msg.realm.clone(),
+    )
+}
+
+/// Forward a `RELAY_FWD` from a bound peer to its target, or queue it for
+/// store-and-forward. The relay forwards only to targets connected to it; it
+/// never hands a frame on to another relay.
 pub async fn handle_forward(
     msg: &Message,
     addr: &SocketAddr,
     peer_manager: &PeerManager,
     relay_enabled: bool,
     relay_store_forward_enabled: bool,
-    relay_selection_enabled: bool,
     _allow_console: bool,
 ) {
     if !relay_enabled {
@@ -283,6 +297,23 @@ pub async fn handle_forward(
         opaque_payload_b64,
     } = &msg.msg_type
     {
+        let bound = peer_manager.is_bound(from, to).await;
+        let expires_at = peer_manager.binding_expires_at(from, to).await;
+        if let Some((reason, code)) = forward_refusal(msg, from, bound, expires_at) {
+            let mut meta = dispatcher::meta("relay", LogLevel::Warn);
+            meta.corr_id = Some(dispatcher::correlation_id());
+            dispatcher::emit(LogEvent::System(SystemEvent {
+                meta,
+                action: "relay_forward_rejected".into(),
+                detail: Some(format!(
+                    "peer={} origin={} target={} reason={}",
+                    msg.from, from, to, code
+                )),
+            }));
+            let notify = relay_notify(reason, format!("target={to} reason={code}"), msg);
+            let _ = peer_manager.send_to_addr(addr, notify).await;
+            return;
+        }
         // Dedup/order enforcement: drop if sequence <= last seen
         if let Some(seq) = *sequence {
             if let Some(last) = peer_manager.last_sequence(from, to).await {
@@ -294,18 +325,15 @@ pub async fn handle_forward(
             peer_manager.update_sequence(from, to, seq).await;
         }
         if peer_manager.has_node_id(to).await {
-            let _ = peer_manager
-                .send_to_node_id(to.as_str(), msg.as_json())
-                .await;
+            let _ = peer_manager.send_to_node_id(to.as_str(), msg.clone()).await;
             if let Some(seq) = *sequence {
-                if peer_manager.binding_qos(&msg.from, to).await.as_deref() == Some("reliable") {
-                    peer_manager.add_inflight(&msg.from, to, seq).await;
+                if peer_manager.binding_qos(from, to).await.as_deref() == Some("reliable") {
+                    peer_manager.add_inflight(from, to, seq).await;
                     // Schedule a simple timeout-based retry if ACK not received
                     let pm_clone = peer_manager.clone();
-                    let addr_clone = *addr;
                     let realm_clone = msg.realm.clone();
                     let to_clone = to.clone();
-                    let from_clone = msg.from.clone();
+                    let from_clone = from.clone();
                     let opaque_payload_b64_clone = opaque_payload_b64.clone();
                     // Optional: disable background retry via env for deterministic tests
                     if std::env::var("THENODES_DISABLE_RETRY").is_err() {
@@ -313,9 +341,7 @@ pub async fn handle_forward(
                             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                             if pm_clone.is_inflight(&from_clone, &to_clone, seq).await {
                                 // Retry once
-                                let retry = Message::new(
-                                    &addr_clone.to_string(),
-                                    &addr_clone.to_string(),
+                                let retry = Message::outbound(
                                     MessageType::RelayForward {
                                         to: to_clone.clone(),
                                         from: from_clone.clone(),
@@ -325,145 +351,49 @@ pub async fn handle_forward(
                                     None,
                                     realm_clone.clone(),
                                 );
-                                let _ = pm_clone
-                                    .send_to_node_id(to_clone.as_str(), retry.as_json())
-                                    .await;
+                                let _ = pm_clone.send_to_node_id(to_clone.as_str(), retry).await;
+                                // The one retry is spent; a late ACK has nothing to cancel.
+                                pm_clone.remove_inflight(&from_clone, &to_clone, seq).await;
                             }
                         });
                     }
                 }
             }
             peer_manager.inc_relay_forwarded();
+            return;
+        }
+
+        peer_manager.inc_relay_dropped();
+        // Check QoS: low_latency avoids enqueue
+        let qos = peer_manager.binding_qos(from, to).await;
+        if relay_store_forward_enabled
+            && peer_manager.binding_store_forward(from, to).await
+            && qos.as_deref() != Some("low_latency")
+        {
+            let priority_front = qos.as_deref() == Some("high_throughput");
+            let soft_drop_bulk = qos.as_deref() == Some("bulk");
+            let enqueued = peer_manager.can_enqueue_store_forward(to).await
+                && peer_manager
+                    .enqueue_store_forward(
+                        to,
+                        msg.as_json(),
+                        expires_at,
+                        priority_front,
+                        soft_drop_bulk,
+                        Some(from.clone()),
+                    )
+                    .await;
+            if !enqueued {
+                let notify = relay_notify(Reason::Overload, format!("target={to}"), msg);
+                let _ = peer_manager.send_to_addr(addr, notify).await;
+            }
         } else {
-            // Try forwarding to a deterministically selected relay peer when enabled
-            if relay_selection_enabled {
-                if let Some(relay_id) =
-                    rendezvous_select(peer_manager, to, relay_store_forward_enabled).await
-                {
-                    let qos = peer_manager.binding_qos(&msg.from, to).await;
-                    let first = peer_manager
-                        .send_to_node_id(relay_id.as_str(), msg.as_json())
-                        .await;
-                    if first.is_err() && qos.as_deref() == Some("reliable") {
-                        // Basic Reliable QoS: single retry on immediate send failure
-                        let _ = peer_manager
-                            .send_to_node_id(relay_id.as_str(), msg.as_json())
-                            .await;
-                    }
-                    // Consider this forwarded via relay
-                    peer_manager.inc_relay_forwarded();
-                    return;
-                }
-            }
-            peer_manager.inc_relay_dropped();
-            // Check QoS: low_latency avoids enqueue
-            let qos = peer_manager.binding_qos(&msg.from, to).await;
-            if relay_store_forward_enabled
-                && peer_manager.binding_store_forward(&msg.from, to).await
-                && qos.as_deref() != Some("low_latency")
-            {
-                let exp = peer_manager.binding_expires_at(&msg.from, to).await;
-                if !peer_manager.can_enqueue_store_forward(to).await {
-                    let notify = Message::new(
-                        &addr.to_string(),
-                        &addr.to_string(),
-                        MessageType::RelayNotify {
-                            notif_type: Reason::Overload,
-                            binding_id: None,
-                            detail: Some(format!("target={}", to)),
-                        },
-                        None,
-                        msg.realm.clone(),
-                    );
-                    let _ = peer_manager.send_to_addr(addr, notify.as_json()).await;
-                } else if let Some(e) = exp {
-                    let now = now_secs();
-                    if e <= now {
-                        let notify = Message::new(
-                            &addr.to_string(),
-                            &addr.to_string(),
-                            MessageType::RelayNotify {
-                                notif_type: Reason::Timeout,
-                                binding_id: None,
-                                detail: Some(format!("target={}", to)),
-                            },
-                            None,
-                            msg.realm.clone(),
-                        );
-                        let _ = peer_manager.send_to_addr(addr, notify.as_json()).await;
-                    } else {
-                        let priority_front = qos.as_deref() == Some("high_throughput");
-                        let soft_drop_bulk = qos.as_deref() == Some("bulk");
-                        let enq = peer_manager
-                            .enqueue_store_forward(
-                                to,
-                                msg.as_json(),
-                                Some(e),
-                                priority_front,
-                                soft_drop_bulk,
-                                Some(msg.from.clone()),
-                            )
-                            .await;
-                        if !enq {
-                            let notify = Message::new(
-                                &addr.to_string(),
-                                &addr.to_string(),
-                                MessageType::RelayNotify {
-                                    notif_type: Reason::Overload,
-                                    binding_id: None,
-                                    detail: Some(format!("target={}", to)),
-                                },
-                                None,
-                                msg.realm.clone(),
-                            );
-                            let _ = peer_manager.send_to_addr(addr, notify.as_json()).await;
-                        }
-                    }
-                } else {
-                    let priority_front = qos.as_deref() == Some("high_throughput");
-                    let soft_drop_bulk = qos.as_deref() == Some("bulk");
-                    let enq = peer_manager
-                        .enqueue_store_forward(
-                            to,
-                            msg.as_json(),
-                            None,
-                            priority_front,
-                            soft_drop_bulk,
-                            Some(msg.from.clone()),
-                        )
-                        .await;
-                    if !enq {
-                        let notify = Message::new(
-                            &addr.to_string(),
-                            &addr.to_string(),
-                            MessageType::RelayNotify {
-                                notif_type: Reason::Overload,
-                                binding_id: None,
-                                detail: Some(format!("target={}", to)),
-                            },
-                            None,
-                            msg.realm.clone(),
-                        );
-                        let _ = peer_manager.send_to_addr(addr, notify.as_json()).await;
-                    }
-                }
-            } else {
-                let notify = Message::new(
-                    &addr.to_string(),
-                    &addr.to_string(),
-                    MessageType::RelayNotify {
-                        notif_type: Reason::Timeout,
-                        binding_id: None,
-                        detail: Some(format!(
-                            "target={} policy=store_forward_disabled_or_low_latency",
-                            to
-                        )),
-                    },
-                    None,
-                    msg.realm.clone(),
-                );
-                let _ = peer_manager.send_to_addr(addr, notify.as_json()).await;
-            }
+            let notify = relay_notify(
+                Reason::Timeout,
+                format!("target={to} policy=store_forward_disabled_or_low_latency"),
+                msg,
+            );
+            let _ = peer_manager.send_to_addr(addr, notify).await;
         }
     }
 }
@@ -475,10 +405,13 @@ pub async fn handle_unbind(
     _allow_console: bool,
 ) {
     if let MessageType::RelayUnbind { binding_id } = &msg.msg_type {
-        if let Some((_from, _to)) = peer_manager.remove_binding_by_id(binding_id).await {
-            let notify = Message::new(
-                &addr.to_string(),
-                &addr.to_string(),
+        // Only the node that created a binding can remove it.
+        let removed = peer_manager
+            .remove_binding_by_id(binding_id, &msg.from)
+            .await
+            .is_some();
+        if removed {
+            let notify = Message::outbound(
                 MessageType::RelayNotify {
                     notif_type: Reason::PeerLeft,
                     binding_id: Some(binding_id.clone()),
@@ -487,14 +420,17 @@ pub async fn handle_unbind(
                 None,
                 msg.realm.clone(),
             );
-            let _ = peer_manager.send_to_addr(addr, notify.as_json()).await;
+            let _ = peer_manager.send_to_addr(addr, notify).await;
         }
         let mut meta = dispatcher::meta("relay", LogLevel::Info);
         meta.corr_id = Some(dispatcher::correlation_id());
         dispatcher::emit(LogEvent::System(SystemEvent {
             meta,
             action: "relay_unbind_processed".into(),
-            detail: Some(format!("binding_id={}", binding_id)),
+            detail: Some(format!(
+                "peer={} binding_id={} removed={}",
+                msg.from, binding_id, removed
+            )),
         }));
     }
 }
@@ -504,6 +440,17 @@ pub async fn handle_ack(msg: &Message, _addr: &SocketAddr, peer_manager: &PeerMa
         to, from, sequence, ..
     } = &msg.msg_type
     {
+        // Only the target a frame was forwarded to acknowledges it.
+        if msg.from != *to {
+            let mut meta = dispatcher::meta("relay", LogLevel::Warn);
+            meta.corr_id = Some(dispatcher::correlation_id());
+            dispatcher::emit(LogEvent::System(SystemEvent {
+                meta,
+                action: "relay_ack_rejected".into(),
+                detail: Some(format!("peer={} target={} origin={}", msg.from, to, from)),
+            }));
+            return;
+        }
         peer_manager.remove_inflight(from, to, *sequence).await;
     }
 }

@@ -1,13 +1,19 @@
 use std::fs;
 
 use rcgen::{
-    date_time_ymd, BasicConstraints, Certificate, CertificateParams, ExtendedKeyUsagePurpose, IsCa,
-    KeyPair, KeyUsagePurpose, PublicKeyData, SignatureAlgorithm,
+    date_time_ymd, BasicConstraints, Certificate, CertificateParams,
+    CertificateRevocationListParams, ExtendedKeyUsagePurpose, IsCa, KeyIdMethod, KeyPair,
+    KeyUsagePurpose, PublicKeyData, RevocationReason, RevokedCertParams, SerialNumber,
+    SignatureAlgorithm,
 };
 use tempfile::TempDir;
-use thenodes::config::{Config, EncryptionConfig, EncryptionPaths, TrustPolicyConfig};
+use thenodes::config::{
+    Config, EncryptionConfig, EncryptionTlsConfig, TlsPaths, TlsTrustPolicyConfig,
+};
 use thenodes::realms::RealmInfo;
-use thenodes::security::encryption::{extract_validity_windows, validate_certificate_chain};
+use thenodes::security::encryption::{
+    check_revocation_config, extract_validity_windows, validate_certificate_chain,
+};
 use thenodes::security::secure_channel::{SecureChannel, TlsSecureChannel};
 use thenodes::security::trust::{
     evaluate_peer_cert_chain_for_usage, CertificateUsage, EffectiveTrustPolicy,
@@ -143,8 +149,8 @@ fn policy(
     reject_before_valid: bool,
     accept_self_signed: bool,
 ) -> EffectiveTrustPolicy {
-    EffectiveTrustPolicy::from_config(&EncryptionConfig {
-        trust_policy: Some(TrustPolicyConfig {
+    EffectiveTrustPolicy::from_tls_config(Some(&EncryptionTlsConfig {
+        trust_policy: Some(TlsTrustPolicyConfig {
             mode: Some("open".to_string()),
             enforce_ca_chain: Some(enforce_ca_chain),
             reject_expired: Some(reject_expired),
@@ -153,7 +159,7 @@ fn policy(
             ..Default::default()
         }),
         ..Default::default()
-    })
+    }))
 }
 
 fn evaluate(
@@ -162,7 +168,7 @@ fn evaluate(
     chain: &[CertificateDer<'_>],
     usage: CertificateUsage,
 ) -> thenodes::security::trust::TrustDecision {
-    evaluate_peer_cert_chain_for_usage(policy, None, trust_anchor_dir, None, chain, None, usage)
+    evaluate_peer_cert_chain_for_usage(policy, trust_anchor_dir, chain, None, usage)
 }
 
 #[test]
@@ -403,6 +409,7 @@ fn validates_certificate_chain_time_at_a_fixed_instant() {
         let (valid, reason, self_signed) = validate_certificate_chain(
             &[leaf],
             roots.path().to_str(),
+            &[],
             CertificateUsage::ServerAuth,
             now,
         );
@@ -501,19 +508,21 @@ async fn tls_and_mtls_apply_the_role_aware_policy_after_handshake() {
         encryption: Some(EncryptionConfig {
             enabled: true,
             backend: Some("tls".to_string()),
-            mtls: Some(true),
-            paths: Some(EncryptionPaths {
-                own_certificate: Some(cert_path.to_string_lossy().into_owned()),
-                own_private_key: Some(key_path.to_string_lossy().into_owned()),
-                ..Default::default()
-            }),
-            trust_policy: Some(TrustPolicyConfig {
-                mode: Some("open".to_string()),
-                accept_self_signed: Some(true),
-                enforce_ca_chain: Some(true),
-                reject_expired: Some(true),
-                reject_before_valid: Some(true),
-                ..Default::default()
+            tls: Some(EncryptionTlsConfig {
+                mtls: Some(true),
+                paths: Some(TlsPaths {
+                    own_certificate: Some(cert_path.to_string_lossy().into_owned()),
+                    own_private_key: Some(key_path.to_string_lossy().into_owned()),
+                    ..Default::default()
+                }),
+                trust_policy: Some(TlsTrustPolicyConfig {
+                    mode: Some("open".to_string()),
+                    accept_self_signed: Some(true),
+                    enforce_ca_chain: Some(true),
+                    reject_expired: Some(true),
+                    reject_before_valid: Some(true),
+                    ..Default::default()
+                }),
             }),
             ..Default::default()
         }),
@@ -539,4 +548,177 @@ async fn tls_and_mtls_apply_the_role_aware_policy_after_handshake() {
 
     assert!(client.is_ok(), "client policy rejected: {:?}", client.err());
     assert!(server.is_ok(), "server policy rejected: {:?}", server.err());
+}
+
+fn at_year(year: i32) -> std::time::SystemTime {
+    std::time::UNIX_EPOCH
+        + std::time::Duration::from_secs(
+            date_time_ymd(year, 1, 1)
+                .unix_timestamp()
+                .try_into()
+                .unwrap(),
+        )
+}
+
+fn leaf_with_serial(issuer: &CertificateAuthority, serial: u64) -> CertificateDer<'static> {
+    let mut params = CertificateParams::new(vec!["node.thenodes.test".to_string()]).unwrap();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "node.thenodes.test");
+    params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    params.not_before = date_time_ymd(2022, 1, 1);
+    params.not_after = date_time_ymd(2038, 1, 1);
+    params.serial_number = Some(SerialNumber::from(serial));
+    let key = KeyPair::generate().unwrap();
+    params
+        .signed_by(&key, &issuer.certificate, &issuer.key)
+        .unwrap()
+        .der()
+        .clone()
+}
+
+/// A directory holding one PEM CRL from `issuer` that revokes `serials` and
+/// is due for renewal at the start of `next_update_year`.
+fn crl_directory(issuer: &CertificateAuthority, serials: &[u64], next_update_year: i32) -> TempDir {
+    let crl = CertificateRevocationListParams {
+        this_update: date_time_ymd(2024, 1, 1),
+        next_update: date_time_ymd(next_update_year, 1, 1),
+        crl_number: SerialNumber::from(1u64),
+        issuing_distribution_point: None,
+        revoked_certs: serials
+            .iter()
+            .map(|&serial| RevokedCertParams {
+                serial_number: SerialNumber::from(serial),
+                revocation_time: date_time_ymd(2024, 6, 1),
+                reason_code: Some(RevocationReason::KeyCompromise),
+                invalidity_date: None,
+            })
+            .collect(),
+        key_identifier_method: KeyIdMethod::Sha256,
+    }
+    .signed_by(&issuer.certificate, &issuer.key)
+    .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    fs::write(directory.path().join("issuer.crl"), crl.pem().unwrap()).unwrap();
+    directory
+}
+
+fn dir_list(directory: &std::path::Path) -> Vec<String> {
+    vec![directory.to_string_lossy().into_owned()]
+}
+
+#[test]
+fn rejects_a_revoked_certificate_and_accepts_others_from_the_same_ca() {
+    let root = certificate_authority("Revoking root");
+    let roots = trust_anchor_directory(&root);
+    let crls = crl_directory(&root, &[7], 2030);
+    let validate = |serial, year| {
+        validate_certificate_chain(
+            &[leaf_with_serial(&root, serial)],
+            roots.path().to_str(),
+            &dir_list(crls.path()),
+            CertificateUsage::ServerAuth,
+            at_year(year),
+        )
+    };
+
+    assert_eq!(validate(7, 2026).1, "certificate-revoked");
+    assert_eq!(validate(8, 2026).1, "webpki-path-valid");
+    // A CRL past its nextUpdate still applies: what it revokes stays revoked.
+    assert_eq!(validate(7, 2031).1, "certificate-revoked");
+    assert_eq!(validate(8, 2031).1, "webpki-path-valid");
+}
+
+#[test]
+fn a_ca_without_a_crl_is_not_revoked_and_an_unusable_crl_rejects() {
+    let root = certificate_authority("Root without a CRL");
+    let roots = trust_anchor_directory(&root);
+    let other = certificate_authority("Other root");
+    let crls = crl_directory(&other, &[7], 2030);
+    let validate = |crl_dirs: &[String]| {
+        validate_certificate_chain(
+            &[leaf_with_serial(&root, 7)],
+            roots.path().to_str(),
+            crl_dirs,
+            CertificateUsage::ServerAuth,
+            at_year(2026),
+        )
+        .1
+    };
+
+    assert_eq!(validate(&dir_list(crls.path())), "webpki-path-valid");
+    // A CRL that cannot be read never means that nothing is revoked.
+    assert_eq!(
+        validate(&dir_list(&crls.path().join("missing"))),
+        "crl-dir-unreadable"
+    );
+    fs::write(crls.path().join("damaged.crl"), b"not a crl").unwrap();
+    assert!(validate(&dir_list(crls.path())).starts_with("crl-invalid"));
+}
+
+fn ca_config(crl_dir: &std::path::Path, enforce_ca_chain: bool) -> Config {
+    Config {
+        encryption: Some(EncryptionConfig {
+            enabled: true,
+            backend: Some("tls".to_string()),
+            tls: Some(EncryptionTlsConfig {
+                paths: Some(TlsPaths {
+                    issuer_crl_dir: Some(crl_dir.to_string_lossy().into_owned()),
+                    ..Default::default()
+                }),
+                trust_policy: Some(TlsTrustPolicyConfig {
+                    mode: Some("open".to_string()),
+                    enforce_ca_chain: Some(enforce_ca_chain),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn trust_policy_checks_the_configured_crl_directories() {
+    let root = certificate_authority("Revoking root");
+    let roots = trust_anchor_directory(&root);
+    let crls = crl_directory(&root, &[7], 2040);
+    let policy = EffectiveTrustPolicy::from_tls_config(ca_config(crls.path(), true).tls());
+
+    let decision = evaluate(
+        &policy,
+        roots.path().to_str(),
+        &[leaf_with_serial(&root, 7)],
+        CertificateUsage::ServerAuth,
+    );
+    assert_eq!(decision.outcome, TrustDecisionOutcome::Reject);
+    assert_eq!(
+        decision.chain_reason.as_deref(),
+        Some("certificate-revoked")
+    );
+}
+
+#[test]
+fn startup_refuses_crl_directories_that_would_protect_nothing() {
+    let root = certificate_authority("Revoking root");
+    let current = crl_directory(&root, &[7], 2040);
+    let outdated = crl_directory(&root, &[7], 2025);
+
+    // Without CA-chain validation no CRL is ever consulted.
+    let err = check_revocation_config(&ca_config(current.path(), false)).unwrap_err();
+    assert!(err.contains("enforce_ca_chain"), "{err}");
+    let err =
+        check_revocation_config(&ca_config(&current.path().join("missing"), true)).unwrap_err();
+    assert!(err.contains("crl-dir-unreadable"), "{err}");
+
+    assert!(check_revocation_config(&ca_config(current.path(), true))
+        .unwrap()
+        .is_empty());
+    let warnings = check_revocation_config(&ca_config(outdated.path(), true)).unwrap();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(check_revocation_config(&Config::default())
+        .unwrap()
+        .is_empty());
 }

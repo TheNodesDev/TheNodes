@@ -13,18 +13,19 @@ const DUMMY_CERT: &[u8] = b"\x30\x03\x02\x01\x01";
 fn fingerprint_pin_match_accepts() {
     let fp = spki_fingerprint(&CertificateDer::from(DUMMY_CERT.to_vec())).unwrap();
     let enc = thenodes::config::EncryptionConfig {
-        trust_policy: Some(thenodes::config::TrustPolicyConfig {
-            mode: Some("open".into()),
-            pin_fingerprints: Some(vec![fp.clone()]),
+        tls: Some(thenodes::config::EncryptionTlsConfig {
+            trust_policy: Some(thenodes::config::TlsTrustPolicyConfig {
+                mode: Some("open".into()),
+                pin_fingerprints: Some(vec![fp.clone()]),
+                ..Default::default()
+            }),
             ..Default::default()
         }),
         ..Default::default()
     };
-    let policy = EffectiveTrustPolicy::from_config(&enc);
+    let policy = EffectiveTrustPolicy::from_tls_config(enc.tls.as_ref());
     let decision = evaluate_peer_cert_chain_for_usage(
         &policy,
-        None,
-        None,
         None,
         &[CertificateDer::from(DUMMY_CERT.to_vec())],
         None,
@@ -40,18 +41,19 @@ fn fingerprint_pin_match_accepts() {
 #[test]
 fn fingerprint_pin_mismatch_rejects() {
     let enc = thenodes::config::EncryptionConfig {
-        trust_policy: Some(thenodes::config::TrustPolicyConfig {
-            mode: Some("open".into()),
-            pin_fingerprints: Some(vec!["deadbeef".into()]),
+        tls: Some(thenodes::config::EncryptionTlsConfig {
+            trust_policy: Some(thenodes::config::TlsTrustPolicyConfig {
+                mode: Some("open".into()),
+                pin_fingerprints: Some(vec!["deadbeef".into()]),
+                ..Default::default()
+            }),
             ..Default::default()
         }),
         ..Default::default()
     };
-    let policy = EffectiveTrustPolicy::from_config(&enc);
+    let policy = EffectiveTrustPolicy::from_tls_config(enc.tls.as_ref());
     let decision = evaluate_peer_cert_chain_for_usage(
         &policy,
-        None,
-        None,
         None,
         &[CertificateDer::from(DUMMY_CERT.to_vec())],
         None,
@@ -67,18 +69,19 @@ fn fingerprint_pin_mismatch_rejects() {
 #[test]
 fn subject_pin_mismatch_rejects() {
     let enc = thenodes::config::EncryptionConfig {
-        trust_policy: Some(thenodes::config::TrustPolicyConfig {
-            mode: Some("open".into()),
-            pin_subjects: Some(vec![String::from('X')]),
+        tls: Some(thenodes::config::EncryptionTlsConfig {
+            trust_policy: Some(thenodes::config::TlsTrustPolicyConfig {
+                mode: Some("open".into()),
+                pin_subjects: Some(vec![String::from('X')]),
+                ..Default::default()
+            }),
             ..Default::default()
         }),
         ..Default::default()
     };
-    let policy = EffectiveTrustPolicy::from_config(&enc);
+    let policy = EffectiveTrustPolicy::from_tls_config(enc.tls.as_ref());
     let decision = evaluate_peer_cert_chain_for_usage(
         &policy,
-        None,
-        None,
         None,
         &[CertificateDer::from(DUMMY_CERT.to_vec())],
         None,

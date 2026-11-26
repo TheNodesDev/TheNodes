@@ -15,28 +15,32 @@ allow_ephemeral = true
 # Encryption settings (secure by default)
 [encryption]
 enabled = true            # TLS on by default (production posture)
+
+[encryption.tls]
 mtls = true               # Recommend mutual TLS in production
 
-[encryption.paths]
+[encryption.tls.paths]
 own_certificate  = "pki/own/{{APP_NAME}}.crt"
 own_private_key  = "pki/own/{{APP_NAME}}.key"
 trusted_cert_dir = "pki/trusted/certs"
-trusted_crl_dir  = "pki/trusted/crl"
-rejected_dir     = "pki/rejected"
+# CRLs are checked only with enforce_ca_chain = true (ADR-0014):
+# trusted_crl_dir  = "pki/trusted/crl"
+rejected_dir     = "pki/rejected"   # rejected peer certs, for review and `trust promote`
 issuer_cert_dir  = "pki/issuers/certs"
-issuer_crl_dir   = "pki/issuers/crl"
+# issuer_crl_dir   = "pki/issuers/crl"
 
 # Restrictive trust policy scaffold (tighten/adjust as needed)
-[encryption.trust_policy]
+[encryption.tls.trust_policy]
 mode = "allowlist"           # allow only explicitly trusted peers
 accept_self_signed = true     # permit self-signed peer certs present in trusted store
-store_new_certs = "observed" # records first-seen certs (helpful during rollout)
 reject_expired = true
 reject_before_valid = true
 enforce_ca_chain = false      # set true when operating a private CA
 
-[encryption.trust_policy.paths]
-observed_dir = "pki/observed/certs"
+# Bind HELLO node IDs to the certificate keys that authenticate them (ADR-0012)
+[encryption.node_identity]
+mode = "tofu"                     # off | tofu | pinned | certificate
+bindings_file = "pki/node-identity/bindings.jsonl"
 
 # Logging configuration
 [logging]

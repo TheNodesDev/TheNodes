@@ -31,8 +31,7 @@ async fn relay_forward_ttl_expired_does_not_enqueue() {
         None,
         None,
     );
-    thenodes::network::relay::handle_forward(&msg, &addr_local(), &pm, true, true, false, true)
-        .await;
+    thenodes::network::relay::handle_forward(&msg, &addr_local(), &pm, true, true, true).await;
     // Capacity should remain available; no enqueue when TTL expired
     let after_ok = pm.can_enqueue_store_forward("node-b").await;
     assert!(before_ok && after_ok);

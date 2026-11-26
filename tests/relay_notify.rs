@@ -1,5 +1,6 @@
 // no direct message parsing needed in deterministic assertion
 use thenodes::network::peer_manager::PeerManager;
+use thenodes::network::Message;
 use tokio::sync::mpsc;
 
 fn addr_local(port: u16) -> std::net::SocketAddr {
@@ -18,7 +19,7 @@ async fn purge_overload_notifies_origin() {
     let target = "nodeB";
     pm.set_binding(origin, target, true, None, None).await;
 
-    let (tx_o, _rx_o) = mpsc::channel::<String>(64);
+    let (tx_o, _rx_o) = mpsc::channel::<Message>(64);
     let addr_o = addr_local(10110);
     pm.add_peer(addr_o, tx_o, origin.to_string()).await.unwrap();
 

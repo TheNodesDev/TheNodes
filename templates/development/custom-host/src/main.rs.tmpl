@@ -1,14 +1,15 @@
 use clap::Parser;
 use std::fs;
 use std::sync::Arc;
-use tokio::signal;
 use tokio::sync::Mutex as TokioMutex;
 
 // Import TheNodes framework
 use thenodes::network::{
-    connect_to_bootstrap_nodes, peer_manager::PeerManager, start_listener, PeerStore,
+    bind_listener, connect_to_bootstrap_nodes, peer_manager::PeerManager, run_listener, PeerStore,
 };
-use thenodes::plugin_host::{PluginContext, PluginLoader, PluginManager, PluginRegistrar};
+use thenodes::plugin_host::{
+    PluginContext, PluginLoader, PluginManager, PluginRegistrar, ShutdownMode, StartPolicy,
+};
 use thenodes::prelude::*;
 use thenodes::prompt::run_prompt_mode;
 
@@ -77,47 +78,61 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let mut plugin_manager = PluginManager::with_context(plugin_context);
 
-    // Initialize custom plugin host
+    // Register the custom plugin host (statically linked, runs on this runtime)
     let custom_host = CustomPluginHost::new(config.clone());
-    plugin_manager.register_handler(Box::new(custom_host));
+    plugin_manager.register_handler(Box::new(custom_host))?;
 
-    // Load TheNodes plugins from the standard plugin directory
+    // Load native TheNodes plugins from the plugin directory. Native plugins
+    // must be built with this host's TheNodes release, toolchain, lockfile,
+    // and features.
     if std::path::Path::new(&args.plugin_dir).exists() {
         log::info!("🔌 Loading plugins from: {}", args.plugin_dir);
-        let mut plugin_loader = PluginLoader::new();
-        if let Err(error) = plugin_loader.load_plugins(&args.plugin_dir, &mut plugin_manager) {
-            log::error!("❌ Failed to load plugins: {}", error);
-        }
+        PluginLoader::new().load_plugins(&args.plugin_dir, &mut plugin_manager)?;
     } else {
         log::warn!("⚠️  Plugin directory '{}' does not exist", args.plugin_dir);
     }
 
-    // Start TheNodes networking
-    let plugin_manager_arc = Arc::new(plugin_manager);
-    if let Some(context) = &plugin_manager_arc.context {
-        context.set_plugin_manager(plugin_manager_arc.clone()).await;
-    }
+    let plugin_manager = Arc::new(plugin_manager);
+    let mut failures = plugin_manager.subscribe_failures();
     peer_manager
         .configure_connection_lifecycle(
             config.clone(),
             node_id.clone(),
-            &plugin_manager_arc,
+            &plugin_manager,
             peer_store.clone(),
             !args.prompt,
         )
         .await;
 
+    // Start plugins, bind the listener, then activate admission.
+    let report = plugin_manager
+        .start_all(StartPolicy::StopOnFirstFailure)
+        .await?;
+    if !report.all_started() {
+        for failure in report.failures() {
+            log::error!("{failure}");
+        }
+        plugin_manager.shutdown(ShutdownMode::Discard).await?;
+        return Err("plugin startup failed".into());
+    }
+    let listener = match bind_listener(config.port, !args.prompt).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            plugin_manager.shutdown(ShutdownMode::Discard).await?;
+            return Err(error.into());
+        }
+    };
     let listener_handle = tokio::spawn({
         let peer_manager = peer_manager.clone();
-        let plugin_manager = plugin_manager_arc.clone();
+        let plugin_manager = plugin_manager.clone();
         let config = config.clone();
         let realm = realm.clone();
         let node_id = node_id.clone();
         let peer_store = peer_store.clone();
         let emit_console_errors = !args.prompt;
         async move {
-            if let Err(e) = start_listener(
-                config.port,
+            if let Err(e) = run_listener(
+                listener,
                 realm,
                 (*peer_manager).clone(),
                 plugin_manager,
@@ -132,6 +147,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     });
+    plugin_manager.activate()?;
 
     // Connect to bootstrap nodes
     let error_buffer = Arc::new(TokioMutex::new(Vec::new()));
@@ -139,7 +155,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &config,
         realm,
         (*peer_manager).clone(),
-        plugin_manager_arc.clone(),
+        plugin_manager.clone(),
         error_buffer,
         !args.prompt,
         node_id,
@@ -149,19 +165,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     log::info!("🚀 {{APP_NAME}} is running. Press Ctrl+C to shutdown...");
 
-    // Handle prompt mode or wait for shutdown
+    // Handle prompt mode or wait for shutdown or a plugin failure
     if args.prompt {
         log::info!("🎮 Starting interactive prompt mode");
-        run_prompt_mode(plugin_manager_arc.clone(), config.clone()).await;
+        run_prompt_mode(plugin_manager.clone(), config.clone()).await;
     } else {
-        // Wait for shutdown signal
-        signal::ctrl_c().await?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result?,
+            failure = failures.recv() => {
+                if let Some(failure) = failure {
+                    log::error!("{failure}");
+                }
+            }
+        }
     }
 
     log::info!("🛑 Shutting down {{APP_NAME}}...");
 
-    // Cleanup
+    // One cleanup path. TheNodes imposes no deadline; a second Ctrl+C escalates.
+    let shutdown = plugin_manager.begin_shutdown(ShutdownMode::Drain);
     listener_handle.abort();
+    let _ = listener_handle.await;
+    let wait = shutdown.wait();
+    tokio::pin!(wait);
+    let report = tokio::select! {
+        report = &mut wait => report?,
+        _ = tokio::signal::ctrl_c() => {
+            plugin_manager.escalate();
+            wait.await?
+        }
+    };
+    if !report.is_clean() {
+        log::warn!("Plugin shutdown report: {:?}", report);
+    }
 
     log::info!("✅ {{APP_NAME}} shutdown complete");
     Ok(())

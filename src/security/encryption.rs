@@ -37,10 +37,15 @@ pub fn extract_validity_windows(der: &[u8]) -> Option<(i64, i64)> {
 /// and validity of the complete path at `now`. Hostname validation is deliberately
 /// separate because TheNodes binds peers using node/realm policy rather than DNS.
 ///
+/// The leaf and intermediates are checked against the CRLs in `crl_dirs`
+/// (ADR-0014). A certificate whose issuer has no CRL there is not revoked, and
+/// a CRL past its nextUpdate still applies.
+///
 /// Returns `(chain_valid, chain_reason, self_signed_leaf)`.
 pub fn validate_certificate_chain(
     peer_chain: &[CertificateDer<'_>],
     trust_anchor_dir: Option<&str>,
+    crl_dirs: &[String],
     usage: CertificateUsage,
     now: SystemTime,
 ) -> (bool, String, bool) {
@@ -98,6 +103,21 @@ pub fn validate_certificate_chain(
         .map(|certificate| CertificateDer::from(certificate.as_ref()))
         .collect();
 
+    let crls = match load_revocation_lists(crl_dirs) {
+        Ok(crls) => crls,
+        Err(reason) => return (false, reason, self_signed),
+    };
+    let crls: Vec<&webpki::CertRevocationList<'_>> = crls.iter().collect();
+    let revocation = webpki::RevocationOptionsBuilder::new(&crls)
+        .ok()
+        .map(|options| {
+            options
+                .with_depth(webpki::RevocationCheckDepth::Chain)
+                .with_status_policy(webpki::UnknownStatusPolicy::Allow)
+                .with_expiration_policy(webpki::ExpirationPolicy::Ignore)
+                .build()
+        });
+
     let verify = |key_usage| {
         leaf.verify_for_usage(
             webpki::ALL_VERIFICATION_ALGS,
@@ -105,7 +125,7 @@ pub fn validate_certificate_chain(
             &intermediates,
             now,
             key_usage,
-            None,
+            revocation,
             None,
         )
         .map(|_| ())
@@ -232,11 +252,117 @@ fn load_trust_anchor_certificates(path: &Path) -> Result<Vec<CertificateDer<'sta
     }
 }
 
+/// Load the CRLs in `dirs`: DER files (`.crl`, `.der`) and PEM files (`.pem`,
+/// or a `.crl` holding `X509 CRL` blocks). A directory that cannot be read or a
+/// file that does not parse is an error, so a broken CRL never means that
+/// nothing is revoked.
+pub fn load_revocation_lists(
+    dirs: &[String],
+) -> Result<Vec<webpki::CertRevocationList<'static>>, String> {
+    let mut crls = Vec::new();
+    for dir in dirs {
+        for der in read_crl_ders(Path::new(dir))? {
+            let crl = webpki::OwnedCertRevocationList::from_der(&der)
+                .map_err(|error| format!("crl-invalid:{error}"))?;
+            crls.push(crl.into());
+        }
+    }
+    Ok(crls)
+}
+
+fn read_crl_ders(dir: &Path) -> Result<Vec<Vec<u8>>, String> {
+    let entries = fs::read_dir(dir).map_err(|_| "crl-dir-unreadable".to_string())?;
+    let mut paths: Vec<(PathBuf, String)> = entries
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| "crl-dir-unreadable".to_string())?
+        .into_iter()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .filter_map(|path| {
+            let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+            matches!(extension.as_str(), "crl" | "pem" | "der").then_some((path, extension))
+        })
+        .collect();
+    paths.sort();
+
+    let mut ders = Vec::new();
+    for (path, extension) in paths {
+        let bytes = fs::read(&path).map_err(|_| "crl-file-unreadable".to_string())?;
+        if extension == "der" {
+            ders.push(bytes);
+            continue;
+        }
+        let pem = rustls_pemfile::crls(&mut BufReader::new(bytes.as_slice()))
+            .map_err(|_| "crl-pem-invalid".to_string())?;
+        if !pem.is_empty() {
+            ders.extend(pem);
+        } else if extension == "crl" {
+            ders.push(bytes);
+        } else {
+            return Err("crl-pem-empty".to_string());
+        }
+    }
+    Ok(ders)
+}
+
+/// Check the CRL settings in `[encryption.tls.paths]` before a node starts
+/// (ADR-0014). CRLs apply only to TLS certificates validated against a CA, so
+/// CRL directories without `enforce_ca_chain` would protect nothing and are an
+/// error, as is a CRL directory or file that cannot be used. Returns a warning
+/// for each CRL past its nextUpdate.
+pub fn check_revocation_config(config: &crate::config::Config) -> Result<Vec<String>, String> {
+    let Some(encryption) = config.encryption.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let tls_config = encryption.tls.as_ref();
+    let dirs = tls_config
+        .and_then(|tls| tls.paths.as_ref())
+        .map(crate::config::TlsPaths::crl_dirs)
+        .unwrap_or_default();
+    if dirs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let tls = encryption.enabled && encryption.backend.as_deref().unwrap_or("tls") == "tls";
+    let ca_chain = tls_config
+        .and_then(|tls| tls.trust_policy.as_ref())
+        .and_then(|policy| policy.enforce_ca_chain)
+        .unwrap_or(false);
+    if !(tls && ca_chain) {
+        return Err(format!(
+            "CRL directories are set ({}), but CRLs are only checked for TLS certificates validated against a CA: enable [encryption] with the TLS backend and set [encryption.tls.trust_policy] enforce_ca_chain = true, or remove trusted_crl_dir and issuer_crl_dir",
+            dirs.join(", ")
+        ));
+    }
+
+    let now = x509_parser::time::ASN1Time::now();
+    let mut warnings = Vec::new();
+    for dir in &dirs {
+        let ders = read_crl_ders(Path::new(dir)).map_err(|reason| format!("{dir}: {reason}"))?;
+        for der in ders {
+            webpki::OwnedCertRevocationList::from_der(&der)
+                .map_err(|error| format!("{dir}: crl-invalid:{error}"))?;
+            if let Ok((_, crl)) = x509_parser::parse_x509_crl(&der) {
+                if crl.next_update().is_some_and(|next| next < now) {
+                    warnings.push(format!(
+                        "CRL from {} in {dir} is past its nextUpdate; it still applies, but revocations since then are missing",
+                        crl.issuer()
+                    ));
+                }
+            }
+        }
+    }
+    Ok(warnings)
+}
+
 fn chain_error_reason(error: webpki::Error) -> String {
     use webpki::Error;
 
     match error {
         Error::CertDistrusted => "certificate-distrusted".to_string(),
+        Error::CertRevoked => "certificate-revoked".to_string(),
+        Error::InvalidCrlSignatureForPublicKey | Error::IssuerNotCrlSigner => {
+            "crl-signature-invalid".to_string()
+        }
         Error::CertExpired { .. } => "certificate-expired".to_string(),
         Error::CertNotValidYet { .. } => "certificate-not-yet-valid".to_string(),
         Error::InvalidSignatureForPublicKey | Error::SignatureAlgorithmMismatch => {

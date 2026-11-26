@@ -2,6 +2,7 @@ pub mod bootstrap;
 pub mod connection;
 pub mod delivery;
 pub(crate) mod events;
+pub mod limits;
 pub mod listener;
 pub mod message;
 #[cfg(feature = "upnp")]
@@ -27,8 +28,12 @@ pub use delivery::{
     DeliveryPathConstraints, DeliveryRuntime, DeliveryTransportPreference,
     IncomingMessageDisposition, MessageId,
 };
-pub use listener::start_listener;
-pub use message::{DeliveryMetadata, Message, MessageType};
+pub use limits::{
+    InboundConnectionLimiter, InboundConnectionPermit, InboundLimitReason, InboundLimitRejection,
+    NetworkLimits,
+};
+pub use listener::{bind_listener, bind_listener_on, run_listener, start_listener};
+pub use message::{DeliveryMetadata, Message, MessageOrigin, MessageType};
 pub use peer::Peer;
 pub use peer_manager::PeerManager;
 pub use peer_store::{PeerSource, PeerStore};
@@ -158,7 +163,7 @@ mod tests {
                 enabled: Some(enabled),
                 listen_port,
                 max_datagram_bytes: Some(1200),
-                max_app_payload_bytes: Some(1176),
+                max_app_payload_bytes: Some(1168),
             });
         }
         config
@@ -216,7 +221,7 @@ mod tests {
                 enabled: Some(false),
                 listen_port: None,
                 max_datagram_bytes: Some(1200),
-                max_app_payload_bytes: Some(1176),
+                max_app_payload_bytes: Some(1168),
             });
         }
 

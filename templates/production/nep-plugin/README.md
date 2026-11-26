@@ -16,9 +16,9 @@ Security defaults:
 - Ensure your host's `config.toml` is configured with PKI paths and a restrictive trust policy (e.g., allowlist or fingerprint pins).
 - For local testing, you can quickly generate certs:
    ```bash
-   cargo run --bin thenodes-cert -- --realm my-network --copy-to-trusted
+   cargo run --bin thenodes-cert -- --realm-code my-network --node-id <node-id> --copy-to-trusted
    ```
-   This prints an SPKI fingerprint you can pin in `[encryption.trust_policy]`.
+   This prints an SPKI fingerprint you can pin in `[encryption.tls.trust_policy]`.
 
 ## Prerequisites
 
@@ -62,7 +62,8 @@ Copy-Item target\release\my_plugin.dll C:\path\to\thenodes\plugins\
 
 ## Key Features
 
-- **Version Pinned:** Targets TheNodes 0.4.0 for plugin ABI compatibility
+- **Build Contract:** Plugin ABI 4; build with the host's TheNodes source, Rust toolchain, `Cargo.lock` (copied by the generator), and TheNodes features
+- **Lifecycle:** `on_start` initialization, a managed task that waits for host activation, and `on_stop` cleanup
 - **Plugin Defaults:** Provides configuration defaults without overriding user config
 - **Message Handling:** Template for custom message processing
 - **Prompt Integration:** Commands available in `--prompt` mode

@@ -13,7 +13,7 @@ async fn delayed_retry_cancelled_by_ack() {
         .await;
 
     // Connect destination peer to capture sends
-    let (tx, mut rx) = mpsc::channel::<String>(16);
+    let (tx, mut rx) = mpsc::channel::<Message>(16);
     let addr: SocketAddr = "127.0.0.1:9100".parse().unwrap();
     pm.add_peer(addr, tx, "toB".into()).await.unwrap();
 
@@ -36,8 +36,7 @@ async fn delayed_retry_cancelled_by_ack() {
     // Invoke handler: schedules delayed retry for reliable
     thenodes::network::relay::handle_forward(
         &fwd, &addr, &pm, /* relay_enabled */ true,
-        /* relay_store_forward_enabled */ true, /* relay_selection_enabled */ false,
-        /* allow_console */ true,
+        /* relay_store_forward_enabled */ true, /* allow_console */ true,
     )
     .await;
 
@@ -46,7 +45,6 @@ async fn delayed_retry_cancelled_by_ack() {
         .await
         .expect("expected initial delivery timeout to succeed")
         .expect("expected initial delivery");
-    let first = Message::from_json(&first).expect("forwarded relay frame should deserialize");
     match &first.msg_type {
         MessageType::RelayForward {
             to,
@@ -67,10 +65,10 @@ async fn delayed_retry_cancelled_by_ack() {
     }
     assert!(first.payload.is_none());
 
-    // Send ACK before 500ms to cancel retry
+    // The target sends ACK before 500ms to cancel retry
     let ack = Message::new(
-        &addr.to_string(),
-        &addr.to_string(),
+        "toB",
+        "relay",
         MessageType::Ack {
             to: "toB".into(),
             from: "fromA".into(),
@@ -88,4 +86,44 @@ async fn delayed_retry_cancelled_by_ack() {
         second.is_err() || matches!(second, Ok(None)),
         "unexpected retry delivery after ACK"
     );
+}
+
+#[tokio::test]
+async fn retry_is_sent_once_and_releases_the_inflight_entry() {
+    let pm = PeerManager::new();
+    pm.set_binding("fromA", "toB", true, None, Some("reliable".into()))
+        .await;
+    let (tx, mut rx) = mpsc::channel::<Message>(16);
+    let addr: SocketAddr = "127.0.0.1:9101".parse().unwrap();
+    pm.add_peer(addr, tx, "toB".into()).await.unwrap();
+
+    let fwd = Message::new(
+        "fromA",
+        "relay",
+        MessageType::RelayForward {
+            to: "toB".into(),
+            from: "fromA".into(),
+            sequence: Some(3),
+            opaque_payload_b64: encode_relay_opaque_payload("hello"),
+        },
+        None,
+        None,
+    );
+    thenodes::network::relay::handle_forward(&fwd, &addr, &pm, true, true, true).await;
+    rx.recv().await.expect("initial delivery");
+    tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        .await
+        .expect("retry after the ACK timeout")
+        .expect("retried frame");
+
+    // No ACK came, and none can cancel anything now.
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while pm.is_inflight("fromA", "toB", 3).await {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("in-flight entry should be released after the retry");
+    let extra = tokio::time::timeout(std::time::Duration::from_millis(700), rx.recv()).await;
+    assert!(extra.is_err(), "a second retry was sent");
 }

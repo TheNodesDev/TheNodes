@@ -10,29 +10,33 @@ node_type = "daemon"
 
 [encryption]
 enabled = true
+
+[encryption.tls]
 mtls = true
 
-[encryption.paths]
+[encryption.tls.paths]
 own_certificate  = "pki/own/cert.pem"
 own_private_key  = "pki/own/key.pem"
 trusted_cert_dir = "pki/trusted/certs"
-trusted_crl_dir  = "pki/trusted/crl"
-rejected_dir     = "pki/rejected"
+# CRLs are checked only with enforce_ca_chain = true (ADR-0014):
+# trusted_crl_dir  = "pki/trusted/crl"
+rejected_dir     = "pki/rejected"   # rejected peer certs, for review and `trust promote`
 issuer_cert_dir  = "pki/issuers/certs"
-issuer_crl_dir   = "pki/issuers/crl"
+# issuer_crl_dir   = "pki/issuers/crl"
 
-[encryption.trust_policy]
+[encryption.tls.trust_policy]
 mode = "allowlist"
 accept_self_signed = true
-store_new_certs = "observed"
 reject_expired = true
 reject_before_valid = true
 enforce_ca_chain = false
 pin_subjects = []
 pin_fp_algo = "sha256"
 
-[encryption.trust_policy.paths]
-observed_dir = "pki/observed/certs"
+# Bind HELLO node IDs to the certificate keys that authenticate them (ADR-0012)
+[encryption.node_identity]
+mode = "tofu"                     # off | tofu | pinned | certificate
+bindings_file = "pki/node-identity/bindings.jsonl"
 
 [logging]
 json_path = "logs/audit.jsonl"

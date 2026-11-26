@@ -1,6 +1,34 @@
 use std::net::SocketAddr;
+use thenodes::network::message::{
+    decode_relay_opaque_payload_utf8, encode_relay_opaque_payload, MessageType,
+};
 use thenodes::network::peer_manager::PeerManager;
+use thenodes::network::Message;
 use tokio::sync::mpsc;
+
+/// A serialized relay frame carrying `label`, as a relay queues it.
+fn frame(label: &str) -> String {
+    Message::outbound(
+        MessageType::RelayForward {
+            to: "nodeB".into(),
+            from: "nodeA".into(),
+            sequence: None,
+            opaque_payload_b64: encode_relay_opaque_payload(label),
+        },
+        None,
+        None,
+    )
+    .as_json()
+}
+
+fn label(message: &Message) -> String {
+    match &message.msg_type {
+        MessageType::RelayForward {
+            opaque_payload_b64, ..
+        } => decode_relay_opaque_payload_utf8(opaque_payload_b64).expect("utf-8 label"),
+        other => panic!("unexpected queued frame {other:?}"),
+    }
+}
 
 fn addr_local(port: u16) -> SocketAddr {
     format!("127.0.0.1:{}", port).parse().unwrap()
@@ -14,24 +42,17 @@ async fn relay_store_forward_delivers_on_connect() {
     pm.set_binding("nodeA", "nodeB", true, None, None).await;
 
     // Enqueue a frame targeting B while B is offline
-    pm.enqueue_store_forward(
-        "nodeB",
-        "{\"dummy\":1}".to_string(),
-        None,
-        false,
-        false,
-        None,
-    )
-    .await;
+    pm.enqueue_store_forward("nodeB", frame("dummy"), None, false, false, None)
+        .await;
 
     // Connect B and drain the queue
-    let (tx, mut rx) = mpsc::channel::<String>(8);
+    let (tx, mut rx) = mpsc::channel::<Message>(8);
     let addr_b = addr_local(10001);
     pm.add_peer(addr_b, tx, "nodeB".to_string()).await.unwrap();
 
     // Expect one frame delivered
     let got = rx.recv().await.expect("expected one forwarded frame");
-    assert!(got.contains("dummy"));
+    assert_eq!(label(&got), "dummy");
 }
 
 #[tokio::test]
@@ -50,21 +71,14 @@ async fn relay_store_forward_respects_expiry() {
 
     pm.set_binding("nodeA", "nodeB", true, Some(expires), None)
         .await;
-    pm.enqueue_store_forward(
-        "nodeB",
-        "{\"ttl\":1}".to_string(),
-        Some(expires),
-        false,
-        false,
-        None,
-    )
-    .await;
+    pm.enqueue_store_forward("nodeB", frame("ttl"), Some(expires), false, false, None)
+        .await;
 
     // Wait past expiry
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     // Connect B; expired frames should be purged and not delivered
-    let (tx, mut rx) = mpsc::channel::<String>(8);
+    let (tx, mut rx) = mpsc::channel::<Message>(8);
     let addr_b = addr_local(10002);
     pm.add_peer(addr_b, tx, "nodeB".to_string()).await.unwrap();
 
@@ -83,24 +97,17 @@ async fn relay_store_forward_per_target_cap_drops_oldest() {
     // Enqueue more than per-target cap (1024) to ensure oldest-drop kicks in
     let over = 1030usize;
     for i in 0..over {
-        pm.enqueue_store_forward(
-            "nodeB",
-            format!("{{\"seq\":{}}}", i),
-            None,
-            false,
-            false,
-            None,
-        )
-        .await;
+        pm.enqueue_store_forward("nodeB", frame(&i.to_string()), None, false, false, None)
+            .await;
     }
 
     // Connect B and drain
-    let (tx, mut rx) = mpsc::channel::<String>(1200);
+    let (tx, mut rx) = mpsc::channel::<Message>(1200);
     let addr_b = addr_local(10003);
     pm.add_peer(addr_b, tx, "nodeB".to_string()).await.unwrap();
 
     // Expect only the most recent 1024 frames delivered
-    let mut frames: Vec<String> = Vec::new();
+    let mut frames: Vec<Message> = Vec::new();
     while let Ok(msg) = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
     {
         if let Some(m) = msg {
@@ -116,12 +123,8 @@ async fn relay_store_forward_per_target_cap_drops_oldest() {
     // Oldest dropped: first delivered should be over - 1024
     let first_expected = over as i64 - 1024;
     let last_expected = over as i64 - 1;
-    let first_seq: i64 = serde_json::from_str::<serde_json::Value>(&frames[0]).unwrap()["seq"]
-        .as_i64()
-        .unwrap();
-    let last_seq: i64 = serde_json::from_str::<serde_json::Value>(&frames[1023]).unwrap()["seq"]
-        .as_i64()
-        .unwrap();
+    let first_seq: i64 = label(&frames[0]).parse().unwrap();
+    let last_seq: i64 = label(&frames[1023]).parse().unwrap();
     assert_eq!(first_seq, first_expected);
     assert_eq!(last_seq, last_expected);
 }
@@ -144,22 +147,15 @@ async fn relay_store_forward_global_cap_limits_total() {
         let to = format!("nodeB{}", t);
         for i in 0..1300 {
             // attempt to enqueue more than per-target cap
-            pm.enqueue_store_forward(
-                &to,
-                format!("{{\"t\":{},\"i\":{}}}", t, i),
-                None,
-                false,
-                false,
-                None,
-            )
-            .await;
+            pm.enqueue_store_forward(&to, frame(&format!("{t}:{i}")), None, false, false, None)
+                .await;
         }
     }
 
     // Connect all and drain counts
-    let mut rxs: Vec<mpsc::Receiver<String>> = Vec::new();
+    let mut rxs: Vec<mpsc::Receiver<Message>> = Vec::new();
     for t in 1..=9 {
-        let (tx, rx) = mpsc::channel::<String>(1400);
+        let (tx, rx) = mpsc::channel::<Message>(1400);
         let addr = addr_local(11000 + t);
         let node_id = format!("nodeB{}", t);
         pm.add_peer(addr, tx, node_id).await.unwrap();
@@ -197,21 +193,14 @@ async fn relay_store_forward_global_cap_affects_distribution() {
     for t in 1..=9 {
         let to = format!("nodeB{}", t);
         for i in 0..1300 {
-            pm.enqueue_store_forward(
-                &to,
-                format!("{{\"t\":{},\"i\":{}}}", t, i),
-                None,
-                false,
-                false,
-                None,
-            )
-            .await;
+            pm.enqueue_store_forward(&to, frame(&format!("{t}:{i}")), None, false, false, None)
+                .await;
         }
     }
     // Connect all
-    let mut rxs: Vec<(usize, mpsc::Receiver<String>)> = Vec::new();
+    let mut rxs: Vec<(usize, mpsc::Receiver<Message>)> = Vec::new();
     for t in 1..=9 {
-        let (tx, rx) = mpsc::channel::<String>(1400);
+        let (tx, rx) = mpsc::channel::<Message>(1400);
         let addr = addr_local(12000 + t);
         let node_id = format!("nodeB{}", t);
         pm.add_peer(addr, tx, node_id).await.unwrap();
@@ -239,4 +228,42 @@ async fn relay_store_forward_global_cap_affects_distribution() {
     // Total should still equal 8192
     let total: usize = per_target.iter().sum();
     assert_eq!(total, 8192);
+}
+
+#[tokio::test]
+async fn relay_store_forward_global_byte_cap_evicts_oldest() {
+    let pm = PeerManager::new();
+    let (per_target, global, max_bytes) = pm.set_relay_queue_caps(None, None, Some(1000));
+    assert_eq!((per_target, global, max_bytes), (1024, 8192, 1000));
+    pm.set_binding("nodeA", "nodeB", true, None, None).await;
+
+    // Ten 100-byte frames fill the budget exactly; the count caps are far away.
+    for i in 0..10 {
+        let frame = format!("{:0>100}", i);
+        assert!(
+            pm.enqueue_store_forward("nodeB", frame, None, false, false, None)
+                .await
+        );
+    }
+    assert!(!pm.can_enqueue_store_forward("nodeB").await);
+
+    // One more frame evicts the oldest so the total stays within the cap.
+    let frame = format!("{:0>100}", 10);
+    assert!(
+        pm.enqueue_store_forward("nodeB", frame, None, false, false, None)
+            .await
+    );
+    let queue = pm.test_get_queue_for("nodeB").await;
+    let total: usize = queue.iter().map(|(f, _, _)| f.len()).sum();
+    assert!(total <= 1000, "queued bytes {total} exceed the cap");
+    assert!(
+        queue.iter().all(|(f, _, _)| !f.ends_with("0000")),
+        "oldest frame survived"
+    );
+
+    // A single frame larger than the whole budget is refused outright.
+    assert!(
+        !pm.enqueue_store_forward("nodeB", "z".repeat(1001), None, false, false, None)
+            .await
+    );
 }

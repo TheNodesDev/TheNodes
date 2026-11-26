@@ -17,13 +17,14 @@ These items are re-exported (or will be) through the `prelude` or documented dir
 - `config::Config` (top-level struct) and its de/serialization contract (field names & basic meanings). Note: field additions are expected; field renames/removals are possible with a short deprecation/migration note when feasible.
 - `config::ConfigDefaults` (shape may grow additively)
 - Event record envelope fields: `meta.level`, `meta.timestamp`, `action`, `detail` (we strive to keep these stable so tooling doesn't break)
-- PKI directory structure naming (subfolders: `own`, `trusted`, `issuers`, `observed`) — additive subfolders may be introduced
+- PKI directory structure naming (subfolders: `own`, `trusted`, `issuers`, `rejected`; `observed` was replaced by `rejected` in 0.5.0, ADR-0016) — additive subfolders may be introduced
 
 The following are intentionally softened pre‑1.0 (treat as Evolving unless otherwise noted):
 - `network::message::{Message, MessageType, Payload}` schema: Envelope remains stable‑intent; individual variants and payload shapes may change. Prefer non‑exhaustive matching and tolerant parsing.
 - `realms::RealmInfo`: may evolve as realm semantics are refined.
 
 ## Evolving (Subject to Change)
+- Plugin host API (`plugin_host`): the `Plugin` trait and its lifecycle hooks, `PluginManager` lifecycle operations, report and outcome types, host options, and the native plugin ABI (`PLUGIN_ABI_VERSION`, `export_plugin!`). Native plugins must be rebuilt for every host build; see ADR-0011.
 - Peer discovery strategy internals (interval semantics, sampling algorithm)
 - `ConfigDefaults` merging heuristics (port detection heuristic may change)
 - Trust policy depth features (pinning, realm binding, CA enforcement flags) beyond simple modes
@@ -37,6 +38,7 @@ The following are intentionally softened pre‑1.0 (treat as Evolving unless oth
 - QUIC transport & pluggable crypto layer
 
 ## Internal (Not Public API)
+- The native endpoint, host services, and adapter types behind the plugin boundary (`plugin_host::runtime` internals and `register_library`)
 - `peer_store` structure and its method set
 - Connection backoff timings, retry scheduling
 - Exact names of `SystemEvent.action` strings (except those explicitly documented later)
@@ -48,9 +50,9 @@ A curated `prelude` module is provided for ergonomic imports. Inclusion signals 
 ### Notably Excluded: `plugin_host::Plugin`
 The plugin trait is intentionally **not** in the prelude initially for two reasons:
 1. CAL Mode Neutrality: When embedding TheNodes as a library (Core-as-a-Library) an application may choose not to host runtime plugins at all; forcing the plugin trait into the default import surface blurs that model boundary.
-2. Surface Hardening: The method set may expand (e.g. asynchronous lifecycle hooks) before 1.0; keeping it out of the prelude reduces accidental lock-in.
+2. Surface Hardening: The asynchronous lifecycle hooks (`on_start`, `on_stop`) and the managed runtime contract are new in plugin ABI 4 and may still be refined before 1.0; keeping the trait out of the prelude reduces accidental lock-in.
 
-It may be added later once lifecycle guarantees are finalized.
+It may be added later once the lifecycle contract has proven stable in practice.
 
 ## Versioning & Additive Changes
 We may add:

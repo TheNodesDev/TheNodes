@@ -37,6 +37,7 @@ async fn peer_store_cap_enforcement_on_load() {
         discovery: None,
         realm_access: None,
         network: Some(NetworkConfig {
+            bind_ip: None,
             persistence: Some(NetworkPersistenceConfig {
                 enabled: Some(true),
                 path: Some(path.clone()),
@@ -50,6 +51,7 @@ async fn peer_store_cap_enforcement_on_load() {
             connection_policy: None,
             nat_traversal: None,
             delivery: None,
+            limits: None,
         }),
     };
 

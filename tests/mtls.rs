@@ -7,7 +7,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 use thenodes::config::{
-    Config, EncryptionConfig, EncryptionPaths, TrustPolicyConfig, TrustPolicyPathsConfig,
+    Config, EncryptionConfig, EncryptionTlsConfig, TlsPaths, TlsTrustPolicyConfig,
 };
 use thenodes::network::peer::Peer;
 use thenodes::network::peer_manager::PeerManager;
@@ -30,34 +30,31 @@ async fn mtls_open_mode_basic_handshake() {
         encryption: Some(EncryptionConfig {
             enabled: true,
             backend: Some("tls".to_string()),
-            noise: None,
-            mtls: Some(true),
-            accept_self_signed: Some(true), // legacy still honored; permissive for test
-            paths: Some(EncryptionPaths {
-                own_certificate: Some(cert_path.to_string()),
-                own_private_key: Some(key_path.to_string()),
-                trusted_cert_dir: Some("pki/trusted/certs".to_string()),
-                trusted_crl_dir: None,
-                rejected_dir: None,
-                issuer_cert_dir: None,
-                issuer_crl_dir: None,
-            }),
-            trust_policy: Some(TrustPolicyConfig {
-                mode: Some("open".to_string()),
-                accept_self_signed: Some(true),
-                store_new_certs: Some("none".to_string()),
-                reject_expired: Some(false),
-                reject_before_valid: Some(false),
-                enforce_ca_chain: Some(false),
-                pin_subjects: Some(vec![]),
-                pin_fingerprints: Some(vec![]),
-                pin_fp_algo: Some("sha256".to_string()),
-                realm_subject_binding: Some(false),
-                paths: Some(TrustPolicyPathsConfig {
-                    observed_dir: Some("pki/observed/certs".to_string()),
-                    allowlist_dir: None,
+            tls: Some(EncryptionTlsConfig {
+                mtls: Some(true),
+                paths: Some(TlsPaths {
+                    own_certificate: Some(cert_path.to_string()),
+                    own_private_key: Some(key_path.to_string()),
+                    trusted_cert_dir: Some("pki/trusted/certs".to_string()),
+                    trusted_crl_dir: None,
+                    rejected_dir: None,
+                    issuer_cert_dir: None,
+                    issuer_crl_dir: None,
+                }),
+                trust_policy: Some(TlsTrustPolicyConfig {
+                    mode: Some("open".to_string()),
+                    accept_self_signed: Some(true),
+                    reject_expired: Some(false),
+                    reject_before_valid: Some(false),
+                    enforce_ca_chain: Some(false),
+                    pin_subjects: Some(vec![]),
+                    pin_fingerprints: Some(vec![]),
+                    pin_fp_algo: Some("sha256".to_string()),
+                    require_realm_node_name: Some(false),
                 }),
             }),
+            noise: None,
+            node_identity: None,
         }),
         ..Default::default()
     };

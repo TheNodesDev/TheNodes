@@ -29,6 +29,7 @@ async fn peer_store_persist_roundtrip() {
         discovery: None,
         realm_access: None,
         network: Some(NetworkConfig {
+            bind_ip: None,
             persistence: Some(NetworkPersistenceConfig {
                 enabled: Some(true),
                 path: None, // derive from state_dir
@@ -42,6 +43,7 @@ async fn peer_store_persist_roundtrip() {
             connection_policy: None,
             nat_traversal: None,
             delivery: None,
+            limits: None,
         }),
     };
 

@@ -1,12 +1,14 @@
 use clap::Parser;
-use std::future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use thenodes::{
     config::Config,
     constants::ICON_PLACEHOLDER,
     events,
-    plugin_host::{PluginContext, PluginLoader, PluginManager},
+    network::{bind_listener, run_listener},
+    plugin_host::{
+        PluginContext, PluginLoadError, PluginLoader, PluginManager, ShutdownMode, StartPolicy,
+    },
 };
 mod app_identity;
 
@@ -40,9 +42,7 @@ async fn main() -> anyhow::Result<()> {
     // Initialize events (console + json)
     events::init::init_events_from_config(cfg.logging.as_ref()).await;
 
-    // Start networking listener and bootstrap peers
     let realm = cfg.realm.clone().unwrap_or_default();
-    let port = cfg.port;
     let node_cfg = cfg.node.clone().unwrap_or_default();
     let node_id = node_cfg.resolve_node_id();
 
@@ -54,50 +54,72 @@ async fn main() -> anyhow::Result<()> {
             .and_then(|network| network.delivery.clone()),
     );
 
-    // Load plugins (NEP) using a context connected to the runtime.
+    // Load native plugins (NEP). Each library must be built with this host's
+    // TheNodes release, toolchain, lockfile, and features. Every plugin is
+    // required: a library that fails to register stops the application.
     println!(
         "{}Loading plugins from {}",
         ICON_PLACEHOLDER,
         args.plugins.display()
     );
-    let plugin_context = PluginContext::new(
+    let mut plugin_manager = PluginManager::with_context(PluginContext::new(
         peer_manager.clone(),
         peer_store.clone(),
         events::dispatcher::handle(),
         node_id.clone(),
         cfg.clone(),
         !args.prompt,
-    );
-    let mut plugin_manager = PluginManager::with_context(plugin_context);
-    let mut loader = PluginLoader::new();
-    loader.load_plugins(&args.plugins, &mut plugin_manager)?;
-    let plugin_manager_arc = Arc::new(plugin_manager);
-    if let Some(context) = &plugin_manager_arc.context {
-        context.set_plugin_manager(plugin_manager_arc.clone()).await;
+    ));
+    match PluginLoader::new().load_plugins(&args.plugins, &mut plugin_manager) {
+        Ok(_) => {}
+        Err(PluginLoadError::Discover { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            println!(
+                "{}No plugin directory; running without plugins",
+                ICON_PLACEHOLDER
+            );
+        }
+        Err(error) => return Err(error.into()),
     }
+    let plugin_manager = Arc::new(plugin_manager);
+    let mut failures = plugin_manager.subscribe_failures();
     peer_manager
         .configure_connection_lifecycle(
             cfg.clone(),
             node_id.clone(),
-            &plugin_manager_arc,
+            &plugin_manager,
             peer_store.clone(),
             !args.prompt,
         )
         .await;
 
-    // Start listener
-    let emit_listener_errors = !args.prompt;
-    let _listen_task = tokio::spawn({
+    // Start plugins, bind the listener, then activate.
+    let report = plugin_manager
+        .start_all(StartPolicy::StopOnFirstFailure)
+        .await?;
+    if !report.all_started() {
+        plugin_manager.shutdown(ShutdownMode::Discard).await?;
+        anyhow::bail!("plugin startup failed: {:?}", report.outcomes);
+    }
+    let listener = match bind_listener(cfg.port, !args.prompt).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            plugin_manager.shutdown(ShutdownMode::Discard).await?;
+            return Err(error.into());
+        }
+    };
+    let listen_task = tokio::spawn({
         let pm = peer_manager.clone();
-        let pmgr = plugin_manager_arc.clone();
+        let pmgr = plugin_manager.clone();
         let realm = realm.clone();
         let cfg_clone = cfg.clone();
         let node_id = node_id.clone();
         let peer_store = peer_store.clone();
-        let emit_console_errors = emit_listener_errors;
+        let emit_console_errors = !args.prompt;
         async move {
-            if let Err(e) = thenodes::network::listener::start_listener(
-                port,
+            if let Err(e) = run_listener(
+                listener,
                 realm,
                 (*pm).clone(),
                 pmgr,
@@ -112,6 +134,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     });
+    plugin_manager.activate()?;
 
     // Bootstrap outbound connections if present
     if cfg.bootstrap_nodes.is_some() {
@@ -121,7 +144,7 @@ async fn main() -> anyhow::Result<()> {
             &cfg,
             realm.clone(),
             (*peer_manager).clone(),
-            plugin_manager_arc.clone(),
+            plugin_manager.clone(),
             error_buffer,
             !args.prompt,
             node_id.clone(),
@@ -130,12 +153,41 @@ async fn main() -> anyhow::Result<()> {
         .await;
     }
 
-    // Optional interactive prompt
+    // Run until the prompt exits, Ctrl+C, or a plugin failure.
     if args.prompt {
-        thenodes::prompt::run_prompt_mode(plugin_manager_arc.clone(), cfg.clone()).await;
+        thenodes::prompt::run_prompt_mode(plugin_manager.clone(), cfg.clone()).await;
+    } else {
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result?,
+            failure = failures.recv() => {
+                if let Some(failure) = failure {
+                    eprintln!("{failure}; shutting down");
+                }
+            }
+        }
     }
 
-    // Park main; services run on tasks
-    future::pending::<()>().await;
+    // One cleanup path. A second Ctrl+C escalates.
+    let shutdown = plugin_manager.begin_shutdown(ShutdownMode::Drain);
+    listen_task.abort();
+    let _ = listen_task.await;
+    let wait = shutdown.wait();
+    tokio::pin!(wait);
+    let report = tokio::select! {
+        report = &mut wait => report?,
+        _ = tokio::signal::ctrl_c() => {
+            plugin_manager.escalate();
+            wait.await?
+        }
+    };
+    println!(
+        "{}Plugin shutdown clean: {}",
+        ICON_PLACEHOLDER,
+        report.is_clean()
+    );
+    if !report.is_clean() {
+        // Escalated work may still be running in pinned plugin code.
+        std::process::exit(1);
+    }
     Ok(())
 }

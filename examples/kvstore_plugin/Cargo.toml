@@ -12,3 +12,9 @@ thenodes = { version = "=0.4.0", path = "../../" }
 serde_json = "1"
 tokio = { version = "1", features = ["rt", "macros", "fs", "sync"] }
 async-trait = "0.1"
+
+# Forward ABI-affecting TheNodes features so the plugin can be built with the
+# same feature set as its host.
+[features]
+noise = ["thenodes/noise"]
+upnp = ["thenodes/upnp"]
